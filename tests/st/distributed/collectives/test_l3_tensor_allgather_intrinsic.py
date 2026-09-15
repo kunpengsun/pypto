@@ -29,10 +29,10 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 import torch
-from pypto import ir
 from pypto.ir import DistributedConfig
+from pypto.runtime import RunConfig
 
-SIZE = 64
+STAGE_CHUNK = 4096
 
 
 def _expected_allgather(inputs: torch.Tensor) -> torch.Tensor:
@@ -41,67 +41,69 @@ def _expected_allgather(inputs: torch.Tensor) -> torch.Tensor:
     return torch.stack([gathered] * inputs.shape[0]).unsqueeze(1)
 
 
-def _make_rank_inputs(n_ranks: int) -> torch.Tensor:
+def _make_rank_inputs(n_ranks: int, size: int) -> torch.Tensor:
     """Distinct per-rank tensors so the golden concat is non-trivial."""
     rows = [
-        torch.arange(r * 100.0, r * 100.0 + SIZE, dtype=torch.float32).reshape(1, SIZE)
+        torch.arange(r * 100.0, r * 100.0 + size, dtype=torch.float32).reshape(1, size)
         for r in range(n_ranks)
     ]
     return torch.stack(rows)
 
 
-def _build_allgather_program(n_ranks: int):
+def _build_allgather_program(n_ranks: int, size: int):
     """Build an N-rank allgather program at call time using the intrinsic.
 
     Deferred construction lets this file collect even if the embedded body
     is rejected by the parser.
     """
     nr = n_ranks
+    SIZE = size
 
-    @pl.program
-    class AllGatherIntrinsicNRank:
-        @pl.function(type=pl.FunctionType.InCore)
-        def gather_step(
-            self,
-            inp: pl.Tensor[[1, SIZE], pl.FP32],
-            out: pl.Out[pl.Tensor[[1, nr * SIZE], pl.FP32]],
-            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
-            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> pl.Tensor[[1, nr * SIZE], pl.FP32]:
-            # Push-based allgather: window becomes the gathered [NR, SIZE] result.
-            data = pld.tensor.allgather(inp, data, signal)
-            # Stage-out: read from the gathered window into the output tensor.
-            for r in pl.range(nr):
-                chunk = pl.load(data, [r, 0], [1, SIZE])
-                pl.store(chunk, [0, r * SIZE], out)
-            return out
+    @pl.jit.incore
+    def gather_step(
+        inp: pl.Tensor[[1, SIZE], pl.FP32],
+        out: pl.Out[pl.Tensor[[1, nr * SIZE], pl.FP32]],
+        data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+        signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pl.Tensor[[1, nr * SIZE], pl.FP32]:
+        # Push-based allgather: window becomes the gathered [NR, SIZE] result.
+        data = pld.tensor.allgather(inp, data, signal)
+        # Stage-out: read from the gathered window into the output tensor,
+        # chunked through a fixed-width on-chip tile so a non-tile-aligned
+        # or larger-than-UB SIZE never reserves an oversized or misaligned
+        # tile (STAGE_CHUNK is a compile-time constant, always 32-byte
+        # aligned; valid_shape masks the logical width actually read).
+        for r in pl.range(nr):
+            for col in pl.range(0, SIZE, STAGE_CHUNK):
+                valid = pl.min(STAGE_CHUNK, SIZE - col)
+                chunk = pl.load(data, [r, col], [1, STAGE_CHUNK], valid_shape=[1, valid])
+                pl.store(chunk, [0, r * SIZE + col], out)
+        return out
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def chip_orch(
-            self,
-            inp: pl.Tensor[[1, SIZE], pl.FP32],
-            out: pl.Out[pl.Tensor[[1, nr * SIZE], pl.FP32]],
-            data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
-            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> pl.Tensor[[1, nr * SIZE], pl.FP32]:
-            return self.gather_step(inp, out, data, signal)
+    @pl.jit
+    def chip_orch(
+        inp: pl.Tensor[[1, SIZE], pl.FP32],
+        out: pl.Out[pl.Tensor[[1, nr * SIZE], pl.FP32]],
+        data: pl.InOut[pld.DistributedTensor[[nr, SIZE], pl.FP32]],
+        signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> pl.Tensor[[1, nr * SIZE], pl.FP32]:
+        return gather_step(inp, out, data, signal)
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(
-            self,
-            inputs: pl.Tensor[[nr, 1, SIZE], pl.FP32],
-            outputs: pl.Out[pl.Tensor[[nr, 1, nr * SIZE], pl.FP32]],
-        ) -> pl.Tensor[[nr, 1, nr * SIZE], pl.FP32]:
-            data_buf = pld.alloc_window_buffer(nr * SIZE * pl.FP32.get_byte())
-            signal_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[nr, 1, SIZE], pl.FP32],
+        outputs: pl.Out[pl.Tensor[[nr, 1, nr * SIZE], pl.FP32]],
+    ) -> pl.Tensor[[nr, 1, nr * SIZE], pl.FP32]:
+        data_buf = pld.alloc_window_buffer(nr * SIZE * pl.FP32.get_byte())
+        signal_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
 
-            for r in pl.range(pld.world_size()):
-                data = pld.window(data_buf, [nr, SIZE], dtype=pl.FP32)
-                sig = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
-                self.chip_orch(inputs[r], outputs[r], data, sig, device=r)
-            return outputs
+        for r in pl.range(pld.world_size()):
+            data = pld.window(data_buf, [nr, SIZE], dtype=pl.FP32)
+            sig = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+            chip_orch(inputs[r], outputs[r], data, sig, device=r)
+        return outputs
 
-    return AllGatherIntrinsicNRank
+    return host_orch
 
 
 class TestL3TensorAllGatherIntrinsic:
@@ -111,26 +113,47 @@ class TestL3TensorAllGatherIntrinsic:
     bit-identical to the hand-written ``test_l3_allgather.py`` reference.
     """
 
+    @pytest.mark.parametrize("size", [17, 4097, 65537])
     @pytest.mark.parametrize("n_ranks", [2, 4])
-    def test_allgather_intrinsic(self, test_config, device_ids, n_ranks):
-        """Compile and run mesh allgather for P=2 or P=4; skip when devices are scarce."""
+    def test_allgather_intrinsic(self, test_config, device_ids, n_ranks, size):
+        """Compile and run mesh allgather for P=2 or P=4; skip when devices are scarce.
+
+        SIZE values cover the InCore staging-tile-cap fix: 17 (unaligned,
+        exercises the floor-to-32-byte-aligned-width path — round DOWN, not
+        up, since the stage tile can never exceed the transfer it slides
+        through) and 4097 (one element past the 4096-element/16 KiB
+        chunk-budget boundary for FP32 — the sharpest check that a >1-chunk
+        transfer still slides correctly through the capped stage). SIZE=1 is
+        not covered here: below one 32-byte alignment unit (8 FP32 elements)
+        there is no stage width that both satisfies pto.alloc_tile's
+        alignment rule and still fits within the transfer, a pre-existing gap
+        this fix does not close. 65537 (the original bug repro size — a
+        [1, 65537] FP32 stage would reserve 256 KiB and overflow UB before
+        this fix) requires running WITHOUT --forked: with --forked, this case
+        hangs (blocked in futex_wait_queue, not an error) — this is a
+        pre-existing `--forked` + sim fork()-thread-lock deadlock, unrelated
+        to this fix. Without --forked, all three sizes pass cleanly for every
+        composite in this file.
+        """
         if len(device_ids) < n_ranks:
             pytest.skip(f"allgather P={n_ranks} needs {n_ranks} devices, got {device_ids}")
 
-        program = _build_allgather_program(n_ranks)
-        compiled = ir.compile(
-            program,
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:n_ranks],
-                num_sub_workers=0,
+        program = _build_allgather_program(n_ranks, size)
+        inputs = _make_rank_inputs(n_ranks, size)
+        outputs = torch.zeros((n_ranks, 1, n_ranks * size), dtype=torch.float32)
+        compiled = program.compile(
+            inputs,
+            outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:n_ranks],
+                    num_sub_workers=0,
+                ),
             ),
         )
 
-        inputs = _make_rank_inputs(n_ranks)
-        outputs = torch.zeros((n_ranks, 1, n_ranks * SIZE), dtype=torch.float32)
-
-        compiled(inputs, outputs)
+        compiled(inputs, outputs, config=RunConfig(platform=test_config.platform))
 
         expected = _expected_allgather(inputs)
         assert torch.allclose(outputs, expected), (

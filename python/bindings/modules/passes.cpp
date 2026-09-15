@@ -154,7 +154,13 @@ void BindPass(nb::module_& m) {
              "mean a dispatchable task, and the runtime passes scalars in by value while returning "
              "only tensors, so such a return has no carrier -- write the value into a [1] tensor "
              "output and read it back with pl.tensor.read. Scalar[TASK_ID] is exempt, and a "
-             "device-side scalar helper belongs in an Inline function");
+             "device-side scalar helper belongs in an Inline function")
+      .value("AivSplitLoweredValid", IRProperty::AivSplitLoweredValid,
+             "Lowered AIV split regions and compatible flat bodies have valid cross-core boundaries")
+      .value("BufferIR", IRProperty::BufferIR,
+             "InCore/AIC/AIV use explicit buffer handles and valid registered buffer calls; "
+             "includes SSA, lexical use-after-definition, and assignment symmetry, not lifetime or "
+             "initialization proofs");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -448,7 +454,9 @@ void BindPass(nb::module_& m) {
              typecheck::ErrorType::DISTRIBUTED_WINDOW_IDENTITY_MISMATCH,
              "Distributed tensors refer to different window buffers")
       .value("TILE_VIEW_MISMATCH", typecheck::ErrorType::TILE_VIEW_MISMATCH,
-             "Effective TileView metadata mismatch");
+             "Effective TileView metadata mismatch")
+      .value("BUFFER_DESCRIPTOR_MISMATCH", typecheck::ErrorType::BUFFER_DESCRIPTOR_MISMATCH,
+             "Buffer descriptor or multi-buffer slot count mismatch");
 
   // Bind NestedCallErrorType enum
   nb::enum_<nested_call::ErrorType>(passes, "NestedCallErrorType", "Nested call verification error types")
@@ -526,8 +534,10 @@ void BindPass(nb::module_& m) {
              "(convert tile.assemble loops to tile.store loops).");
   passes.def("block_nz_tensor_views", &pass::BlockNzTensorViews,
              "Create a pass that rewrites logical pl.NZ tensors into pto-isa's blocked NZ form\n\n"
-             "An NZ TensorType shape [..., R, C] becomes [..., C/c0, R/16, 16, c0], where\n"
-             "c0 is the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
+             "An NZ TensorType shape [B, R, C] becomes [B, C/c0, R/16, 16, c0] and [R, C]\n"
+             "becomes [1, C/c0, R/16, 16, c0] — the leading slot is always present, so a\n"
+             "rank-2 tensor gets a batch extent of 1 rather than a shorter shape. c0 is\n"
+             "the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
              "consuming tile.load has its offsets / shapes / valid_shape rewritten into\n"
              "blocked coordinates while its logical 2-D destination TileType is preserved.\n"
              "Must run after ConvertTensorToTileOps and after FlattenTileNdTo2D (it\n"

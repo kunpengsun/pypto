@@ -38,7 +38,7 @@ program_inlined = inline_pass(program)
      - Build the param-substitution map (formal `Var` → actual `Expr`).
      - Alpha-rename every locally-bound `Var` in the inlined body to a fresh name (`<orig>_inline<counter>`, with any trailing `_` trimmed off `<orig>`) to avoid collisions across multiple call sites.
      - Splice the renamed-and-substituted body's statements before the call site.
-     - Replace the call with: `LHS = renamed_return` (single-return) or `LHS = MakeTuple([renamed_returns...])` (multi-return). When `LHS` resolves to the same `Var` as the substituted return value, the assignment is omitted to avoid a redundant SSA copy.
+     - Wire up the callee's trailing return value according to the call-site form: `LHS = renamed_return` (single-return assign; omitted when `LHS` resolves to the same `Var` as the substituted value, to avoid a redundant SSA copy), per-element `TupleGetItemExpr` substitution instead of a `MakeTuple` binding (multi-return assign), a fresh `ReturnStmt` (`return inline_call(...)`), or a fresh `EvalStmt` when the value is discarded but its evaluation is observable (`EvalStmt` call site — see [Edge cases](#edge-cases)).
 4. **Drop** all Inline functions from the program.
 
 The pass uses a single underscore (`_inline`) in the rename suffix because `__` is reserved by the IR's auto-naming convention (see `auto_name_utils.h`).
@@ -120,8 +120,51 @@ The scope is preserved verbatim and gets outlined by `OutlineIncoreScopes` later
 | Inline function as program entry | Not detected as an error here — but no Call to it exists, so it is removed in the cleanup phase like any other no-caller function. |
 | Inline calls Inline (transitive) | Iteratively expanded to fixpoint. |
 | Recursive Inline (self or mutual) | `pypto::ValueError` raised before any splicing, with the cycle named (`a -> b -> a`). |
-| Multi-return inline | `LHS = MakeTuple([rets...])` emitted at the call site. Subsequent `Simplify` may fold `TupleGetItemExpr(MakeTuple(...), i)`. |
+| Multi-return inline | No `LHS = MakeTuple([rets...])` is emitted — orchestration codegen cannot lower `MakeTuple`. The cloned return values are recorded against the LHS `Var` and downstream `TupleGetItemExpr(LHS, i)` uses are rewritten to value `i`, leaving the LHS binding unreferenced (see `SpliceInlineCallAsTupleSub`). |
 | Nested call to Inline (e.g. `pl.add(inline_fn(x), y)`) | Not handled in v1 — left as-is. The `InlineFunctionsEliminated` verifier flags any surviving Call. |
+| `EvalStmt(inline_call(...))` — return value ignored | The value is discarded, its **evaluation** is not. See [Discarding a return value](#discarding-a-return-value) below. |
+
+## Discarding a return value
+
+An `EvalStmt` call site — `self.wrapper(x, out)` with no LHS — has nowhere to put the callee's trailing return value. Dropping that **value** is correct; dropping its **evaluation** is not, because evaluating it can write through `Out` / `InOut` arguments, launch a task, block on a signal, or set up hardware. Each discarded value is therefore classified:
+
+| Discarded value | Behaviour |
+| --------------- | --------- |
+| A `Call` — any callee, cross-function or builtin | Re-emitted as an `EvalStmt`, in return order. The fixpoint loop expands a cross-function one on its next iteration when that callee is also Inline; otherwise it stays an ordinary dispatch, exactly as if the author had written it at the call site. |
+| A `Submit` | Re-emitted as an `EvalStmt`. A task launch is effectful whatever its callee does. |
+| Anything else that hides no call — a `Var`, a constant | Dropped. |
+| A value that is not itself call-like but *wraps* a call — scalar arithmetic such as `self.bump(n) + 1`, a `MakeTuple`, a `TupleGetItemExpr` | `pypto::ValueError`. It cannot become an `EvalStmt`, and deleting it would delete the nested call with it. Return that call directly, or bind the wrapper's result at the call site. |
+
+**Why every call, rather than only the ones that write.** Nothing in the IR answers "is this call safe to delete". The nearest registry data, `OpRegistryEntry::WritesAnyArg`, answers whether an operator writes *through an argument*, and keying deletion on it is wrong in both directions:
+
+- Most operators are simply unclassified — 263 of 315 at the time of writing, among them `tile.tpush_to_aiv` and `system.aic_initialize_pipe`, which `dce::IsSideEffectOp` lists as side-effecting. `OpRegistryEntry::HasDeclaredArgEffects` exists precisely so an analysis can tell "declared to write nothing" from "nobody looked yet".
+- A *positive* `no_arg_writes()` verdict does not mean deletable either. `pld.system.wait` blocks until a signal slot satisfies a threshold, `pld.system.defer_wait` registers a completion condition, and `system.set_ffts` hands the FFTS unit its workspace pointer — all three declare `no_arg_writes()` while carrying synchronization or hardware-setup semantics.
+
+So the pass keeps every call. A discarded genuinely pure call survives as a dead `EvalStmt`, which the pipeline carries harmlessly. Narrowing this needs a real "safely deletable" operator property, declared per operator rather than inferred from writes.
+
+**Before**:
+
+```python
+@pl.function(type=pl.FunctionType.Inline)
+def writeout(self, t, out: pl.Out[...]):
+    return pl.tile.store(t, [0, 0], out)   # the write IS the return expression
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel(self, a, out: pl.Out[...]):
+    t = pl.tile.load(a, [0, 0], [64, 64])
+    self.writeout(t, out)                  # return value ignored
+    return out
+```
+
+**After** — the store survives:
+
+```python
+@pl.function(type=pl.FunctionType.InCore)
+def kernel(self, a, out: pl.Out[...]):
+    t = pl.tile.load(a, [0, 0], [64, 64])
+    pl.tile.store(t, [0, 0], out)
+    return out
+```
 
 ## Verification
 

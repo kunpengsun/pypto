@@ -30,12 +30,17 @@ reads back with ``pl.load`` — exactly the same pattern as the symmetric
 
 The TPUT engine transfers exactly the rows being sent — the transfer shape is
 [rows, SIZE], where ``rows = clamp(send_counts[dest], 0, MAX_RECV)`` is read at
-runtime — using a compact [1, SIZE] staging tile that it auto-chunks through.
+runtime — using a bounded 2-D staging tile that it auto-chunks through.
 PTOAS accepts dynamic partition-view dims on ``pto.comm.tput``, so the padding
 up to MAX_RECV never crosses the interconnect. The receiver uses the published
 recv_counts to identify valid rows and skip unwritten window holes.
 
-ST coverage: **P=2** (default CI / 2-device hosts) and **P=4** (any four devices).
+The shared staging tile is a bounded ``[stage_rows, stage_cols]`` tile whose
+area fits one 16-KiB chunk; TPUT 2-D-slides larger transfers through it.
+
+ST coverage: **P=2** (default CI / 2-device hosts) and **P=4** (any four
+devices), with widths 17, 4097, and 65537 plus count boundaries 0, 1, and
+``MAX_RECV``.
 """
 
 import sys
@@ -44,133 +49,110 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 import torch
-from pypto import ir
 from pypto.ir import DistributedConfig
+from pypto.runtime import RunConfig
 
 SIZE = 64
+STAGE_CHUNK = 4096
 MAX_RECV = 4
 
 
-def _build_all_to_all_v_program(n_ranks: int, max_recv: int):
+def _build_all_to_all_v_program(n_ranks: int, max_recv: int, size: int = SIZE):
     """Build an N-rank variable-size all-to-all program."""
     nr = n_ranks
     mr = max_recv
+    SIZE = size
     total = nr * mr
 
-    @pl.program
-    class AllToAllVIntrinsicNRank:
-        """N-rank variable-size all-to-all program with window-as-result pattern."""
+    @pl.jit.incore
+    def exchange_step(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        counts: pl.Tensor[[nr, 1], pl.INT32],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+        data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        """Push variable rows per peer, then read the window via published counts."""
+        result = pld.tensor.all_to_all_v(inp, data, signal, counts, recv_counts)
+        # Copy the complete receive window through a bounded, aligned tile. The
+        # valid and tail row ranges partition each sender's slot, preserving the
+        # bounded-transfer assertion while supporting arbitrary SIZE.
+        for src in pl.range(nr):
+            n_rows_i32 = pl.read(recv_counts, [src, 0])
+            pl.write(recv_out, [src, 0], n_rows_i32)
+            n_rows = pl.cast(n_rows_i32, pl.INDEX)
+            base = src * mr
+            for r in pl.range(n_rows):
+                flat_row = base + r
+                for col in pl.range(0, SIZE, STAGE_CHUNK):
+                    valid = pl.min(STAGE_CHUNK, SIZE - col)
+                    chunk = pl.load(result, [flat_row, col], [1, STAGE_CHUNK], valid_shape=[1, valid])
+                    pl.store(chunk, [flat_row, col], out)
+            for r in pl.range(n_rows, mr):
+                flat_row = base + r
+                for col in pl.range(0, SIZE, STAGE_CHUNK):
+                    valid = pl.min(STAGE_CHUNK, SIZE - col)
+                    chunk = pl.load(result, [flat_row, col], [1, STAGE_CHUNK], valid_shape=[1, valid])
+                    pl.store(chunk, [flat_row, col], out)
+        return out, recv_out
 
-        @pl.function(type=pl.FunctionType.InCore)
-        def exchange_step(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            counts: pl.Tensor[[nr, 1], pl.INT32],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-            recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            """InCore kernel: push variable rows per peer, barrier, read back via recv_counts."""
-            # Push-based all_to_all_v — intrinsic pushes counts[dest] rows to
-            # each peer, publishes counts into recv_counts, and returns data
-            # in-place (window-as-result).
-            result = pld.tensor.all_to_all_v(inp, data, signal, counts, recv_counts)
-            # Read back valid rows from the window for host-side verification.
-            # Loop bounded by published recv_counts[src] (not a hardcoded formula
-            # / MAX_RECV). The TPUT transfer shape is the runtime [rows, SIZE]
-            # (PTOAS accepts dynamic partition-view dims on pto.comm.tput); a
-            # [1, SIZE] staging tile feeds the engine. The receiver uses
-            # recv_counts to skip unwritten window holes.
-            # Both loops target `out`, and their row ranges partition each
-            # sender's slot, so every row of the window is copied exactly once
-            # and `out` ends up FULLY written. That last part matters: a
-            # `pl.Out` tensor is write-only on the device (the host buffer is
-            # never uploaded), so any row the kernel skipped would come back as
-            # undefined memory rather than as window content.
-            #   [base, base + recv_counts[src])       valid -- checked vs golden
-            #   [base + recv_counts[src], base + mr)  tail  -- bounded-transfer check
-            # Keeping the valid-row loop bounded by the published recv_counts
-            # (not a hardcoded formula / MAX_RECV) exercises the intended
-            # device-side consumer pattern; the tail loop is what makes the
-            # bounded-transfer assertion non-vacuous — a padded full-capacity
-            # transfer would deposit the sender's surplus there.
-            for src in pl.range(nr):
-                n_rows_i32 = pl.read(recv_counts, [src, 0])
-                # Scalar read/write — a [1,1] INT32 tile.load fails ptoas
-                # 32-byte row alignment (4 bytes).
-                pl.write(recv_out, [src, 0], n_rows_i32)
-                n_rows = pl.cast(n_rows_i32, pl.INDEX)
-                base = src * mr
-                for r in pl.range(n_rows):
-                    flat_row = base + r
-                    chunk = pl.load(result, [flat_row, 0], [1, SIZE])
-                    pl.store(chunk, [flat_row, 0], out)
-                for r in pl.range(n_rows, mr):
-                    flat_row = base + r
-                    chunk = pl.load(result, [flat_row, 0], [1, SIZE])
-                    pl.store(chunk, [flat_row, 0], out)
-            return out, recv_out
+    @pl.jit
+    def chip_orch(
+        inp: pl.Tensor[[total, SIZE], pl.FP32],
+        counts: pl.Tensor[[nr, 1], pl.INT32],
+        out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
+        recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
+        data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
+        signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
+        return exchange_step(inp, counts, out, recv_out, data, signal, recv_counts)
 
-        @pl.function(type=pl.FunctionType.Orchestration)
-        def chip_orch(
-            self,
-            inp: pl.Tensor[[total, SIZE], pl.FP32],
-            counts: pl.Tensor[[nr, 1], pl.INT32],
-            out: pl.Out[pl.Tensor[[total, SIZE], pl.FP32]],
-            recv_out: pl.Out[pl.Tensor[[nr, 1], pl.INT32]],
-            data: pl.InOut[pld.DistributedTensor[[total, SIZE], pl.FP32]],
-            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-            recv_counts: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[total, SIZE], pl.FP32], pl.Tensor[[nr, 1], pl.INT32]]:
-            """Chip orchestration: dispatch to exchange_step with bound windows."""
-            return self.exchange_step(inp, counts, out, recv_out, data, signal, recv_counts)
+    @pl.jit.host
+    def host_orch(
+        inputs: pl.Tensor[[nr, total, SIZE], pl.FP32],
+        send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
+        outputs: pl.Out[pl.Tensor[[nr, total, SIZE], pl.FP32]],
+        recv_outputs: pl.Out[pl.Tensor[[nr, nr, 1], pl.INT32]],
+    ) -> tuple[pl.Tensor[[nr, total, SIZE], pl.FP32], pl.Tensor[[nr, nr, 1], pl.INT32]]:
+        data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
+        signal_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
 
-        @pl.function(level=pl.Level.HOST, role=pl.Role.Orchestrator)
-        def host_orch(
-            self,
-            inputs: pl.Tensor[[nr, total, SIZE], pl.FP32],
-            send_counts: pl.Tensor[[nr, nr, 1], pl.INT32],
-            outputs: pl.Out[pl.Tensor[[nr, total, SIZE], pl.FP32]],
-            recv_outputs: pl.Out[pl.Tensor[[nr, nr, 1], pl.INT32]],
-        ) -> tuple[pl.Tensor[[nr, total, SIZE], pl.FP32], pl.Tensor[[nr, nr, 1], pl.INT32]]:
-            """HOST orchestrator: allocate windows once, loop over ranks calling chip_orch."""
-            data_buf = pld.alloc_window_buffer(total * SIZE * pl.FP32.get_byte())
-            signal_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
-            recv_buf = pld.alloc_window_buffer(nr * pl.INT32.get_byte())
+        for r in pl.range(pld.world_size()):
+            data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
+            sig = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
+            recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
+            chip_orch(
+                inputs[r],
+                send_counts[r],
+                outputs[r],
+                recv_outputs[r],
+                data,
+                sig,
+                recv,
+                device=r,
+            )
+        return outputs, recv_outputs
 
-            for r in pl.range(pld.world_size()):
-                data = pld.window(data_buf, [total, SIZE], dtype=pl.FP32)
-                sig = pld.window(signal_buf, [nr, 1], dtype=pl.INT32)
-                recv = pld.window(recv_buf, [nr, 1], dtype=pl.INT32)
-                self.chip_orch(
-                    inputs[r],
-                    send_counts[r],
-                    outputs[r],
-                    recv_outputs[r],
-                    data,
-                    sig,
-                    recv,
-                    device=r,
-                )
-            return outputs, recv_outputs
-
-    return AllToAllVIntrinsicNRank
+    return host_orch
 
 
 class TestL3TensorAllToAllVIntrinsic:
     """L3 distributed runtime: variable-size all-to-all via ``pld.tensor.all_to_all_v``."""
 
+    @pytest.mark.parametrize("size", [17, 4097, 65537])
     @pytest.mark.parametrize("n_ranks", [2, 4])
-    def test_all_to_all_v_intrinsic(self, test_config, device_ids, n_ranks):
+    def test_all_to_all_v_intrinsic(self, test_config, device_ids, n_ranks, size):
         """Compile and run variable-size all-to-all for P=2 or P=4.
 
         Each rank sends ``n_ranks - dest`` rows to each peer (variable counts).
         MAX_RECV=4 is the compile-time capacity, actual sends ≤ MAX_RECV.
-        The test validates that the push-based decomposition produces the
-        correct per-src per-dest exchange, and that ``recv_counts`` publishes
-        the receive-side counts (no hardcoded ``n_rows = nr - rank`` on device).
+        SIZE covers the alignment-floor path (17), one element beyond the
+        16-KiB FP32 chunk (4097), and the original UB-overflow scale (65537).
+        The count set retains 1-row and MAX_RECV boundaries.
         """
         if len(device_ids) < n_ranks:
             pytest.skip(f"all_to_all_v P={n_ranks} needs {n_ranks} devices, got {device_ids}")
@@ -179,37 +161,47 @@ class TestL3TensorAllToAllVIntrinsic:
         mr = MAX_RECV
         total = nr * mr
 
-        program = _build_all_to_all_v_program(nr, mr)
-        compiled = ir.compile(
-            program,
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(
-                device_ids=device_ids[:nr],
-                num_sub_workers=0,
-            ),
-        )
-
-        # Build inputs: 3D host view [nr, total, SIZE] = per-rank flat 2D
+        # Build inputs: 3D host view [nr, total, size] = per-rank flat 2D
         # Rank r sends to dest d: rows dest*mr+k for k=0..n_rows-1
         # Value = r*1000 + d*100 + k*10 + j%10
         # The TPUT transfers only [n_rows, SIZE] — rows beyond n_rows are not
         # pushed at all.  The receiver uses recv_counts to identify the valid
         # rows; the rest of its capacity slot is simply never written.
-        inputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
+        inputs = torch.zeros((nr, total, size), dtype=torch.float32)
         send_counts = torch.zeros((nr, nr, 1), dtype=torch.int32)
+        columns = torch.arange(size, dtype=torch.float32) % 10
         for r in range(nr):
             for d in range(nr):
                 n_rows = nr - d  # variable send count
                 send_counts[r, d, 0] = n_rows
                 base = d * mr
                 for k in range(n_rows):
-                    for j in range(SIZE):
-                        inputs[r, base + k, j] = float(r * 1000 + d * 100 + k * 10 + j % 10)
+                    inputs[r, base + k, :] = float(r * 1000 + d * 100 + k * 10) + columns
 
-        outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
+        outputs = torch.zeros((nr, total, size), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
 
-        compiled(inputs, send_counts, outputs, recv_outputs)
+        program = _build_all_to_all_v_program(nr, mr, size)
+        compiled = program.compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(
+                    device_ids=device_ids[:nr],
+                    num_sub_workers=0,
+                ),
+            ),
+        )
+        compiled(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            config=RunConfig(platform=test_config.platform),
+        )
 
         # Golden validation:
         # Rank rank receives from src the chunk that src sent to dest=rank.
@@ -288,12 +280,6 @@ class TestL3TensorAllToAllVSkew:
         total = nr * mr
         raw = _SKEW_CASES[case](nr, mr)
 
-        compiled = ir.compile(
-            _build_all_to_all_v_program(nr, mr),
-            platform=test_config.platform,
-            distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
-        )
-
         # Fill the FULL capacity slot of every destination, not just the rows
         # being sent, so an over-send would deposit recognisable data in the
         # padding rows and the assertion below would catch it.
@@ -316,7 +302,24 @@ class TestL3TensorAllToAllVSkew:
 
         outputs = torch.zeros((nr, total, SIZE), dtype=torch.float32)
         recv_outputs = torch.zeros((nr, nr, 1), dtype=torch.int32)
-        compiled(inputs, send_counts, outputs, recv_outputs)
+        program = _build_all_to_all_v_program(nr, mr)
+        compiled = program.compile(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            config=RunConfig(
+                platform=test_config.platform,
+                distributed_config=DistributedConfig(device_ids=device_ids[:nr], num_sub_workers=0),
+            ),
+        )
+        compiled(
+            inputs,
+            send_counts,
+            outputs,
+            recv_outputs,
+            config=RunConfig(platform=test_config.platform),
+        )
 
         for rank in range(nr):
             for src in range(nr):

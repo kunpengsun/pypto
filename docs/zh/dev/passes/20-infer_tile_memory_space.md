@@ -105,8 +105,9 @@ yield 查表与 init 载体查表都使用 `AsVarLike` 而非 `As<Var>`。原样
 
 阶段 1 **从不**覆盖已有的 `target_memory` kwarg。如果用户写了 `pl.load(..., target_memory=Mat)`，而下游 `matmul` 需要 `Left`，则 load 仍保持 `Mat`，并由后续插入 `tile.move`。
 
-源类型为 `TensorLayout.MX_A_ZZ` / `MX_B_NN` 的 `tile.load` 必须显式携带
-`target_memory=Mat`；如果省略或传入其他目标，类型推导会在本 pass 运行前报错。
+公开 Python load builder 会把 `TensorLayout.MX_A_ZZ` / `MX_B_NN` 源上省略的
+target 规范化为 `target_memory=Mat`。原始 `tile.load` IR 仍必须携带该 target；
+如果缺失或传入其他目标，类型推导会在本 pass 运行前报错。
 
 ### 阶段 2 — Move 收集（`MoveCollector`）
 
@@ -121,6 +122,9 @@ yield 查表与 init 载体查表都使用 `AsVarLike` 而非 `As<Var>`。原样
 3. **参数替换（`VisitExpr_(Call)`）** —— 用 `created_moves_` 中已有的项替换每个受约束的输入参数。
 4. **Retargetable 生产者 kwarg 重写（`VisitStmt_(AssignStmt)`）** —— 对注册了 `HasRetargetableMemoryKwarg()` 的算子，若阶段 1 把输出解析到与 kwarg 不同的 space（或 kwarg 缺失），则重写 `Call` 的 `target_memory` kwarg 与结果 `TileType`，使之匹配。这让 codegen 与赋值左侧 `Var` 的注解保持一致；这是必要的，因为阶段 1 可能基于反向需求做出解析，而 kwarg 永远看不到这些需求。
 5. **LHS / RHS 类型同步** —— 当 `VisitExpr_(Call)` 在替换被 move 后的参数后，借由 `OpRegistry` 重建 `Call`，结果类型可能与 LHS `Var` 的原类型不同（重建的 call 会看到布局变化后的输入）。Mutator 把 LHS `Var` 的 `TileType` 同步到重建 call 的 shape / dtype / memref / view，同时保留变量重写阶段选定的 `memory_space_`，保证 roundtrip 等价。
+
+   同样的同步也适用于普通 `Var` / `IterArg` 别名：别名必须描述重写后的值，不能保留生产者在 move 之前的布局。
+6. **循环布局传播（Loop layout propagation）** —— 在访问循环体之前，`ForStmt` 和 `WhileStmt` 的携带值继承重写后初始值的物理布局（`blayout`、`slayout`、`fractal`）；循环结果继承该携带值布局，包括零次迭代的情况。携带值和结果各自的 shape、dtype、分配及 valid-shape 元数据保持不变。显式的非默认布局会被继承，而不是被内存空间的默认布局替代。
 
 ### 阶段 4 — 循环不变量 Mat 驻留（`loop_invariant_mat_residency`）
 
@@ -252,7 +256,7 @@ class After:
 
 `TileMemoryInferred` 属性是本 pass 建立的契约。下游 pass（尤其 `ExpandMixedKernel` 与 `InitMemRef`）依赖该契约，配套的属性 verifier 守护回归。
 
-`AccToGmStoreValid` 只有在这里才可判定：`tile.store` 是否从 Acc 收窄写入 GM，取决于本 pass 解析出的 memory space。`AivSplitValid` 被失效并重新产生也是同一原因——这是最后一个能观察到 AIV split 边界内存的验证点（此前在 `ConvertTensorToTileOps` 处该操作数的 space 可能仍未解析），再往后 `LowerAutoVectorSplit` 就会擦除区域节点。
+`AccToGmStoreValid` 只有在这里才可判定：`tile.store` 是否从 Acc 收窄写入 GM，取决于本 pass 解析出的 memory space。`AivSplitValid` 被失效并重新产生也是同一原因——这是最后一个能观察到 AIV split 边界内存的验证点（此前在 `ConvertTensorToTileOps` 处该操作数的 space 可能仍未解析），再往后 `LowerAutoVectorSplit` 就会切换到 lowered 阶段的验证契约。
 
 ## 作用范围
 

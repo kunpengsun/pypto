@@ -70,6 +70,7 @@
 | `IterArgCarryClassified` | Orchestration 中每个带 iter_args 的 ForStmt 都带有 `iter_arg_rebind_<i>` 携带方案，codegen 直接读取而不再重新推导 |
 | `AccToGmStoreValid` | 每个源 tile 位于 Acc 的 `tile.store` 所写 GM dtype 都能被后端 fix-pipe 收窄 |
 | `AtomicAddDtypeValid` | 每个写入 GM 的 atomic-add 的目标 dtype 都能被后端 store pipe 合并 |
+| `BufferIR` | InCore/AIC/AIV 使用显式 buffer 句柄和符合注册契约的 buffer 调用；组合检查 SSA、严格词法作用域下的先定义后使用及赋值类型对称性。在 buffer IR 开发阶段显式选择，不证明存储生命周期或数据初始化。 |
 
 ### IRPropertySet
 
@@ -126,8 +127,8 @@ struct PassProperties {
 | InferTileMemorySpace | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid, AccToGmStoreValid | AivSplitValid |
 | InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | — |
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, NormalizedStmtStructure | — |
-| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | AivSplitValid |
-| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid | — |
+| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitLoweredValid | AivSplitValid |
+| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitLoweredValid | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid, AccCompactValid | AccCompactValid, AivSplitLoweredValid |
 | InjectGMPipeBuffer | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | — |
 | SplitVectorKernel | SSAForm, MixedKernelExpanded | SSAForm, VectorKernelSplit, NormalizedStmtStructure | — |
 | StampTfreeSplit | SplitIncoreOrch | — | — |
@@ -576,3 +577,9 @@ print(p.get_produced_properties())   # {SSAForm}
 - `tests/ut/ir/transforms/test_pass_pipeline.py` — Pipeline、PassContext、插桩和自动验证测试
 - `tests/ut/ir/transforms/test_pass_manager.py` — PassManager 向后兼容性测试
 - `tests/ut/conftest.py` — 为所有测试启用 BEFORE_AND_AFTER 验证的 autouse fixture
+
+### AIV split 验证属性交接
+
+`LowerAutoVectorSplit` 要求 `AivSplitValid` 并产生 `AivSplitLoweredValid`。
+`ExpandMixedKernel` 消费保留/合成的区域以及受支持的 flat fallback，然后使 lowered
+属性失效。pass 顺序不变。

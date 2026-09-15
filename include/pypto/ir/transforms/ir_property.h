@@ -135,7 +135,11 @@ enum class IRProperty : uint64_t {
                          ///< written FunctionType::Inline and spliced away by InlineFunctions. Decidable
                          ///< on the user's own IR, so it is a structural property verified at every pass
                          ///< boundary
-  kCount                 ///< Sentinel (must be last)
+  AivSplitLoweredValid,  ///< Lowered split regions or flat split bodies have valid cross-core boundaries
+  BufferIR,              ///< InCore/AIC/AIV use explicit buffer handles and valid registered buffer calls;
+             ///< composes SSA, lexical use-after-definition, and assignment symmetry, not lifetime or
+             ///< initialization checks
+  kCount  ///< Sentinel (must be last)
 };
 
 static_assert(
@@ -267,7 +271,7 @@ enum class VerificationLevel {
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid, TileMemoryInferred, HardSyncallOccupancyValid,
+ * AivSplitValid, AivSplitLoweredValid, TileMemoryInferred, TileOps2D, HardSyncallOccupancyValid,
  * IterArgCarryClassified, RuntimeScopesMaterialized,
  * DistTensorCtxMaterialized, GraphBoundaryLegalized, AccToGmStoreValid,
  * AccCompactValid, AtomicAddDtypeValid, AccStorePhaseValid} —

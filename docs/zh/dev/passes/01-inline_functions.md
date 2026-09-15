@@ -38,7 +38,7 @@ program_inlined = inline_pass(program)
      - 构建参数替换映射(形参 `Var` → 实参 `Expr`)。
      - 对内联体中每个本地绑定的 `Var` 做 alpha 重命名(`<orig>_inline<counter>`,并去掉 `<orig>` 末尾的 `_`),避免多个调用点之间冲突。
      - 在调用点之前插入重命名+替换后的函数体语句。
-     - 用 `LHS = renamed_return`(单返回值)或 `LHS = MakeTuple([renamed_returns...])`(多返回值)替换调用。当 `LHS` 与替换后的返回 `Var` 是同一个 `Var` 时,赋值被省略以避免冗余 SSA 拷贝。
+     - 按调用点形态接线被内联函数的尾部返回值:`LHS = renamed_return`(单返回值赋值;当 `LHS` 与替换后的返回 `Var` 是同一个 `Var` 时省略该赋值,以避免冗余 SSA 拷贝)、逐元素替换 `TupleGetItemExpr` 而不发出 `MakeTuple` 绑定(多返回值赋值)、新的 `ReturnStmt`(`return inline_call(...)`),或者当返回值被丢弃但其求值可观测时发出新的 `EvalStmt`(`EvalStmt` 调用点 — 参见[边界情况](#边界情况))。
 4. **删除**所有 Inline 函数。
 
 重命名后缀使用单下划线(`_inline`),因为 `__` 被 IR 自动命名约定保留(参见 `auto_name_utils.h`)。
@@ -120,8 +120,51 @@ scope 被原样保留,稍后由 `OutlineIncoreScopes` 提取为独立的 InCore 
 | 作为程序入口的 Inline 函数 | 此处不视为错误 — 但因为没有任何 Call 指向它,清理阶段会像任何无调用者函数那样移除。 |
 | Inline 调用 Inline(传递) | 迭代到不动点。 |
 | 递归 Inline(自递归或互相调用) | 在任何展开发生之前抛出 `pypto::ValueError`,消息中标明环路径(`a -> b -> a`)。 |
-| 多返回值 Inline | 在调用点发出 `LHS = MakeTuple([rets...])`。后续 `Simplify` 可能把 `TupleGetItemExpr(MakeTuple(...), i)` 折叠掉。 |
+| 多返回值 Inline | **不**发出 `LHS = MakeTuple([rets...])` — 编排层 codegen 无法 lower `MakeTuple`。改为把克隆后的返回值记录在 LHS `Var` 上,并把下游 `TupleGetItemExpr(LHS, i)` 的使用改写为第 `i` 个值,使该 LHS 绑定最终无人引用(参见 `SpliceInlineCallAsTupleSub`)。 |
 | 嵌套 Call 到 Inline(如 `pl.add(inline_fn(x), y)`) | v1 不处理 — 保持原样。`InlineFunctionsEliminated` verifier 会标记任何残留的 Call。 |
+| `EvalStmt(inline_call(...))` — 返回值被忽略 | 被丢弃的是返回**值**,不是它的**求值**。参见下方[丢弃返回值](#丢弃返回值)。 |
+
+## 丢弃返回值
+
+`EvalStmt` 调用点(`self.wrapper(x, out)`,没有 LHS)无处安放被调用者的尾部返回值。丢弃那个**值**是对的,丢弃它的**求值**则不对 —— 求值过程可能通过 `Out` / `InOut` 参数写入、启动任务、阻塞等待信号,或完成硬件设置。因此每个被丢弃的值都要分类:
+
+| 被丢弃的值 | 行为 |
+| ---------- | ---- |
+| `Call` —— 无论被调用者是跨函数还是 builtin | 按 return 顺序重新发出为 `EvalStmt`。若跨函数调用的被调用者同样是 Inline,不动点循环会在下一轮展开它;否则它就保持为一次普通派发,与作者在调用点直接写出来完全一致。 |
+| `Submit` | 重新发出为 `EvalStmt`。任务启动本身就是有副作用的,与被调用者做什么无关。 |
+| 其它不藏有调用的值 —— `Var`、常量 | 丢弃。 |
+| 本身不是 call-like、但**包裹**了调用的值 —— `self.bump(n) + 1` 这类标量算术、`MakeTuple`、`TupleGetItemExpr` | 抛出 `pypto::ValueError`。它无法变成 `EvalStmt`,而删除它会连带删除内层的调用。请直接返回该调用,或在调用点绑定 wrapper 的结果。 |
+
+**为什么是"所有调用",而不只是"会写的调用"。** IR 里没有任何东西能回答"这次调用可以安全删除吗"。最接近的注册表数据 `OpRegistryEntry::WritesAnyArg` 回答的是另一个问题 —— 算子是否**通过参数**写入 —— 以它为删除依据在两个方向上都会出错:
+
+- 大多数算子根本没有分类 —— 撰写时 315 个里有 263 个,其中就包括被 `dce::IsSideEffectOp` 列为副作用算子的 `tile.tpush_to_aiv` 和 `system.aic_initialize_pipe`。`OpRegistryEntry::HasDeclaredArgEffects` 存在的意义正是让分析能区分"已声明不写"和"尚无人查看"。
+- **正面**的 `no_arg_writes()` 判定也不等于可删除。`pld.system.wait` 会阻塞直到信号槽满足阈值,`pld.system.defer_wait` 注册任务完成条件,`system.set_ffts` 把 workspace 指针交给 FFTS 单元 —— 三者都声明了 `no_arg_writes()`,却都承担同步或硬件设置语义。
+
+因此该 pass 保留所有调用。被丢弃的真·纯调用会留下一条无用的 `EvalStmt`,流水线可以无害地带着它走完。要收窄这一点,需要一个真正的"可安全删除"算子属性 —— 逐算子声明,而不是从写入行为反推。
+
+**变换前**:
+
+```python
+@pl.function(type=pl.FunctionType.Inline)
+def writeout(self, t, out: pl.Out[...]):
+    return pl.tile.store(t, [0, 0], out)   # 写入本身就是返回表达式
+
+@pl.function(type=pl.FunctionType.InCore)
+def kernel(self, a, out: pl.Out[...]):
+    t = pl.tile.load(a, [0, 0], [64, 64])
+    self.writeout(t, out)                  # 返回值被忽略
+    return out
+```
+
+**变换后** —— store 被保留:
+
+```python
+@pl.function(type=pl.FunctionType.InCore)
+def kernel(self, a, out: pl.Out[...]):
+    t = pl.tile.load(a, [0, 0], [64, 64])
+    pl.tile.store(t, [0, 0], out)
+    return out
+```
 
 ## 验证
 

@@ -2507,6 +2507,50 @@ class TestAutoTileMatmulL0MNTiling:
             f"B-stationary numerics mismatch: max abs diff {(out - expected).abs().max().item():.3e}"
         )
 
+    def test_multiple_geometries_reuse_full_l0b_panel_through_default_pypto(self):
+        """#2633: address-level reuse keeps A5's chosen 64 KiB dense panel.
+
+        The tail matmul creates two co-live 32 KiB Right panels. PYPTO's
+        overflow fallback places them in the two halves of the expired dense
+        panel instead of forcing AutoTile to re-choose the dense schedule.
+        """
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend950)
+        from pypto.ir.pass_manager import OptimizationStrategy, PassManager  # noqa: PLC0415
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                lhs: pl.Tensor[[64, 128], pl.INT8],
+                tail: pl.Tensor[[16, 128], pl.INT8],
+                rhs: pl.Tensor[[128, 512], pl.INT8],
+                out: pl.Out[pl.Tensor[[64, 512], pl.INT32]],
+                out_tail: pl.Out[pl.Tensor[[16, 512], pl.INT32]],
+            ) -> tuple[pl.Tensor[[64, 512], pl.INT32], pl.Tensor[[16, 512], pl.INT32]]:
+                lhs_mat = pl.tile.load(lhs, [0, 0], [64, 128], target_memory=pl.Mem.Mat)
+                rhs_mat = pl.tile.load(rhs, [0, 0], [128, 512], target_memory=pl.Mem.Mat)
+                c = pl.tile.matmul(lhs_mat, rhs_mat)
+                out = pl.store(c, [0, 0], out)
+                tail_mat = pl.tile.load(tail, [0, 0], [16, 128], target_memory=pl.Mem.Mat)
+                c_tail = pl.tile.matmul(tail_mat, rhs_mat)
+                out_tail = pl.store(c_tail, [0, 0], out_tail)
+                return out, out_tail
+
+        with passes.PassContext([], memory_planner=passes.MemoryPlanner.PYPTO):
+            tiled = passes.auto_tile_matmul_l0()(Before)
+            lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Before)
+
+        # Only the tail uses the k=64 output-stationary loop. The dense call
+        # remains the chooser's full-k B-stationary design point.
+        assert ir.python_print(tiled).count("pl.pipeline(0, 128, 64,") == 1
+        right_allocs = [
+            int(size)
+            for size in re.findall(r"pl\.tile\.alloc\(pl\.Mem\.Right, (\d+)\)", ir.python_print(lowered))
+        ]
+        assert right_allocs == [64 * 1024]
+
     @pytest.mark.parametrize("planner", [passes.MemoryPlanner.PYPTO, passes.MemoryPlanner.PTOAS])
     @pytest.mark.parametrize(
         ("M", "K", "N", "tile_k"),
@@ -4775,6 +4819,39 @@ class TestAutoTileMatmulL0FitsL0cCastFold:
 
         # ``floor`` is unfoldable, so the whole chain must survive untouched --
         # Vector cast kept, no Mat-scratch assemble, and no other rewrite either.
+        _assert_unchanged_by_pass(Before, After)
+
+    @pytest.mark.parametrize("saturation_mode", ["on", "off"])
+    def test_explicit_saturation_not_folded(self, saturation_mode):
+        """Guard: a fits-L0c chained ``rint`` cast that asked for a saturation mode
+        must keep the Vector cast. ``pto.tinsert`` carries no ``satmode`` any more
+        than it carries an ``rmode``, so folding one would make ``"on"`` and
+        ``"off"`` compile to the same instruction even though the API defines
+        different finite-overflow results for them. The same cast without the
+        kwarg still folds -- a float destination has no default saturation, so
+        absent means "did not ask" (see ``*cast_folds*``)."""
+        _backend.reset_for_testing()
+        _backend.set_backend_type(BackendType.Ascend910B)
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                a: pl.Tensor[[128, 64], pl.BF16],
+                b: pl.Tensor[[64, 128], pl.BF16],
+                e: pl.Tensor[[128, 64], pl.BF16],
+                out: pl.Out[pl.Tensor[[128, 64], pl.FP32]],
+            ) -> pl.Tensor[[128, 64], pl.FP32]:
+                c = pl.matmul(a, b, out_dtype=pl.FP32)  # [128, 128] f32, fits L0c
+                cb = pl.cast(c, pl.BF16, mode="rint", saturation_mode=saturation_mode)
+                d = pl.matmul(cb, e, out_dtype=pl.FP32)  # consumed as a matmul operand
+                out = pl.assemble(out, d, [0, 0])
+                return out
+
+        After = passes.auto_tile_matmul_l0()(_lower_to_tile_ops(Before))
+
+        # The request is unrepresentable on the cube, so the whole chain survives.
         _assert_unchanged_by_pass(Before, After)
 
     def test_default_round_mode_not_folded(self):

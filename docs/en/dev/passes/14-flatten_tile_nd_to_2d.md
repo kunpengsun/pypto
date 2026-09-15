@@ -44,20 +44,21 @@ For each InCore function (InCore, AIC, AIV):
 
 1. **Validate preconditions**: Check static physical shapes, last-axis reduction, no `tile.read`/`tile.write`/`tile.slice` on >2D, and no >2D `tile.assemble` whose written region fails to collapse contiguously
 2. **Transform statements**: Walk function body and convert >2D tile ops to 2D, preserving any dynamic `valid_shape` (see [Dynamic valid_shape](#dynamic-tile-dimensions-issue-1578))
-3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks, 2D `tile.assemble` offsets, and codegen-ready transpose forms
+3. **Verify postconditions**: The `TileOps2D` property verifier independently checks that the rewritten InCore IR contains only supported tile ranks, 2D `tile.assemble` offsets, and codegen-ready transpose forms. `TileOps2D` is in `GetVerifiedProperties()`, so `PassPipeline` runs this verifier automatically right after the pass at any `VerificationLevel` above `None`
 
 Per-statement handling:
 
 | Tile op | Transformation |
 | ------- | -------------- |
 | `tile.load` (>2D) | Rebuild the result tile as 2D. For a natural NZ Mat load, also insert a shape-only 2D `tensor.view` on the source tensor, collapse leading offsets/shapes/valid_shape to the 2D source window, and require that window to be row-major contiguous. Vec loads and transposed Mat loads keep the original rank>2 source window and only flatten the result tile |
-| `tile.store` (rank>2 tensor) | Inject the original tensor-rank partition `shapes` as an extra 4th operand in the transformed IR so backend codegen can reconstruct the `partition_view`; the DSL source is unchanged. If the tile operand itself is still rank>2 (e.g. a user-written `tile.reshape` to 3D feeding `pl.assemble` into an N-D tensor view), insert a `tile.reshape` to flatten the tile operand to 2D first — the codegen requires a 2D tile while the original tile shape still flows through as the `shapes` partition operand |
+| `tile.store` (rank>2 tensor) | Inject the tensor-rank partition `shapes` as an extra 4th operand in the transformed IR so backend codegen can reconstruct the `partition_view`; the DSL source is unchanged. The window is a **box the destination contains**, anchored at the store's offsets — see [The store partition window](#the-store-partition-window). If the tile operand itself is still rank>2, insert a `tile.reshape` to flatten the tile operand to 2D first — a safety net for hand-built IR, since the `tile.load` and `tile.reshape` branches now flatten every producer the DSL can write — the codegen requires a 2D tile while the tile shape still flows through as the `shapes` partition operand |
 | `tile.store` (2D tensor) | Pass through unchanged |
 | `tile.create`/`tile.full` (>2D) | Rebuild with flattened 2D shape directly |
 | `tile.assemble` (>2D target) | Fold the ND offset into the flattened `(row, col)` space with the same row-major collapse `tile.load` applies to its tensor-rank offsets (`row = ((o0*d1 + o1)*d2 + o2)*… + o[k-2]`, `col = o[k-1]`); the tile operands themselves are flattened by their defining ops. Requires source, target and offset to share one rank, and the written region to collapse to a contiguous row band (`IsRowMajorCollapseContiguous`) — both rejected in the precondition phase otherwise. Without the fold the offset would keep its ND rank on a 2D tile, and codegen (which reads `elements[0]`/`elements[1]` positionally and ignores the rest) would silently place the write at the wrong address |
 | `tile.transpose` | Sole owner of `pto.ttrans` scratch materialization. Arrives 3-arg (input, axis1, axis2). **2D**: create one scratch tile (shape = SOURCE page, in the input's memory space) and emit the codegen-ready 4-arg `tile.transpose(in, a1, a2, scratch)`. **>2D** (last-two-axes swap): unroll into per-batch 2D transposes, each a 4-arg form with scratch sliced from a flat `[batch*A, B]` pool, assembled into the merged 2D output. A batch-axis swap is a user error |
 | `tile.batch_matmul` | Expand to per-batch 2D `tile.matmul`, honoring batch broadcast. A b_trans/a_trans operand arrives as a zero-copy `tile.transpose_view` over a natural load (no transpose-at-load, no copy); the tile-level op carries no transpose semantic. Each operand is handled identically (see operand handling below). **When the result is itself a batched accumulator** (a downstream `tile.batch_matmul_acc` keeps writing it), the pages are written into ONE column-packed `Acc` tile with `tile.matmul_acc(window, lhs_b, rhs_b, init_cond=True)` instead — see [Batched accumulators pack along columns](#batched-accumulators-pack-along-columns) |
 | `tile.batch_matmul_acc` | Expand to per-batch 2D `tile.matmul_acc`, taking one window of the (already-flattened) accumulator per batch index: the **column** window `[0, b*N]` of an `[M, B*N]` tile when the chain is column-packed, the legacy **row** window `[b*M, 0]` of a `[B*M, N]` tile otherwise — see [Batched accumulators pack along columns](#batched-accumulators-pack-along-columns). Memory-space decisions the pass does not already state (Vec/Acc round-trips on a row-packed accumulator, retargetable producer promotion of an upstream `tile.create`, TileView refresh) are deferred to `InferTileMemorySpace` (pass 20) — flatten emits no inline `tile.move` |
+| `tile.reshape` / `tile.reinterpret_view` (>2D result) | Rewrite the literal target-shape operand to the merged 2D `[product(leading), last]` and re-deduce. These are the only tile ops whose result rank comes from a shape operand rather than from an operand's type, so the generic path below cannot lower them — it rebuilds the call with the *same* ND tuple and the rank>2 result survives the pass, to be typed from its first two dimensions by `ExtractTileTypeInfo` in PTO codegen. The collapse is exactly semantics-preserving here: a tile is one contiguous row-major run, so `[2, 8, 128]` and `[16, 128]` name the same elements in the same order. The 2D reshape that results is often the identity, which `FoldNoOpReshape` (pass 38) then removes. A safe batch-only reshape feeding `tile.batch_matmul` is peeled by the lowering instead (see above) and never reaches this branch |
 | Other tile ops (>2D) | Substitute vars, re-create with 2D types |
 | 1D/2D tile ops | Unchanged |
 
@@ -314,9 +315,43 @@ class After:
 
 The 3D tile `[2, 3, 4]` is flattened to `[6, 4]`. `tile.load` directly produces a 2D tile —
 no `tile.reshape` is inserted. `tile.store` accepts the 2D tile and writes to the original rank>2 tensor. For
-rank>2 tensors, the pass injects the original partition `shapes` as an extra 4th operand into the
+rank>2 tensors, the pass injects the partition `shapes` as an extra 4th operand into the
 transformed IR (e.g. `pl.store(y_tile, [0, 0, 0], out_0, (2, 3, 4))`); this operand is only
 present in the transformed IR and is not part of the source DSL.
+
+### The store partition window
+
+The `shapes` operand is a **box in destination coordinates** — every size within
+its own axis's extent, anchored at the store's offsets. Codegen turns it into
+`pto.partition_view`, which can describe nothing else.
+
+Aligning the tile's dims against the tensor's trailing dims and padding the front
+with 1s produces that box whenever each tile dim *is* the tensor dim it lands on:
+tensor `[B, M, N]` written from an `[M, N]` tile gives `[1, M, N]`.
+
+It stops working once the tile's leading extent is a **collapse** of several
+tensor dims, which is what `tensor.gather` lowering produces — a `[2, 3, 8]`
+result becomes a `[6, 8]` tile. Padding would give `[1, 6, 8]`, asking for 6 of
+an axis whose extent is 3. That is not a box the destination contains; it reached
+the intended bytes only while the outer stride happened to be contiguous, and
+PTOAS >= 0.61 rejects it:
+
+```text
+error: 'pto.partition_view' op size at dim 1 (6) exceeds static source dim (3)
+```
+
+The window is therefore built by walking the leading axes outward from the
+innermost, consuming each whole while the row count still spans it: `[2, 3, 8]`.
+
+**Not every collapsed store has a window.** A flattened store writes `rows`
+*consecutive* row-major positions starting at its offsets, and a box matches that
+run only when every axis the row count consumes is consumed whole and starts at
+0. A `[12, 8]` tile over `[2, 2, 4, 8]` has `[2, 2, 3, 8]` available as an
+in-bounds box that multiplies back to 12 rows, but it covers flat positions
+`{0,1,2, 4,5,6, 8,9,10, 12,13,14}` while the store means `{0..11}`. The pass
+rejects such a store rather than retargeting it onto memory the author did not
+name. The innermost axis is exempt — it carries the tile's columns, so a partial
+column range is still rectangular and only has to fit.
 
 ## Dynamic tile dimensions (issue #1578)
 

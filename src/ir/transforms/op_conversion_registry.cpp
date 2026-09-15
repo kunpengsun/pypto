@@ -40,6 +40,7 @@
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
 #include "pypto/ir/storage_size.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/printer.h"
 #include "pypto/ir/transforms/utils/tile_conversion_utils.h"
@@ -131,6 +132,78 @@ VarPtr AppendScratchTile(std::vector<StmtPtr>* prologue, const std::shared_ptr<c
   auto tmp_var = std::make_shared<Var>(name, create_call->GetType(), span);
   prologue->push_back(std::make_shared<AssignStmt>(tmp_var, create_call, span));
   return tmp_var;
+}
+
+ConversionResult ConvertFlatGather(const std::vector<ExprPtr>& args, const Span& span,
+                                   const ConversionContext& context) {
+  auto& reg = OpRegistry::GetInstance();
+  std::vector<StmtPtr> prologue;
+  auto emit = [&](const CallPtr& call, const std::string& name) -> VarPtr {
+    auto var = std::make_shared<Var>(name, call->GetType(), span);
+    prologue.push_back(std::make_shared<AssignStmt>(var, call, span));
+    return var;
+  };
+  ExprPtr index = args[1];
+  if (auto tensor = AsTensorTypeLike(index->GetType())) {
+    const auto valid = GetValidShape(tensor);
+    index = emit(reg.Create("tile.load",
+                            {index, MakeZeroOffsets(2, span), MakeShapeTuple(tensor->shape_, span),
+                             MakeShapeTuple(valid, span)},
+                            {{"target_memory", MemorySpace::Vec}}, span),
+                 "gather_idx");
+  }
+  auto index_type = As<TileType>(index->GetType());
+  INTERNAL_CHECK_SPAN(index_type, span) << "flat gather conversion requires a tile index after loading";
+  CHECK_SPAN(!index_type->memory_space_ || *index_type->memory_space_ == MemorySpace::Vec, span)
+      << "flat gather requires indices in Vec; move the index tile to Vec first";
+  const auto index_view = tile_view_semantics::GetEffectiveTileView(*index_type);
+  CHECK_SPAN(index_view.blayout == TileLayout::row_major && index_view.slayout == TileLayout::none_box, span)
+      << "flat gather requires indices with an unboxed row-major layout";
+  if (AsTensorTypeLike(args[0]->GetType())) {
+    return ConversionResult{std::move(prologue),
+                            reg.Create("tile.mgather", {args[0], index}, {{"coalesce", 1}}, span)};
+  }
+
+  auto source = As<TileType>(args[0]->GetType());
+  INTERNAL_CHECK_SPAN(source, span) << "flat gather conversion requires a GM tensor or on-chip tile";
+  CHECK_SPAN(source->shape_.size() == 2, span) << "flat gather on-chip source must be a 2D Vec tile";
+  CHECK_SPAN(!source->memory_space_ || *source->memory_space_ == MemorySpace::Vec, span)
+      << "flat gather on-chip source must be in Vec; move it to Vec or gather from GM";
+  const auto source_view = tile_view_semantics::GetEffectiveTileView(*source);
+  CHECK_SPAN(source_view.blayout == TileLayout::row_major && source_view.slayout == TileLayout::none_box,
+             span)
+      << "flat gather on-chip source must have an unboxed row-major layout";
+  auto rows = As<ConstInt>(source->shape_[0]);
+  auto cols = As<ConstInt>(source->shape_[1]);
+  CHECK_SPAN(rows && cols, span) << "flat gather on-chip source must have a static shape";
+  CHECK_SPAN(rows->value_ == 1 || (cols->value_ * source->dtype_.GetByte()) % 32 == 0, span)
+      << "flat gather on-chip source rows must be 32-byte aligned; gather directly from the GM tensor "
+         "for unaligned rows";
+
+  // Type metadata alone cannot prove packing: tile.slice retains the parent's
+  // pitch without encoding it in TileView. Only reuse a proven packed producer.
+  ExprPtr packed = args[0];
+  if (context.packed_tiles.count(packed) == 0) {
+    auto zero = std::make_shared<ConstInt>(0, DataType::INDEX, span);
+    // A2/A3 TEXTRACT cannot copy INT16/INT32. Integer addition of zero is an
+    // exact identity and packs the result without a lossy float conversion.
+    packed =
+        source->dtype_.IsInt()
+            ? emit(reg.Create("tile.adds", {args[0], std::make_shared<ConstInt>(0, source->dtype_, span)},
+                              span),
+                   "gather_src")
+            : emit(reg.Create("tile.extract", {args[0], zero, zero, MakeShapeTuple(source->shape_, span)},
+                              {{"target_memory", MemorySpace::Vec}}, span),
+                   "gather_src");
+  }
+  auto tmp = AppendScratchTile(&prologue, index_type, "gather_tmp", span);
+  auto valid_tmp = emit(
+      reg.Create("tile.set_validshape", {tmp, index_view.valid_shape[0], index_view.valid_shape[1]}, span),
+      "gather_tmp_valid");
+  auto result = emit(reg.Create("tile.gather", {packed, index, valid_tmp}, span), "gather_flat");
+  return ConversionResult{std::move(prologue),
+                          reg.Create("tile.set_validshape",
+                                     {result, index_view.valid_shape[0], index_view.valid_shape[1]}, span)};
 }
 
 // The space one operator's argument is declared to require, straight from its
@@ -1250,6 +1323,41 @@ void OpConversionRegistry::RegisterMatmulOps() {
         {BridgeSpaceOf({"tile.matmul", "tile.batch_matmul"}, 1), "b_trans", /*cube_m_axis=*/false,
          /*m_align_from_arg=*/std::nullopt, /*cube_n_axis=*/true}}});
 
+  // tensor.quant_mx: materialize the source in Vec and preserve the paired
+  // tuple result. The normal return-store path writes each projection to its
+  // own GM output when the values leave the InCore function; when they feed a
+  // tensor.matmul_mx below, the bridge instead keeps them on chip and the
+  // mixed-kernel expansion recognizes the direct V2C hand-off.
+  RegisterCustom(
+      "tensor.quant_mx",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        INTERNAL_CHECK_SPAN(args.size() == 1, span) << "tensor.quant_mx conversion expects one source";
+        return ConversionResult{OpRegistry::GetInstance().Create("tile.tquant_mx", args, kwargs, span)};
+      },
+      {{0, {BridgeSpaceOf({"tile.tquant_mx"}, 0), std::nullopt}}});
+
+  // tensor.matmul_mx: all four operands are loaded to Mat. InferTileMemorySpace
+  // then promotes data to Left/Right and scale tiles to LeftScale/RightScale.
+  // Keeping the scale inputs explicit is important: their MX TensorLayout
+  // selects TLoadMxCube* rather than an ordinary byte load.
+  RegisterCustom(
+      "tensor.matmul_mx",
+      [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
+         const Span& span) -> ConversionResult {
+        INTERNAL_CHECK_SPAN(args.size() == 4, span)
+            << "tensor.matmul_mx conversion expects lhs, lhs_scale, rhs, rhs_scale";
+        INTERNAL_CHECK_SPAN(kwargs.empty(), span)
+            << "tensor.matmul_mx conversion accepts no keyword arguments";
+        return ConversionResult{OpRegistry::GetInstance().Create("tile.matmul_mx", args, span)};
+      },
+      {{0, {BridgeSpaceOf({"tile.matmul_mx"}, 0), std::nullopt, /*cube_m_axis=*/true}},
+       {1, {BridgeSpaceOf({"tile.matmul_mx"}, 1), std::nullopt}},
+       {2,
+        {BridgeSpaceOf({"tile.matmul_mx"}, 2), std::nullopt, /*cube_m_axis=*/false,
+         /*m_align_from_arg=*/std::nullopt, /*cube_n_axis=*/true}},
+       {3, {BridgeSpaceOf({"tile.matmul_mx"}, 3), std::nullopt}}});
+
   // tensor.matmul_acc: 2D × 2D × 2D → tile.matmul_acc; any operand ≥3D →
   // tile.batch_matmul_acc. Same a_trans/b_trans handling as tensor.matmul.
   RegisterCustom(
@@ -1530,9 +1638,12 @@ void OpConversionRegistry::RegisterGatherOps() {
   RegisterCustom(
       "tensor.gather",
       [](const std::vector<ExprPtr>& args, const std::vector<std::pair<std::string, std::any>>& kwargs,
-         const Span& span) -> ConversionResult {
+         const Span& span, const ConversionContext& context) -> ConversionResult {
         INTERNAL_CHECK_SPAN(args.size() == 2, span)
             << "tensor.gather conversion expects 2 args (input, index), got " << args.size();
+        const bool has_dim =
+            std::any_of(kwargs.begin(), kwargs.end(), [](const auto& kwarg) { return kwarg.first == "dim"; });
+        if (!has_dim) return ConvertFlatGather(args, span, context);
         auto& op_reg = OpRegistry::GetInstance();
 
         const auto& input = args[0];
@@ -2935,10 +3046,20 @@ void OpConversionRegistry::RegisterSimple(const std::string& from_op, const std:
     }
     return ConversionResult{call};
   };
-  conversions_[from_op] = ConversionEntry{std::move(func), std::move(input_reqs)};
+  RegisterCustom(from_op, std::move(func), std::move(input_reqs));
 }
 
 void OpConversionRegistry::RegisterCustom(const std::string& from_op, ConversionFunc func,
+                                          std::unordered_map<size_t, InputSpaceReq> input_reqs) {
+  RegisterCustom(
+      from_op,
+      [func = std::move(func)](const std::vector<ExprPtr>& args,
+                               const std::vector<std::pair<std::string, std::any>>& kwargs, const Span& span,
+                               const ConversionContext&) { return func(args, kwargs, span); },
+      std::move(input_reqs));
+}
+
+void OpConversionRegistry::RegisterCustom(const std::string& from_op, ContextualConversionFunc func,
                                           std::unordered_map<size_t, InputSpaceReq> input_reqs) {
   conversions_[from_op] = ConversionEntry{std::move(func), std::move(input_reqs)};
 }

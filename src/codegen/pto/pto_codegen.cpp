@@ -852,6 +852,10 @@ void PTOCodegen::EmitDeferredCompletionAdapterDeclaration() {
 }
 
 void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
+  if (UsesBufferIR(func)) {
+    GenerateBufferFunction(func);
+    return;
+  }
   fs_.Reset();
   fs_.current_function = func;
 
@@ -1288,7 +1292,7 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
     // outlined body does not reference: PTOAS cannot infer a non-ND layout for
     // such an unused view (notably the MX scale tensors on the AIV cast side).
     if (body_vars.var_uses.count(param.get()) == 0) continue;
-    if (param->name_hint_ == "__gm_pipe_buffer") continue;         // GM slot buffer is a raw pointer
+    if (!fs_.buffer_ir && param->name_hint_ == "__gm_pipe_buffer") continue;  // Legacy GM slot buffer
     if (fs_.ffts_workspace_vars.count(param.get()) > 0) continue;  // FFTS workspace stays a raw pointer
 
     // ptoas rejects a malformed view (bad strides / layout) on this line, so
@@ -2116,6 +2120,7 @@ void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
 
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   auto call = As<ir::Call>(op->value_);
+  if (fs_.buffer_ir && TryEmitBufferCall(call, op->var_)) return;
   const bool is_set_validshape = ir::IsOp(call, "tile.set_validshape");
   const bool alias_result_to_in_place_input = ShouldAliasResultToInPlaceInput(op);
   const bool alias_array_update_to_input = ShouldAliasArrayUpdateResultToInput(op);
@@ -2273,6 +2278,7 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
 // ========================================================================
 
 void PTOCodegen::VisitExpr_(const CallPtr& op) {
+  if (fs_.buffer_ir && TryEmitBufferCall(op)) return;
   const std::string& op_name = op->op_->name_;
 
   CHECK(backend_ != nullptr) << "Backend must not be null; use PTOCodegen(backend) or default backend";
@@ -2555,11 +2561,6 @@ std::string PTOCodegen::TryGetTensorView(const VarPtr& tensor_var) const {
     if (auto init_iter = As<ir::IterArg>(iter_arg->initValue_)) return TryGetTensorView(init_iter);
   }
   return "";
-}
-
-bool PTOCodegen::NoteCacheBypassWarned(const ir::Var* tensor) {
-  INTERNAL_CHECK(tensor != nullptr) << "Internal error: null tensor passed to NoteCacheBypassWarned";
-  return fs_.cache_bypass_warned.insert(tensor).second;
 }
 
 std::string PTOCodegen::GetOrCreateTensorView(const VarPtr& tensor_var) {

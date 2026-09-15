@@ -12,15 +12,12 @@
 # The markdown under `docs/` is the single source of truth and must stay readable
 # directly on GitHub; this file only describes how it is rendered. The built site
 # is never committed -- CI publishes it to GitHub Pages (see .github/workflows/docs.yml).
-#
-# Build locally:
-#   pip install -r docs/requirements.txt
-#   mkdocs serve            # live preview on http://127.0.0.1:8000
-#   mkdocs build --strict   # what CI runs; warnings (broken links) fail the build
+
+INHERIT: .site-theme/docs-theme/base.yml
 
 site_name: PyPTO
 site_description: A high-performance programming framework for tile-centric computing
-site_url: https://hw-native-sys.github.io/pypto/
+site_url: https://www.pypto.ai/pypto/
 repo_url: https://github.com/hw-native-sys/pypto
 repo_name: hw-native-sys/pypto
 edit_uri: edit/main/docs/
@@ -32,6 +29,7 @@ site_dir: site
 # Build inputs that live under docs/ but are not content.
 exclude_docs: |
   requirements.txt
+  theme-revision.txt
   /superpowers/
 
 # Broken internal links must fail the build, not warn. `mkdocs build --strict`
@@ -46,31 +44,8 @@ validation:
     not_found: warn
 
 theme:
-  name: material
+  custom_dir: .site-theme/docs-theme/overrides
   language: en
-  features:
-    - navigation.tabs
-    - navigation.sections
-    - navigation.indexes
-    - navigation.top
-    - content.code.copy
-    - content.action.edit
-    - search.suggest
-    - search.highlight
-    - toc.follow
-  palette:
-    - scheme: default
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
 
 plugins:
   # `lang: [en, zh]` needs `jieba` for Chinese word segmentation -- it ships in
@@ -179,6 +154,7 @@ markdown_extensions:
       alternate_style: true
 
 extra:
+  pypto_project: pypto
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/hw-native-sys/pypto
@@ -293,6 +269,8 @@ nav:
       - en/dev/00-ecosystem.md
       - en/dev/01-compile-profiling.md
       - en/dev/08-artifact-identity.md
+      - en/dev/09-artifact-store.md
+      - en/dev/10-jit-cache.md
       - en/dev/02-error-handling.md
       - en/dev/03-logging.md
       - en/dev/03-runtime-dfx.md
@@ -313,10 +291,12 @@ nav:
           - en/dev/ir/03-structural_comparison.md
           - en/dev/ir/04-serialization.md
           - en/dev/ir/05-operators.md
+          - en/dev/ir/05-tensor-tile-ops.md
           - en/dev/ir/06-builder.md
           - en/dev/ir/07-parser.md
           - en/dev/ir/08-param-directions.md
           - en/dev/ir/09-multi_output_ops.md
+          - en/dev/ir/10-operator-effects.md
       - Passes:
           - en/dev/passes/index.md
           - en/dev/passes/00-pass_manager.md
@@ -395,4 +375,4 @@ nav:
       - Debug:
           - en/dev/debug/index.md
           - en/dev/debug/00-torch_codegen.md
-  - Runtime: https://hw-native-sys.github.io/simpler/
+  - Runtime: https://www.pypto.ai/simpler/

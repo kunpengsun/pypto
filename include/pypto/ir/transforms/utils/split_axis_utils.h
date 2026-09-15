@@ -13,6 +13,7 @@
 #define PYPTO_IR_TRANSFORMS_UTILS_SPLIT_AXIS_UTILS_H_
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -29,6 +30,12 @@
 namespace pypto {
 namespace ir {
 namespace split_axis {
+
+/// True only for a statically singleton physical split axis.
+bool IsSingletonSplitAxis(const TileType& type, int split_dim);
+
+/// Right-align an operand to its result; missing leading axes broadcast.
+bool IsBroadcastOnSplitAxis(const TileType& operand, int result_split_dim, int result_rank);
 
 /**
  * @brief Map a SplitMode to the tile dimension it partitions.
@@ -248,6 +255,19 @@ struct TileInfo {
   int split_dim = 0;
 };
 
+/// Admission facts for a lowered data-parallel body. Broadcast roots remain
+/// neutral: allowing a replicated producer does not prove its consumers split.
+struct SplitBodyAnalysis {
+  std::unordered_set<const Var*> half_tiles;
+  std::unordered_set<const Var*> lane_scalars;
+  std::vector<std::string> full_width_vec_ops;  ///< Operator names without proven per-lane dataflow.
+  std::vector<std::string> carry_mismatches;    ///< Carry names whose backedge loses an entry shard fact.
+};
+
+SplitBodyAnalysis AnalyzeSplitBody(const std::vector<StmtPtr>& stmts, int split_dim,
+                                   const std::unordered_map<const Var*, TileInfo>& known_tiles = {},
+                                   const std::unordered_map<const Var*, VarPtr>& replacements = {});
+
 /**
  * @brief Result of injecting the per-subblock index at the top of a body.
  *
@@ -382,7 +402,8 @@ std::vector<VarPtr> RepairReturnVars(const std::vector<VarPtr>& return_vars,
 /// is no halved version to substitute, so a diagnostic naming the carry is the
 /// only correct answer.
 void ValidateCarryBackedge(const StmtPtr& new_body, const std::vector<IterArgPtr>& new_iter_args,
-                           const std::unordered_map<const Var*, TileInfo>& tile_vars, const Span& span);
+                           const std::unordered_map<const Var*, TileInfo>& tile_vars,
+                           const std::unordered_map<const Var*, VarPtr>& var_replacements, const Span& span);
 
 std::vector<VarPtr> RepairIfReturnVars(const std::vector<VarPtr>& return_vars, const StmtPtr& new_then_body,
                                        const std::optional<StmtPtr>& new_else_body,
@@ -390,6 +411,54 @@ std::vector<VarPtr> RepairIfReturnVars(const std::vector<VarPtr>& return_vars, c
                                        std::unordered_map<const Var*, VarPtr>& var_replacements,
                                        const ExprPtr& subblock_idx, const ExprPtr& lane_stride,
                                        const Span& span);
+
+/// The split the pass has already applied to one operand, or nullopt when it is not
+/// lane-local. THE single answer to "did the split partition this operand, and along
+/// which axis" -- every gate must go through it.
+///
+/// A bound operand is looked up in @p tile_vars; an INLINE tuple projection
+/// (`pl.tile.store(pair[0], ...)`, which the DSL emits verbatim because nothing hoists
+/// a projection into its own binding) is not a Var and never appears there, so its axis
+/// is read back off the halved tuple type. Matching only Var is a silent wrong answer:
+/// the operand is substituted for its halved replacement regardless, leaving the
+/// consuming node a full-width declared type over per-lane data.
+std::optional<TileInfo> OperandSplitInfo(const ExprPtr& arg,
+                                         const std::unordered_map<const Var*, TileInfo>& tile_vars,
+                                         const std::unordered_map<const Var*, VarPtr>& var_replacements);
+
+/// The halved replacement for one operand, or nullptr when nothing replaces it.
+/// An inline projection is rebuilt over the replaced tuple, which re-derives the
+/// element type from it.
+ExprPtr ReplacedOperand(const ExprPtr& arg, const std::unordered_map<const Var*, VarPtr>& var_replacements);
+
+/// Rebuild @p ret with every ``tile.store`` of a tracked tile moved to this lane's
+/// half of the destination, or nullptr when it carries no such store.
+///
+/// A store that IS the return expression takes neither the AssignStmt nor the
+/// EvalStmt offset-localization arm, while the trailing Substitute swaps in the
+/// halved tile regardless. Both AIV lanes then write the same rows from different
+/// data and lane 1's half is silently lost. Both lowering arms must call this, for
+/// the same reason they must call RetypeTupleProjection.
+StmtPtr LocalizeReturnStores(const std::shared_ptr<const ReturnStmt>& ret,
+                             const std::unordered_map<const Var*, TileInfo>& tile_vars,
+                             const std::unordered_map<const Var*, VarPtr>& var_replacements,
+                             const ExprPtr& subblock_idx, const ExprPtr& lane_stride);
+
+/// Retype an ``x = tup[i]`` projection whose tuple was halved, or nullptr when
+/// @p assign is not such a projection.
+///
+/// A tuple-returning op has one split axis PER ELEMENT (tile.gather_compare answers a
+/// row split with a ``dst`` halved on dim 0 and a ``cdst`` -- shaped ``[1, rows]`` --
+/// halved on dim 1), so the projection cannot inherit a single result split dim. It
+/// reads the mapping back off the halved tuple type instead, and records the axis that
+/// moved in @p tile_vars so a later ``tile.store`` offsets each lane.
+///
+/// Both lowering arms must call this: the AUTO arm's affinity gate only routes leaf
+/// *calls* into ProcessStmts, so a projection left to its "pass through unchanged"
+/// fallback keeps a full-width declared type over a halved tuple.
+StmtPtr RetypeTupleProjection(const std::shared_ptr<const AssignStmt>& assign,
+                              std::unordered_map<const Var*, TileInfo>& tile_vars,
+                              std::unordered_map<const Var*, VarPtr>& var_replacements);
 
 std::vector<StmtPtr> ProcessStmts(const std::vector<StmtPtr>& stmts, SplitMode mode, int split_dim,
                                   std::unordered_map<const Var*, TileInfo>& tile_vars, bool is_aiv,

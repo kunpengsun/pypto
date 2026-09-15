@@ -24,6 +24,7 @@ from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit.decorator import (
     _SYNTHESIZED_DYN_PREFIX,
     JITFunction,
+    _allocate_generated_names,
     _arg_ref,
     _build_param_mapping,
     _compute_per_func_dyndim_maps,
@@ -301,8 +302,8 @@ class TestHostDiscoversOrchestrationDep:
 
         a = torch.empty(128, 128)
         c = torch.empty(128, 128)
-        _, _, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = host_orch._bind_args((a, c), {})
-        contexts = host_orch._build_contexts(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn)
+        _, _, tensor_meta, scalar_dtypes, per_func_dyn = host_orch._bind_args((a, c), {})
+        contexts = host_orch._build_contexts(tensor_meta, scalar_dtypes, per_func_dyn)
         dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "chip_orch")
         assert dep_ctx.auto_scope is False
 
@@ -322,8 +323,8 @@ class TestHostDiscoversOrchestrationDep:
 
         a = torch.empty(128, 128)
         c = torch.empty(128, 128)
-        _, _, tensor_meta, scalar_values, scalar_dtypes, per_func_dyn = entry._bind_args((a, c), {})
-        contexts = entry._build_contexts(tensor_meta, scalar_values, scalar_dtypes, per_func_dyn)
+        _, _, tensor_meta, scalar_dtypes, per_func_dyn = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tensor_meta, scalar_dtypes, per_func_dyn)
         dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "inline_fn")
         assert dep_ctx.auto_scope is False
         entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
@@ -708,9 +709,7 @@ class TestAliasedDepCallName:
             "a": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
             "c": TensorMeta(shape=(64, 64), dtype=DataType.FP32),
         }
-        dep_meta, _, _ = _resolve_dep_call_metadata(
-            dep, entry._func, caller_meta, {}, {}, {}, dep_call_name="kern"
-        )
+        dep_meta, _ = _resolve_dep_call_metadata(dep, entry._func, caller_meta, {}, {}, dep_call_name="kern")
         # Positional call-site mapping, not the name-based fallback: the dep's
         # own parameter names appear nowhere in the caller.
         assert dep_meta["src"].shape == (64, 64)
@@ -721,8 +720,8 @@ class TestAliasedDepCallName:
         entry, _ = self._aliased_entry()
         a = torch.empty(64, 64)
         c = torch.empty(64, 64)
-        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
-        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        _pn, _, tmeta, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sd, pfd)
 
         dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "copy_incore")
         assert dep_ctx.tensor_meta["src"].shape == (64, 64)
@@ -737,8 +736,8 @@ class TestAliasedDepCallName:
         entry, _ = self._aliased_entry()
         a = torch.empty(64, 64)
         c = torch.empty(64, 64)
-        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
-        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        _pn, _, tmeta, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sd, pfd)
         source = Specializer("_jit_entry", contexts).specialize()
 
         assert "self.copy_incore(a, c)" in source
@@ -767,8 +766,8 @@ class TestAliasedDepCallName:
 
         a = torch.empty(64, 64)
         c = torch.empty(64, 64)
-        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
-        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        _pn, _, tmeta, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sd, pfd)
         entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
         assert entry_ctx.dep_func_names == {"first": "copy_incore", "second": "copy_incore"}
 
@@ -816,8 +815,8 @@ class TestAliasedDepCallName:
 
         a = torch.empty(64, 64)
         c = torch.empty(64, 64)
-        _pn, _, tmeta, sv, sd, pfd = entry._bind_args((a, c), {})
-        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        _pn, _, tmeta, sd, pfd = entry._bind_args((a, c), {})
+        contexts = entry._build_contexts(tmeta, sd, pfd)
 
         dep_ctx = next(ctx for ctx in contexts if ctx.func_name == "copy_incore")
         assert dep_ctx.tensor_meta["src"].shape == (64, 64)
@@ -852,6 +851,275 @@ class TestAliasedDepCallName:
         # ``out`` captures the dep's Out param, which the call site bound to
         # ``buf`` — resolvable only if _scan_dep_io keyed the dep by "kern".
         assert metas["out"].shape == (32, 16)
+
+
+class TestDuplicateDepNames:
+    """Two distinct deps that share a ``__name__``.
+
+    Both emit into one ``@pl.program`` class, so the generated names must be
+    made unique — otherwise the parser refuses the whole program with a bare
+    ``Duplicate function name "helper"``, and the entry's two call sites both
+    rewrite to the same ``self.helper``.
+    """
+
+    @staticmethod
+    def _factory_entry():
+        """``entry`` calling two same-named kernels built by one factory."""
+
+        def make(rows):
+            @jit.incore
+            def helper(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+                tile = pl.load(src, [0, 0], [rows, 64])
+                pl.store(tile, [0, 0], dst)
+                return dst
+
+            return helper
+
+        first, second = make(32), make(64)
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            first(a, c)
+            second(a, c)
+            return c
+
+        return entry
+
+    @staticmethod
+    def _contexts_for(entry):
+        torch = pytest.importorskip("torch")
+        a = torch.empty(64, 64)
+        c = torch.empty(64, 64)
+        _pn, _, tmeta, sd, pfd = entry._bind_args((a, c), {})
+        return entry._build_contexts(tmeta, sd, pfd)
+
+    def test_same_named_deps_get_distinct_generated_names(self):
+        contexts = self._contexts_for(self._factory_entry())
+        assert [ctx.func_name for ctx in contexts] == ["helper", "helper__2", "entry"]
+        # The uniquified context still finds its ``def`` in its own source.
+        assert [ctx.source_def_name for ctx in contexts] == ["helper", "helper", "entry"]
+
+    def test_each_call_site_targets_its_own_specialization(self):
+        contexts = self._contexts_for(self._factory_entry())
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_func_names == {"first": "helper", "second": "helper__2"}
+
+    def test_generated_program_parses_and_keeps_both_bodies(self):
+        contexts = self._contexts_for(self._factory_entry())
+        source = Specializer("_jit_entry", contexts).specialize()
+
+        assert "def helper(self" in source
+        assert "def helper__2(self" in source
+        assert "self.helper(a, c)" in source
+        assert "self.helper__2(a, c)" in source
+        # Each specialization folded its own ``rows``; naming them apart is
+        # what keeps both bodies in the program.
+        assert "pl.load(src, [0, 0], [32, 64])" in source
+        assert "pl.load(src, [0, 0], [64, 64])" in source
+
+        program = pl.parse(source)
+        assert isinstance(program, ir.Program)
+        assert {f.name for f in program.functions} == {"helper", "helper__2", "entry"}
+
+    def test_deps_from_two_modules_sharing_a_name(self):
+        """The reported shape: two modules each defining the same kernel name.
+
+        The fixture module is loaded twice under different module names, so the
+        two ``copy_incore`` objects are genuinely distinct functions that agree
+        on ``__name__`` — exactly what two ``expert_routed`` definitions give.
+        """
+        import importlib.util  # noqa: PLC0415
+        import types  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        fixture_path = Path(__file__).parent / "_alias_dep_fixture.py"
+
+        def _load(mod_name):
+            spec = importlib.util.spec_from_file_location(mod_name, fixture_path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.copy_incore
+
+        left, right = _load("_dup_name_left"), _load("_dup_name_right")
+        assert left.__name__ == right.__name__ == "copy_incore"
+        assert left._func is not right._func
+
+        def _entry_raw(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            left(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            right(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            return c
+
+        new_globals = {**_entry_raw.__globals__, "left": left, "right": right}
+        entry = JITFunction(
+            types.FunctionType(
+                _entry_raw.__code__,
+                new_globals,
+                _entry_raw.__name__,
+                _entry_raw.__defaults__,
+                _entry_raw.__closure__,
+            ),
+            func_type="orchestration",
+        )
+
+        contexts = self._contexts_for(entry)
+        assert [ctx.func_name for ctx in contexts] == [
+            "copy_incore",
+            "copy_incore__2",
+            "_entry_raw",
+        ]
+        source = Specializer("_jit_entry_raw", contexts).specialize()
+        assert "self.copy_incore(a, c)" in source
+        assert "self.copy_incore__2(a, c)" in source
+        assert isinstance(pl.parse(source), ir.Program)
+
+    def test_dep_sharing_the_entry_name_yields_to_the_entry(self):
+        """The entry keeps the name the user called; the dep is the one moved."""
+
+        def make():
+            @jit.incore
+            def entry(src: pl.Tensor, dst: pl.Out[pl.Tensor]) -> pl.Tensor:
+                tile = pl.load(src, [0, 0], [64, 64])
+                pl.store(tile, [0, 0], dst)
+                return dst
+
+            return entry
+
+        dep = make()
+
+        @jit
+        def entry(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            dep(a, c)
+            return c
+
+        contexts = self._contexts_for(entry)
+        assert [ctx.func_name for ctx in contexts] == ["entry__2", "entry"]
+        entry_ctx = next(ctx for ctx in contexts if ctx.func_name == "entry")
+        assert entry_ctx.dep_func_names == {"dep": "entry__2"}
+        assert isinstance(pl.parse(Specializer("_jit_entry", contexts).specialize()), ir.Program)
+
+    def test_dep_layouts_cache_key_tracks_which_dep_declared_which_layout(self):
+        """Swapping two same-named deps' layouts must change the cache key.
+
+        ``dep_layouts`` is a *sorted* tuple, so it carries no position — keyed
+        by ``__name__`` it collapsed, and the second call got the first call's
+        artifact even though the generated signatures differ.
+        """
+        import importlib.util  # noqa: PLC0415
+        import types  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+
+        fixture_path = Path(__file__).parent / "_dup_layout_fixture.py"
+
+        def _load(mod_name):
+            """Load the fixture, returning ``(helper, its globals dict)``.
+
+            A postponed annotation is resolved against the function's own
+            globals, so rebinding ``LAYOUT`` there is what changes the layout
+            the dep declares — the module's ``__dict__`` is that same mapping.
+            """
+            spec = importlib.util.spec_from_file_location(mod_name, fixture_path)
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module.helper, module.__dict__
+
+        (left, left_globals), (right, right_globals) = (
+            _load("_dup_layout_left"),
+            _load("_dup_layout_right"),
+        )
+
+        def _entry_raw(a: pl.Tensor, c: pl.Out[pl.Tensor]):
+            left(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            right(a, c)  # noqa: F821  # pyright: ignore[reportUndefinedVariable]
+            return c
+
+        new_globals = {**_entry_raw.__globals__, "left": left, "right": right}
+        entry = JITFunction(
+            types.FunctionType(
+                _entry_raw.__code__,
+                new_globals,
+                _entry_raw.__name__,
+                _entry_raw.__defaults__,
+                _entry_raw.__closure__,
+            ),
+            func_type="orchestration",
+        )
+
+        left_globals["LAYOUT"], right_globals["LAYOUT"] = ir.TensorLayout.NZ, ir.TensorLayout.ND
+        first = entry._dep_declared_layouts()
+
+        left_globals["LAYOUT"], right_globals["LAYOUT"] = ir.TensorLayout.ND, ir.TensorLayout.NZ
+        second = entry._dep_declared_layouts()
+
+        # Each triple names the generated function whose signature carries the
+        # layout, so the swap is visible.
+        assert first == (
+            ("helper", "src", str(ir.TensorLayout.NZ)),
+            ("helper__2", "src", str(ir.TensorLayout.ND)),
+        )
+        assert second == (
+            ("helper", "src", str(ir.TensorLayout.ND)),
+            ("helper__2", "src", str(ir.TensorLayout.NZ)),
+        )
+        assert first != second
+
+
+class TestAllocateGeneratedNames:
+    """Unit coverage for the generated-name allocator itself."""
+
+    @staticmethod
+    def _jit_named(name, *, func_type="incore", external_core_type=None):
+        """A JITFunction over a trivial body — the allocator reads only names.
+
+        Each call builds a fresh function object, so same-named holders are
+        distinct keys, exactly as two factory-built kernels are.
+        """
+
+        def _f():
+            pass
+
+        _f.__name__ = name
+        return JITFunction(_f, func_type=func_type, external_core_type=external_core_type)
+
+    def test_entry_is_named_first(self):
+        entry = self._jit_named("k")
+        dep = self._jit_named("k")
+        names = _allocate_generated_names(entry, [dep])
+        assert names[id(entry._func)] == "k"
+        assert names[id(dep._func)] == "k__2"
+
+    def test_three_way_clash_counts_up(self):
+        entry = self._jit_named("e")
+        deps = [self._jit_named("k") for _ in range(3)]
+        names = _allocate_generated_names(entry, deps)
+        assert [names[id(d._func)] for d in deps] == ["k", "k__2", "k__3"]
+
+    def test_suffix_shaped_user_name_does_not_collide(self):
+        """A user function literally named ``k__2`` still gets its own slot."""
+        entry = self._jit_named("e")
+        deps = [self._jit_named("k__2"), self._jit_named("k"), self._jit_named("k")]
+        names = _allocate_generated_names(entry, deps)
+        generated = [names[id(d._func)] for d in deps]
+        assert generated == ["k__2", "k", "k__3"]
+        assert len(set(generated)) == len(generated)
+
+    def test_mixed_extern_reserves_its_member_names(self):
+        """A mixed extern occupies ``base``, ``base_aic`` and ``base_aiv``."""
+        entry = self._jit_named("e")
+        mixed = self._jit_named("k", func_type="extern", external_core_type="mixed")
+        plain = self._jit_named("k_aic")
+        names = _allocate_generated_names(entry, [mixed, plain])
+        assert names[id(mixed._func)] == "k"
+        assert names[id(plain._func)] == "k_aic__2"
+
+    def test_one_function_reached_twice_keeps_one_name(self):
+        """A diamond dep appears once in the map, not twice."""
+        entry = self._jit_named("e")
+        dep = self._jit_named("k")
+        names = _allocate_generated_names(entry, [dep, dep])
+        assert names[id(dep._func)] == "k"
+        assert len(names) == 2
 
 
 class TestMultiFuncIntegration:
@@ -1563,15 +1831,13 @@ class TestSliceAndDepReturnMetadata:
             "src": TensorMeta(shape=(32,), dtype=DataType.FP32),
             "out": TensorMeta(shape=(4, 8), dtype=DataType.FP32),
         }
-        tensor_meta, scalar_values, scalar_dtypes = _resolve_dep_call_metadata(
+        tensor_meta, scalar_dtypes = _resolve_dep_call_metadata(
             _callsite_metadata_kernel,
             caller,
             seed,
             {},
             {},
-            {},
         )
-        assert scalar_values == {}
         assert scalar_dtypes == {}
         return tensor_meta
 
@@ -1979,11 +2245,10 @@ class TestSlicedDispatchMetadata:
             "inputs": TensorMeta(shape=(2, 1, 256), dtype=DataType.FP32),
             "outputs": TensorMeta(shape=(2, 1, 256), dtype=DataType.FP32),
         }
-        tensor_meta, _, _ = _resolve_dep_call_metadata(
+        tensor_meta, _ = _resolve_dep_call_metadata(
             _sliced_chip,
             _per_rank_dispatch_body,
             seed,
-            {},
             {},
             {},
             caller_func_type="host",
@@ -1998,11 +2263,10 @@ class TestSlicedDispatchMetadata:
             "inputs": TensorMeta(shape=(2,), dtype=DataType.FP32),
             "outputs": TensorMeta(shape=(2,), dtype=DataType.FP32),
         }
-        tensor_meta, _, _ = _resolve_dep_call_metadata(
+        tensor_meta, _ = _resolve_dep_call_metadata(
             _sliced_chip,
             _per_rank_dispatch_body,
             seed,
-            {},
             {},
             {},
             caller_func_type="host",
@@ -2672,7 +2936,6 @@ class TestVariableRebinding:
                 "x": TensorMeta((128, 128), DataType.FP32),
                 "out": TensorMeta((128, 128), DataType.FP32),
             },
-            scalar_values={},
             scalar_dtypes={},
             per_func_dyn={id(kernel._func): {}},
             pl=pl,
@@ -2755,7 +3018,6 @@ class TestCompileKwargForwarding:
                 tensor_shapes={"x": (128, 128)},
                 tensor_dtypes={"x": DataType.FP32},
                 dynamic_dims=set(),
-                scalar_values={},
                 platform="a2a3",
                 strategy=OptimizationStrategy.Default,
                 distributed_config=distributed_config,
@@ -2784,7 +3046,6 @@ class TestCompileKwargForwarding:
                 tensor_shapes={"x": (128, 128)},
                 tensor_dtypes={"x": DataType.FP32},
                 dynamic_dims=set(),
-                scalar_values={},
                 platform="a2a3",
                 strategy=OptimizationStrategy.Default,
                 analyze_auto_scopes_for_deps=enabled,
@@ -2943,7 +3204,6 @@ class TestCompileKwargForwarding:
                 "x": TensorMeta((128, 128), DataType.FP32),
                 "out": TensorMeta((128, 128), DataType.FP32),
             },
-            scalar_values={},
             scalar_dtypes={},
             per_func_dyn={id(fwd_kernel._func): {}},
             pl=pl,
@@ -2984,7 +3244,6 @@ class TestCompileKwargForwarding:
                 "x": TensorMeta((128, 128), DataType.FP32),
                 "out": TensorMeta((128, 128), DataType.FP32),
             },
-            scalar_values={},
             scalar_dtypes={},
             per_func_dyn={id(plain_kernel._func): {}},
             pl=pl,
@@ -3043,7 +3302,6 @@ class TestJitSourceProvenance:
                 "x": TensorMeta((128, 128), DataType.FP32),
                 "out": TensorMeta((128, 128), DataType.FP32),
             },
-            scalar_values={},
             scalar_dtypes={},
             per_func_dyn={id(_provenance_kernel._func): {}},
             pl=pl,
@@ -3068,7 +3326,6 @@ class TestJitSourceProvenance:
                 "x": TensorMeta((128, 128), DataType.FP32),
                 "out": TensorMeta((128, 128), DataType.FP32),
             },
-            scalar_values={},
             scalar_dtypes={},
             per_func_dyn={id(_provenance_kernel._func): {}},
             pl=pl,
@@ -3092,8 +3349,8 @@ class TestClosureConstantFolding:
 
     @staticmethod
     def _specialize(entry, *args) -> str:
-        _pn, _, tmeta, sv, sd, pfd = entry._bind_args(args, {})
-        contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+        _pn, _, tmeta, sd, pfd = entry._bind_args(args, {})
+        contexts = entry._build_contexts(tmeta, sd, pfd)
         return Specializer(f"_jit_{entry.__name__}", contexts).specialize()
 
     @staticmethod
@@ -3343,9 +3600,7 @@ class TestRuntimeSizedLocalExtents:
             "cfg": TensorMeta(shape=(1,), dtype=DataType.INT64),
             "out": TensorMeta(shape=(16, 8), dtype=DataType.FP32),
         }
-        metas, _, _ = _resolve_dep_call_metadata(
-            _synth_dim_kernel, _runtime_create_then_dep, seed, {}, {}, {}
-        )
+        metas, _ = _resolve_dep_call_metadata(_synth_dim_kernel, _runtime_create_then_dep, seed, {}, {})
         dim = self._leading_dim(metas, "t")
         assert isinstance(dim, DynDim)
         assert dim.synthesized
@@ -3361,8 +3616,8 @@ class TestRuntimeSizedLocalExtents:
             "out": TensorMeta(shape=(16, 8), dtype=DataType.FP32),
         }
         dep_dyn_map = {"t": {0: DynDim(name="NR", literal="NR", static_bound=0)}}
-        metas, _, _ = _resolve_dep_call_metadata(
-            _synth_dim_kernel, _runtime_create_then_dep, seed, {}, {}, dep_dyn_map
+        metas, _ = _resolve_dep_call_metadata(
+            _synth_dim_kernel, _runtime_create_then_dep, seed, {}, dep_dyn_map
         )
         dim = self._leading_dim(metas, "t")
         assert isinstance(dim, DynDim)
@@ -3419,8 +3674,8 @@ class TestRuntimeSizedLocalExtents:
             "out": TensorMeta(shape=(16, 8), dtype=DataType.FP32),
         }
         dep_dyn_map = {"t": {0: DynDim(name="NR", literal="NR", static_bound=0)}}
-        metas, _, _ = _resolve_dep_call_metadata(
-            _synth_dim_kernel, _dyn_alias_create_then_dep, seed, {}, {}, dep_dyn_map
+        metas, _ = _resolve_dep_call_metadata(
+            _synth_dim_kernel, _dyn_alias_create_then_dep, seed, {}, dep_dyn_map
         )
         dim = self._leading_dim(metas, "t")
         assert isinstance(dim, DynDim)

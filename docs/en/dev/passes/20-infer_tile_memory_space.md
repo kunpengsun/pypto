@@ -86,9 +86,10 @@ For each `IfStmt` with `return_vars_`, the analyzer likewise records each TileTy
 | `HasRetargetableMemoryKwarg()` op (e.g. `tile.load`, `tile.create`) and resolver returned `None` (kwarg absent) | Phase-0 demand if it is `Vec` or `Mat`; a cube-operand demand (`Left`, `Right`, `LeftScale`, `RightScale`, `Bias`) resolves to `Mat`; otherwise input-inherit; else `Vec` |
 | `tile.*` op with `deduce_output_memory` returning `None` and not retargetable / not inherit | Input-inherit; else `Vec` |
 
-`tile.load` of a `TensorLayout.MX_A_ZZ` / `MX_B_NN` source must carry an
-explicit `target_memory=Mat`; type deduction rejects an omitted or different
-target before this pass runs.
+The public Python load builder normalizes an omitted target on a
+`TensorLayout.MX_A_ZZ` / `MX_B_NN` source to `target_memory=Mat`. Raw
+`tile.load` IR must still carry that target; type deduction rejects a missing
+or different target before this pass runs.
 
 The clamp to `{Vec, Mat}` on retargetable producers is deliberate: a DDR-facing `tile.load` cannot directly produce `Left`/`Right`/`Acc`/`Bias`, so even when downstream demand is one of those, the producer must stop at `Mat` (or `Vec`) and Phase 2 inserts a `tile.move` to reach the specialized space.
 
@@ -122,6 +123,9 @@ A full `IRMutator` rewrite that produces the new function body:
 3. **Argument substitution (`VisitExpr_(Call)`)** — replaces each constrained input arg with the matching `created_moves_` entry where present.
 4. **Retargetable producer kwarg rewrite (`VisitStmt_(AssignStmt)`)** — for ops registered with `HasRetargetableMemoryKwarg()`, if Phase 1 resolved the output to a different space than the kwarg said (or the kwarg was absent), rewrite the `Call`'s `target_memory` kwarg and the result `TileType` to match. This keeps codegen and the assigned `Var` annotation in sync, and is necessary because Phase 1 may have resolved the producer using backward demand that the kwarg never saw.
 5. **LHS / RHS type sync** — when `VisitExpr_(Call)` rebuilds a `Call` via `OpRegistry` after argument substitution, the deduced result type may differ from the LHS `Var`'s original type (the rebuilt call sees inputs with new layouts). The mutator syncs the LHS Var's `TileType` to the rebuilt call's shape / dtype / memref / view while preserving the `memory_space_` chosen by Var rewrite, so roundtrip equality is preserved.
+
+   The same synchronization applies to plain `Var` / `IterArg` aliases: an alias must describe the rewritten value, not retain the producer's pre-move layout.
+6. **Loop layout propagation** — `ForStmt` and `WhileStmt` carries inherit the rewritten initializer's physical layout (`blayout`, `slayout`, `fractal`) before the body is visited; loop results inherit that carry layout, including for zero iterations. Their own shape, dtype, allocation, and valid-shape metadata are preserved. Explicit non-default layouts are inherited rather than replaced with the memory space's default layout.
 
 ### Phase 4 — Loop-invariant Mat residency (`loop_invariant_mat_residency`)
 
@@ -253,7 +257,7 @@ The pass also registers a `TileMemoryInferred` `PropertyVerifier` (defined in th
 
 The `TileMemoryInferred` property is the contract this pass establishes. Downstream passes (notably `ExpandMixedKernel` and `InitMemRef`) rely on it, and the matching property verifier guards regressions.
 
-`AccToGmStoreValid` becomes decidable only here: whether a `tile.store` narrows from Acc into GM depends on the memory space this pass resolves. `AivSplitValid` is invalidated and re-produced for the same reason — this is the last verification point at which an AIV-split boundary whose operand space was still unresolved at `ConvertTensorToTileOps` becomes observable, before `LowerAutoVectorSplit` erases the region node.
+`AccToGmStoreValid` becomes decidable only here: whether a `tile.store` narrows from Acc into GM depends on the memory space this pass resolves. `AivSplitValid` is invalidated and re-produced for the same reason — this is the last verification point at which an AIV-split boundary whose operand space was still unresolved at `ConvertTensorToTileOps` becomes observable, before `LowerAutoVectorSplit` switches to the lowered-stage contract.
 
 ## Scope
 

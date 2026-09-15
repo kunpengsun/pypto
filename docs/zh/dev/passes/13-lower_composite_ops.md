@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-把组合 (composite) tile / distributed 算子降级 (lower) 为基础操作，使代码生成 (codegen) 不再需要发射其高层形式。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）、packed `tile.tquant_mx`，以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。
+把组合 (composite) tile / distributed 算子降级 (lower) 为基础操作，使代码生成 (codegen) 不再需要发射其高层形式。当前支持 `tile.sin` / `tile.cos`（FP32 Cody-Waite + Horner）、packed `tile.tquant_mx`，以及 `pld.tensor.*` 分布式集合通信算子（`allreduce`（mesh 与 ring）、`allgather`、`reduce_scatter`、`broadcast`、`barrier`、`all_to_all`、`all_to_all_v`）。mesh 和 ring allreduce 还可能创建保留元数据的 `tensor.view`，让 tile load/remote/store 操作一个 2D 展平目标窗口。
 
 ## 概览 (Overview)
 
@@ -55,7 +55,7 @@ src/ir/transforms/lower_composite_ops_pass.cpp
 
 降级创建 dtype 与源一致的 `max` / `scaling` 只写 workspace tile，再 `Bind` 值返回的 `tile.tquant_mx_raw(src, max, scaling)`，用 `TupleGetItem` 投影出 `TupleType{INT8 dst, UINT8 exp}`（与 `tile.gather_compare` 相同的 SSA 形态）。codegen 经 `ResolveTupleResultElements` 解析投影并发射带四个 outs 的 `pto.tquant.mx`。公开 `group_axis` 对齐 PTOAS `grpAxis`：axis1 保持 `[M,K]` 并返回 scale `[M,K/32]`；axis0 先把 `[N,K]` 转置为 `[K,N]` 再返回 `[K/32,N]`。两种形式再 `Bind` 值返回的 `tile.tmov_x2zz(exp, tmp)`。Axis1 tmp 容量为 `64 + ceil(rows/16)*cols` 字节（通常 32 字节对齐）；axis0 使用 `TMovDnTo2Zz` 所需的最小 32 字节 Vec pad。Axis0 遵循 pto-isa `TMovDnTo2Zz`（pin `be5ccb76`）：DN `[M̂,N]` → ZZ `[N,M̂]` row/row，再经零拷贝 `tile.transpose_view` 得到公开 `[M̂,N]` col/col scale。最后补上零拷贝 FP8 data alias 与 FP8E8M0 scale alias。workspace 参数上的 Write effect 保证公开结果未消费时 Call 也不会被 DCE 删掉。
 
-公开用法仍需把 `quant_mx` 与 `matmul_mx` 拆成独立 AIV/AIC kernel，经 GM 暂存；同一 InCore mixed task 内自动传 quant data+scale 留待后续（见 [ExpandMixedKernel](24-expand_mixed_kernel.md)）。
+在 Ascend950 上，公开的 quant data 与 scale 可以在同一个 InCore mixed task 内直接供 `matmul_mx` 使用；[ExpandMixedKernel](24-expand_mixed_kernel.md#mx-scale-的-v2c-传输) 会把两个结果直接经 V2C 传递。
 
 mutator 把本 Pass 产出的 `MakeTuple`（及其 SSA alias）记入私有 `composite_tuples_`，再折叠 `TupleGetItem`，避免滥用全局 `var_remap_` 去 inline 任意 `v = (a, b)`。内部 `tile.tquant_mx_raw` / `tile.tmov_x2zz` 不注册为组合规则，Pass 仍然幂等。
 
@@ -281,13 +281,11 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 ### `pld.tensor.allgather`
 
-签名：`allgather(local_data, target, signal)`。`local_data` 是本 rank 的 chunk（`Tensor` 或 `Tile` `[1, SIZE]`），`target` 是窗口绑定的 `DistributedTensor[NR, SIZE]` 暂存区同时又是结果，`signal` 是 INT32 屏障。基于推送 (push-based) 的展开：
+签名：`allgather(local_data, target, signal)`。`local_data` 是本 rank 的 chunk（InCore 路径上为普通 `Tensor` `[1, SIZE]`），`target` 是窗口绑定的 `DistributedTensor[NR, SIZE]` 暂存区同时又是结果，`signal` 是 INT32 屏障。基于推送 (push-based) 的展开：
 
-- ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — 分配一个 VEC staging tile 供 ``pld.tile.put`` 自动分块使用。``pld.tile.put`` 直接从 ``local_data`` Tensor（或 Tile）源读取 — 不发射显式的 ``tile.load``。
+- ``tile.create([1, stage_cols], dtype=..., target_memory=Vec)`` — 分配一个 VEC staging tile 供 ``pld.tile.put`` 自动分块使用。对于静态 extent，``stage_cols`` 先取 ``min(SIZE, chunk_elements)``，在小于完整 chunk 时再向下取整到 32-byte 行边界；例如 FP32 ``SIZE=17`` 得到 ``stage_cols=16``，而不是 17。短于一个对齐单元（FP32 为 8 个元素，packed-FP4 为 64 个元素）的传输，不存在既对齐又不大于传输的正 stage 宽度，因此仍不受支持。符号 extent 使用完整 chunk 上界 — 与 `MakeTputStageShape` / `chunk_cols` 相同的静态 UB 约定，因此运行时宽度 17 仍会分配 4096 个 FP32 元素。几何计算采用物理存储 bit 宽度，因此一个 16-KiB stage 可容纳 4096 个 FP32 或 32768 个 packed-FP4 逻辑元素。该 stage 是有界中转缓冲，**不是**传输的副本：pto-isa 从 partition view 读取完整 extent 并把传输在 stage 上做二维滑动，因此按 ``SIZE`` 来分配 stage 只会浪费 UB（``[1, 65537]`` 的 FP32 stage 为 256 KiB，会超出 VEC 预算）。``pld.tile.put`` 直接从 ``local_data`` Tensor 源读取 — 不发射显式的 ``tile.load``。
 - Phase 1：对 `peer` 从 `0` 到 `NR-1`，`pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — 将本 rank 的 chunk 推送到每个 peer 窗口的第 `my_rank` 行。自推送 (`peer == my_rank`) 通过 HCCL 恒等映射实现。`pld.tile.put` 在 SIZE 超过 staging tile 容量时自动分块
-- Phase 2a：notify-all（`AtomicAdd 1`）
-- Phase 2b：wait-all（`Ge 1`）
-- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
+- Phase 2：屏障（generation 1）+ 尾声（从每个非 self cell 减去 1）
 - 返回 `target` — 窗口本身就是汇聚后的 `[NR, SIZE]` 结果（窗口即结果，`DistributedTensor`）
 
 与原始基于拉取 (pull-based) 的 allgather（4 参数带独立 `out` 张量）相比，该推送版本去掉了 `out` 参数和每 peer 的 `pld.tile.get` 汇聚循环。总 HBM 从 `(NR+1)×SIZE` 降至 `NR×SIZE`，代价是窗口在调用方消费结果之前一直处于占用状态。
@@ -312,26 +310,31 @@ mesh 和 ring 降级均支持 FP16、FP32，以及任意正元素数量下的
 
 展开为 3 阶段序列：
 
-- Phase 2a：notify-all（`AtomicAdd 1`）
-- Phase 2b：wait-all（`Ge 1`）
-- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
-- Phase 3：每个 rank 都发射 `tile.create`（VEC staging tile）+ `pld.tile.get(target, peer=root, target, stage)`，把 root 的切片读进自己的 `target`。`peer == root` 时 HCCL 恒等映射让该 get 成为本地空操作，因此 root 保留自己的数据，非 root rank 收到 root 的数据
+- Phase 2：屏障（generation 1）
+- Phase 3：每个 rank 都发射 `tile.create`（VEC staging tile，与 allgather 一样上限为一个 16-KiB chunk）+ `pld.tile.get(target, peer=root, target, stage)`，把 root 的切片读进自己的 `target`。`peer == root` 时 HCCL 恒等映射让该 get 成为本地空操作，因此 root 保留自己的数据，非 root rank 收到 root 的数据。由于 stage 不再由 target 的 extent 推导，**动态** target shape 现已被接受 — 动态维度直接取 chunk 上限
+- 尾声：从每个非 self cell 减去 1
 
 `root` 是编译时已知的静态 `int` kwarg。
 
+### `pld.tensor.all_to_all`
+
+对称推送：每个 rank 通过 `pld.tile.put` 把 `input[dest, :]` 写入每个 peer 窗口的第 `my_rank` 行，然后做屏障。共享 VEC stage 与 allgather 相同，是有界的 `[stage_rows, stage_cols]` 中转缓冲。
+
+### `pld.tensor.all_to_all_v`
+
+可变大小推送（`MPI_Alltoallv` 模式）。每个目的地通过同一个有界 2-D stage 传输 `clamp(send_counts[dest], 0, MAX_RECV)` 行；`target.shape[0] % NR == 0` 仍是负载约束，以便接收方按行 `s * MAX_RECV` 定位发送方 `s`。运行时行数是动态 partition-view 维，stage 本身仍是静态 chunk 上界。
+
 ### `pld.tensor.barrier`
 
-纯同步，无数据搬运。展开为 2 阶段序列：
+纯同步，无数据搬运。展开为屏障（generation 1）加上其尾声（从每个非 self cell 减去 1）。
 
-- Phase 2a：notify-all（`AtomicAdd 1`）
-- Phase 2b：wait-all（`Ge 1`）
-- 尾调用：`EmitEpilogueReset`（自清理信用屏障）
-
-返回表达式就是同一个 `signal` 张量，支持 `signal = pld.tensor.barrier(signal)` 的 rebind 写法。
+返回表达式就是同一个 `signal` 张量，支持 `signal = pld.tensor.barrier(signal)` 的 rebind 写法。在自清理协议下，每次调用都从 generation 1 重新开始，因此 rebind 不再需要链到任何先前状态。
 
 ### Signal buffer 约定
 
-所有分布式规则在 wait 谓词上都使用 `kGe` 而非 `kEq`。单次调用内 cell 单调递增，但慢的 rank 第一次轮询时，如果快的 peer 已经完成 Phase 3 的数据搬运并开始下一轮 notify，cell 可能已经超过阈值。此时 `kEq` 会死锁，`kGe` 不会。可自重置的写法（调用结束时 set-to-zero / `Eq 0`）受 PTOAS issue #797 阻塞，后续运行时修复落地后才能切换。
+每次调用发出 `N` 次屏障 — 向每个 peer cell 做 `AtomicAdd(1)`，再 `Wait(>= g)`，其中 `g` **只在该次调用内**递增（每次新调用经 `EmitBarrier` 的调用局部 `barrier_count_` 从 1 重新开始）。主体结束后，尾声（`EmitEpilogueReset`）用一次 `AtomicAdd(-N)` 从每个非 self cell 减去本次调用的总信用 `N`。原子加与减可交换，因此一旦每个 rank 完成尾声，signal 可证明再次全零 — 没有跨调用状态，下一次在同一 signal 上的调用也从 generation 1 开始。
+
+所有分布式规则在 wait 谓词上都使用 `kGe` 而非 `kEq`。快的 peer 可能在慢 rank 第一次轮询前就把 cell 推进到超过阈值，此时 `kEq` 会死锁，`kGe` 不会。同理，`kSet` 绝不能与 `kAtomicAdd` 混用在同一组 cell 上。
 
 ## 实现要点 (Implementation Notes)
 

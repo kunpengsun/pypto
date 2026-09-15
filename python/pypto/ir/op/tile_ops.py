@@ -43,6 +43,7 @@ from ..utils import (
     _to_int32_scalar,
     _to_make_tuple,
     resolve_cast_mode,
+    resolve_saturation_deviation,
 )
 from ._pad_value import normalize_pad_value
 
@@ -209,9 +210,10 @@ def load(
             element must be an integer scalar — one extent per dimension, never a
             nested tuple.
         target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
-            ``None`` (the default) leaves the space unset so InferTileMemorySpace
-            places the tile from consumer demand; the kwarg is then omitted from
-            the op entirely. MX-layout tensors require an explicit MemorySpace.Mat.
+            ``None`` (the default) leaves an ordinary load unset so
+            InferTileMemorySpace places the tile from consumer demand. An
+            MX-layout load instead defaults to MemorySpace.Mat, the only memory
+            that the raw MX load instruction can target.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts that ``offsets + valid_shape`` stays inside the source
             and is rejected when that provably fails; with ``clamp=True`` the
@@ -236,10 +238,12 @@ def load(
     source_layout = getattr(tensor_view, "layout", None)
     is_mx = source_layout in (TensorLayout.MX_A_ZZ, TensorLayout.MX_B_NN)
 
-    if is_mx and target_memory != MemorySpace.Mat:
+    if is_mx and target_memory is None:
+        target_memory = MemorySpace.Mat
+    elif is_mx and target_memory != MemorySpace.Mat:
         raise ValueError(
-            "tile.load of an MX-layout tensor requires explicit target_memory=MemorySpace.Mat "
-            f"(MX scale loads are L1/Mat only); got {target_memory}"
+            "tile.load of an MX-layout tensor only supports target_memory=MemorySpace.Mat "
+            f"(omitting target_memory selects Mat automatically); got {target_memory}"
         )
 
     # Validate target_memory: only Vec and Mat are allowed for load. ``None``
@@ -1762,6 +1766,7 @@ def cast(
     span: Span | None = None,
     *,
     tmp: Expr | None = None,
+    saturation_mode: str | int | None = None,
 ) -> Call:
     """Cast tile to target data type (element-wise).
 
@@ -1771,8 +1776,15 @@ def cast(
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
         span: Optional source span for debugging (auto-captured if not provided)
-        tmp: Optional A2/A3 PTOAS scratch tile for non-saturating narrowing
-             tcvt. Normally compiler-generated.
+        tmp: Optional A2/A3 PTOAS scratch tile for a non-saturating narrowing
+             tcvt. Normally compiler-generated, and only for a cast that opted
+             out of saturation — the saturating form is native and reads none.
+        saturation_mode: Destination saturation — "on" (1) clamps out-of-range
+             results to the destination range, "off" (0) selects the target's
+             non-saturating conversion. ``None`` takes the destination's own
+             default — ``DEFAULT_SATURATION_MODE`` ("on") for an integer
+             destination, the target's own behavior for a float one. Only a
+             deviation from that default is recorded on the call.
 
     Returns:
         Call expression for element-wise cast to target dtype
@@ -1784,7 +1796,10 @@ def cast(
     mode_val = resolve_cast_mode(mode)
 
     actual_span = _get_span_or_capture(span)
+    deviation = resolve_saturation_deviation(saturation_mode, target_type)
     kwargs: dict[str, Any] = {"target_type": target_type, "mode": mode_val}
+    if deviation is not None:
+        kwargs["saturation_mode"] = deviation
     args: list[Expr] = [tile] if tmp is None else [tile, tmp]
     return _ir_core.create_op_call("tile.cast", args, kwargs, actual_span)
 

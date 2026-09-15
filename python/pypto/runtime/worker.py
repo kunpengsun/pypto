@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import contextvars
 import ctypes
+import threading
 import weakref
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any
@@ -113,6 +114,26 @@ def _close_simpler_worker_best_effort(impl: Any) -> None:
         # retryable, so this still gives an abandoned construction one final
         # opportunity to drain its native cleanup journal.
         pass
+
+
+# Serialises device-context opening across threads in one process.
+#
+# ``simpler_init`` levels CANN's process-global dlog and then opens the device
+# context (``rtSetDevice`` inside ``attach_current_thread``), and CANN snapshots
+# that global state at context-open time. Two threads opening contexts at once
+# can therefore each capture the other's half-applied state.
+#
+# Measured on a2a3: four concurrent inits in one process fail
+# non-deterministically -- ``simpler_init failed with code 507018`` (AICPU init
+# stream sync) or ``107000`` (param-invalid), on a different case each time --
+# while four separate *processes* doing the same four inits are clean, because
+# each owns its CANN globals. Serialising the open makes four-way clean over
+# five runs.
+#
+# Only the open is serialised. Registration, dispatch and close stay concurrent,
+# and the open is short enough that concurrency still pays: 19 profiled cases
+# across four cards go from 122s (one at a time) to 35s.
+_device_init_lock = threading.Lock()
 
 
 class ChipWorker(Worker):
@@ -261,7 +282,8 @@ class ChipWorker(Worker):
         # dispatch asks for. A per-call RunConfig that sizes the rings differently
         # rebuilds once, as before. No-op without a prebuilt arena.
         try:
-            self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
+            with _device_init_lock:
+                self._impl.init(prewarm_config=_get_simpler_call_config_cls()())
         except BaseException:
             # Simpler marks a partially failed startup terminal. Drive its
             # retryable cleanup immediately; if cleanup itself fails, retain
@@ -582,7 +604,9 @@ class ChipWorker(Worker):
 
         dfx_dir: Path | None = None
         if rc.any_dfx_enabled():
-            dfx_dir = Path(compiled.output_dir) / "dfx_outputs"
+            from ._artifact_runtime import runtime_output_directory  # noqa: PLC0415
+
+            dfx_dir = runtime_output_directory(compiled) / "dfx_outputs"
             dfx_dir.mkdir(parents=True, exist_ok=True)
 
         orch_args, coerced, return_style = compiled._build_orch_args(*args, worker=self._impl)
@@ -592,7 +616,13 @@ class ChipWorker(Worker):
         if dfx_dir is not None:
             from .runner import _collect_dfx_artifacts  # noqa: PLC0415
 
-            _collect_dfx_artifacts(dfx_dir, self.platform, rc.dfx_options())
+            runtime = vars(compiled).get("_artifact_runtime")
+            if runtime is None:
+                _collect_dfx_artifacts(dfx_dir, self.platform, rc.dfx_options())
+            else:
+                _collect_dfx_artifacts(
+                    dfx_dir, self.platform, rc.dfx_options(), prebuilt_directory=runtime.directory
+                )
 
         if not return_style:
             return None

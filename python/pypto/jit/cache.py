@@ -7,26 +7,17 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Compilation cache support for @pl.jit functions.
+"""In-process specialization keys for @pl.jit.
 
-The active cache used by JITFunction is an in-memory dict on each instance (L1).
-This module also defines the cache-key construction utilities and an on-disk
-L2 cache implementation (l2_lookup / l2_store) that can be wired in by callers
-to persist compiled artifacts across process restarts.
-
-Cache keys encode source hash, tensor shapes/dtypes, scalar values, and the
-PyPTO version so that a version upgrade automatically invalidates stale entries.
-Dynamic dimensions (marked via bind_dynamic) are stored as None in the key
-so different concrete values for that dimension share the same cache entry.
+Persistent dispatch uses full typed identities and immutable transactions in
+``_persistent`` and ``artifact_cache``. Dynamic dimensions use None so runtime
+extents do not create unnecessary specializations.
 """
 
 import dataclasses
 import hashlib
-import json
-import shutil
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from pypto.pypto_core import DataType
 from pypto.pypto_core.passes import MemoryPlanner, RuntimeKind, runtime_kind_to_name
@@ -43,8 +34,19 @@ try:
 except Exception:
     _PYPTO_VERSION = "unknown"
 
-# Root directory for L2 on-disk cache.
-_L2_CACHE_ROOT = Path.home() / ".cache" / "pypto" / "jit"
+SCALAR_SEMANTICS: Final[int] = 2
+"""Version of the scalar-parameter contract this key was built under.
+
+Bumped whenever the meaning of a scalar parameter changes, so an artifact
+compiled under an older contract can never be served to a newer request.
+
+- 1: a numeric argument to a ``pl.Scalar`` parameter was folded into the body
+  and keyed by value, so each value compiled its own artifact.
+- 2: a ``pl.Scalar`` parameter is a runtime value — it stays symbolic in the
+  generated program, its value arrives at dispatch, and it takes no part in
+  this key. Compile-time constants come from module-level or closure names,
+  which ``compute_source_hash`` already folds into ``source_hash``.
+"""
 
 
 @dataclass(frozen=True)
@@ -68,31 +70,19 @@ class TensorCacheInfo:
     layout: "TensorLayout | None" = None
 
 
-@dataclass(frozen=True)
-class ScalarCacheInfo:
-    """Per-scalar-param component of a cache key.
+class CacheKey(NamedTuple):
+    """Named specialization components, retaining tuple equality and hashing.
 
-    Attributes:
-        name: Parameter name.
-        value: Concrete scalar value passed at this call site.
+    Scalar parameters are deliberately absent: they are runtime values, so one
+    artifact serves every value (see :data:`SCALAR_SEMANTICS`).
     """
 
-    name: str
-    value: int | float | bool
-
-
-# A cache key is a tuple of
-# (source_hash, platform, strategy, tensor_infos, scalar_infos, dist_config, compile_opts).
-# Using a plain tuple keeps it hashable without a custom __hash__.
-CacheKey = tuple[
-    str,
-    str | None,
-    "OptimizationStrategy | None",
-    tuple[TensorCacheInfo, ...],
-    tuple[ScalarCacheInfo, ...],
-    tuple[Any, ...] | None,
-    tuple[Any, ...] | None,
-]
+    source_hash: str
+    platform: str | None
+    strategy: "OptimizationStrategy | None"
+    tensor_infos: tuple[TensorCacheInfo, ...]
+    dist_config: tuple[Any, ...] | None
+    compile_opts: tuple[Any, ...] | None
 
 
 def _freeze(value: Any) -> Any:
@@ -137,7 +127,6 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
     tensor_shapes: dict[str, tuple[int, ...]],
     tensor_dtypes: dict[str, DataType],
     dynamic_dims: set[tuple[str, int]],
-    scalar_values: dict[str, int | float | bool],
     platform: str | None = None,
     strategy: "OptimizationStrategy | None" = None,
     distributed_config: Any = None,
@@ -159,15 +148,16 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         tensor_layouts: Annotated layout per tensor parameter name, where the
             annotation declares one. See :class:`TensorCacheInfo.layout` for
             why the layout has to split the key on its own.
-        dep_layouts: ``(dep name, parameter, layout)`` triples for layouts the
-            reachable deps declare themselves. Same reasoning as
+        dep_layouts: ``(generated dep name, parameter, layout)`` triples for
+            layouts the reachable deps declare themselves. Same reasoning as
             ``tensor_layouts``, one call deeper: they shape the generated dep
             signatures but appear in no entry-parameter meta, and a postponed
-            annotation hides a rebind from ``source_hash``.
+            annotation hides a rebind from ``source_hash``. The name is the
+            *generated* one, so two same-named deps stay distinguishable in
+            this sorted, position-free tuple.
         dynamic_dims: Set of (param_name, dim_index) pairs that are dynamic.
             Dynamic dims are stored as None in the cache key so different
             concrete values for that dimension produce the same cache entry.
-        scalar_values: Concrete value per scalar parameter name.
         platform: Target platform string (e.g. "a2a3sim"). Included in the key
             because compiled artifacts are platform-specific; a cache entry
             compiled for one platform must not be reused for another.
@@ -231,18 +221,13 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
             )
         )
 
-    scalar_infos = []
-    for name in param_names:
-        if name not in scalar_values:
-            continue
-        scalar_infos.append(ScalarCacheInfo(name=name, value=scalar_values[name]))
-
     dist_key = _freeze(distributed_config) if distributed_config is not None else None
     effective_pypto_dbc = enable_pypto_l0c_double_buffer and memory_planner in (
         None,
         MemoryPlanner.PYPTO,
     )
     compile_opts = (
+        ("scalar_semantics", SCALAR_SEMANTICS),
         ("analyze_auto_scopes_for_deps", analyze_auto_scopes_for_deps),
         ("emit_source_loc", emit_source_loc),
         ("memory_planner", None if memory_planner is None else str(memory_planner)),
@@ -250,84 +235,20 @@ def make_cache_key(  # noqa: PLR0913 — args are the key's components, one per 
         ("dep_layouts", dep_layouts),
         ("runtime", runtime_kind_to_name(runtime)),
     )
-    return (
+    return CacheKey(
         source_hash,
         platform,
         strategy,
         tuple(tensor_infos),
-        tuple(scalar_infos),
         dist_key,
         compile_opts,
     )
 
 
-def _key_to_hash(key: CacheKey) -> str:
-    """Return a SHA-256 hex digest of the cache key (for L2 directory naming)."""
-    h = hashlib.sha256()
-    h.update(json.dumps(key, default=str).encode())
-    return h.hexdigest()
-
-
-def l2_lookup(key: CacheKey) -> str | None:
-    """Look up a compiled output_dir from the L2 on-disk cache.
-
-    The L2 cache stores the path to the compiled artifacts directory produced
-    by ``ir.compile()``.  The path is written to ``manifest.json`` inside the
-    cache slot.  Returns ``None`` on a cache miss or if the stored path no
-    longer exists on disk.
-
-    Args:
-        key: Cache key for this specialization.
-
-    Returns:
-        Absolute path string to the compiled output directory, or ``None``
-        on a miss.
-    """
-    slot = _L2_CACHE_ROOT / _key_to_hash(key)
-    manifest = slot / "manifest.json"
-    if not manifest.exists():
-        return None
-    try:
-        data = json.loads(manifest.read_text())
-        output_dir = data.get("output_dir", "")
-        if output_dir and Path(output_dir).exists():
-            return output_dir
-    except Exception:
-        pass
-    return None
-
-
-def l2_store(key: CacheKey, output_dir: str) -> None:
-    """Store a compiled output_dir in the L2 on-disk cache.
-
-    Copies the entire ``output_dir`` tree into the cache slot so the artifacts
-    survive even if the original directory is cleaned up.  Writes a
-    ``manifest.json`` pointing to the cached copy.
-
-    Args:
-        key: Cache key for this specialization.
-        output_dir: Path to the directory produced by ``ir.compile()``.
-    """
-    slot = _L2_CACHE_ROOT / _key_to_hash(key)
-    try:
-        slot.mkdir(parents=True, exist_ok=True)
-        artifacts_dir = slot / "artifacts"
-        if artifacts_dir.exists():
-            shutil.rmtree(artifacts_dir)
-        shutil.copytree(output_dir, artifacts_dir)
-        manifest = slot / "manifest.json"
-        manifest.write_text(json.dumps({"output_dir": str(artifacts_dir)}))
-    except Exception:
-        # L2 cache write failure is non-fatal; L1 cache will still be used.
-        pass
-
-
 __all__ = [
+    "SCALAR_SEMANTICS",
     "CacheKey",
-    "ScalarCacheInfo",
     "TensorCacheInfo",
     "compute_source_hash",
-    "l2_lookup",
-    "l2_store",
     "make_cache_key",
 ]

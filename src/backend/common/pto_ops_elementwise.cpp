@@ -32,6 +32,7 @@
 #include "pypto/codegen/pto/pto_codegen.h"
 #include "pypto/core/dtype.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/kind_traits.h"
 #include "pypto/ir/memory_space.h"
@@ -400,10 +401,30 @@ static std::string MakePrecisionCodegenPTO(const std::string& pto_op_name, size_
 // The level3 explicit-tmp form verifies tcvt scratch against src capacity and
 // dst valid_shape. alloc_tile types keep v_row=?, v_col=?, so bridge to
 // static-valid views the same way tprelu / tcolsum do.
+//
+// Both forms carry the same config attr-dict, so the rounding mode and the
+// destination saturation are rendered once, before the form splits. The IR
+// records only a deviation from the destination's default, so the default is
+// read through here -- an integer destination emits an explicit `satmode` even
+// when the cast said nothing, while a float destination emits none and keeps the
+// target's own IEEE overflow behavior.
 static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& codegen_base) {
   auto& codegen = AsPto(codegen_base);
   INTERNAL_CHECK_SPAN(op->args_.size() == 1 || op->args_.size() == 2, op->span_)
       << "tile.cast requires 1 or 2 arguments (src[, tmp]), but got " << op->args_.size();
+
+  const int mode = op->GetKwarg<int>("mode");
+  INTERNAL_CHECK_SPAN(mode >= 0 && mode < static_cast<int>(round_modes.size()), op->span_)
+      << "Internal error: tile.cast round mode out of range: " << mode;
+  std::string config_attr = "{rmode = #pto<round_mode " + round_modes.at(mode) + ">";
+  if (const auto saturation_mode = ir::GetSaturationMode(op)) {
+    INTERNAL_CHECK_SPAN(ir::IsValidSaturationMode(*saturation_mode), op->span_)
+        << "Internal error: tile.cast saturation_mode out of range: " << *saturation_mode;
+    config_attr +=
+        ", satmode = #pto<saturation_mode " + ir::SaturationModeToPTOString(*saturation_mode) + ">";
+  }
+  config_attr += "}";
+
   if (op->args_.size() == 2 && codegen.GetBackendHandler()->RequiresLevel3TmpScratch()) {
     auto src_type = ir::As<ir::TileType>(op->args_[0]->GetType());
     auto tmp_type = ir::As<ir::TileType>(op->args_[1]->GetType());
@@ -418,17 +439,14 @@ static std::string MakeTcvtCodegenPTO(const CallPtr& op, codegen::CodegenBase& c
     const std::string tmp_ssa = EnsureStaticViewTileSsa(op->args_[1], codegen, "tcvt_tmp_view");
     const std::string dst_ssa = EnsureStaticViewTileSsa(dst_var, codegen, "tcvt_dst_view");
 
-    int mode = op->GetKwarg<int>("mode", 2);
-    CHECK(mode >= 0 && mode < static_cast<int>(round_modes.size())) << "Round mode out of range: " << mode;
-    std::string config_attr = std::string("{rmode = #pto<round_mode ") + round_modes.at(mode) + ">}";
     EmitInsOutsWithViewTypes(codegen, "pto.tcvt",
                              {{src_ssa, GetTileViewTypeAnnotation(op->args_[0], codegen)},
                               {tmp_ssa, GetTileViewTypeAnnotation(op->args_[1], codegen)}},
                              dst_ssa, dst_type, config_attr);
     return "";
   }
-  return MakeModalCodegenPTO("pto.tcvt", op->args_.size(), "mode", round_modes, "Round", "rmode",
-                             "round_mode", op, codegen);
+  codegen.Emit("pto.tcvt " + GenerateInsOutsClause(op, codegen, config_attr));
+  return "";
 }
 
 static std::string MakeRemainderCodegenPTO(const std::string& pto_op_name, size_t arity,

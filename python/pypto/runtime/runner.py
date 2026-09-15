@@ -51,6 +51,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from pypto._cache_config import CacheConfig
 from pypto.backend import BackendType
 from pypto.ir.pass_manager import OptimizationStrategy, PassDumpLevel
 from pypto.pypto_core import backend as _backend_core
@@ -235,6 +236,7 @@ class RunConfig:
     does not execute or write compilation artifacts.
 
     Attributes:
+        cache_config: Complete per-call persistent-cache policy. None uses process or environment defaults.
         arch: Target architecture, as the codegen backend that names it —
             ``BackendType.Ascend910B`` (a2a3) or ``BackendType.Ascend950`` (a5).
         execution_mode: :class:`ExecutionMode.SIM` or ``ONBOARD``.
@@ -259,8 +261,8 @@ class RunConfig:
         save_kernels: If ``True``, retain generated artefacts after execution.
             When ``False`` (default), a temporary directory is used and cleaned up.
         save_kernels_dir: Directory to save generated artefacts when *save_kernels*
-            is ``True``.  If ``None``, a timestamped directory is created under
-            ``build_output/<program_name>_<timestamp>``.
+            is ``True``.  If ``None``, a fresh directory is created per call
+            under ``build_output/<program_name>_<unique>``.
         codegen_only: If ``True``, stop after code generation without executing
             on device.  Useful for validating compilation output.
         enable_chip_swimlane: Chip swimlane collection **level** — per-task
@@ -433,6 +435,7 @@ class RunConfig:
     ring_task_window: int | list[int] | tuple[int, ...] | None = None
     ring_heap: int | list[int] | tuple[int, ...] | None = None
     ring_dep_pool: int | list[int] | tuple[int, ...] | None = None
+    cache_config: CacheConfig | None = None
     distributed_config: "DistributedConfig | None" = None
     analyze_auto_scopes_for_deps: bool = False
     memory_planner: MemoryPlanner | None = None
@@ -831,8 +834,7 @@ class DfxOptions:
 class RunOptions:
     """What a dispatch reads: where it runs, how big its rings are, what it collects.
 
-    Everything here is per-launch. Nothing here reaches compilation — an
-    artifact compiled once can be dispatched under any number of these.
+    Everything here is per-launch. Nothing here reaches compilation.
 
     ``platform`` appears in both halves because it is genuinely two decisions
     that must agree: the target codegen builds for, and the device the worker
@@ -1376,6 +1378,8 @@ def _collect_dfx_artifacts(
     dfx_dir: Path,
     platform: str,
     dfx: "DfxOptions",
+    *,
+    prebuilt_directory: Path | None = None,
 ) -> None:
     """Dispatch post-run DFX converters per enabled flag.
 
@@ -1394,7 +1398,10 @@ def _collect_dfx_artifacts(
     # consumers); harmless no-op when no kernel names are available.
     name_map_path: Path | None = None
     if dfx.enable_chip_swimlane or dfx.enable_dep_gen:
-        name_map_path = _write_name_map(dfx_dir.parent, dfx_dir)
+        if prebuilt_directory is None:
+            name_map_path = _write_name_map(dfx_dir.parent, dfx_dir)
+        else:
+            name_map_path = _write_name_map(prebuilt_directory, dfx_dir, prebuilt=True)
 
     chip_swimlane_records = dfx_dir / _CHIP_SWIMLANE_RECORDS_NAME
     if dfx.enable_chip_swimlane and chip_swimlane_records.exists():
@@ -1457,7 +1464,7 @@ def _collect_dfx_artifacts(
         )
 
 
-def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
+def _write_name_map(work_dir: Path, dfx_dir: Path, *, prebuilt: bool = False) -> Path | None:
     """Synthesise a ``name_map_*.json`` in *dfx_dir* from ``kernel_config.py``.
 
     The profiling tools render human-readable kernel names (``QK(rXtY)``
@@ -1481,11 +1488,16 @@ def _write_name_map(work_dir: Path, dfx_dir: Path) -> Path | None:
     if not kernel_config_path.exists():
         return None
     try:
-        from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-            load_kernel_config,
-        )
+        if prebuilt:
+            from ._prebuilt import kernel_name_map  # noqa: PLC0415
 
-        func_id_to_name = load_kernel_config(str(kernel_config_path))
+            func_id_to_name = kernel_name_map(work_dir)
+        else:
+            from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+                load_kernel_config,
+            )
+
+            func_id_to_name = load_kernel_config(str(kernel_config_path))
     except Exception as e:  # noqa: BLE001 - best-effort diagnostics, never fatal
         print(f"Skipping name_map generation ({type(e).__name__}: {e})")
         return None
@@ -1510,6 +1522,7 @@ def _generate_swimlane(
     swimlane_dir: Path,
     perf_file: Path | None,
     func_names: Path | None = None,
+    deps_json: Path | None = None,
 ) -> None:
     """Run ``python -m simpler_setup.tools.swimlane_converter`` to generate ``merged_swimlane_*.json``.
 
@@ -1526,6 +1539,13 @@ def _generate_swimlane(
         func_names: Optional ``name_map_*.json`` (see :func:`_write_name_map`)
             passed to the converter via ``--func-names``. Takes precedence over
             the ``-k kernel_config.py`` fallback for label resolution.
+        deps_json: Optional ``deps.json`` passed to the converter via
+            ``--deps-json``. Only needed when the task graph does not sit beside
+            the records — the converter's own default is the sibling file — which
+            is the L3 two-pass case, where the graph and timing passes are
+            separate captures in separate directories (see
+            :func:`~pypto.runtime.distributed_runner._collect_l3_swimlane`).
+            Without it the swimlane renders with no dependency edges.
     """
     converter_module = "simpler_setup.tools.swimlane_converter"
     try:
@@ -1562,6 +1582,10 @@ def _generate_swimlane(
     # for label resolution; ``-k`` stays as the fallback when no map was written.
     if func_names is not None:
         cmd += ["--func-names", str(func_names)]
+    # The converter defaults to the records' sibling ``deps.json``; pass the
+    # path only when the caller located the graph elsewhere.
+    if deps_json is not None:
+        cmd += ["--deps-json", str(deps_json)]
 
     try:
         subprocess.run(cmd, check=True)
@@ -1589,6 +1613,7 @@ def _execute_compiled(  # noqa: PLR0913
     aicpu_thread_num: int | None = None,
     analyze_auto_scopes_for_deps: bool = False,
     config: RunConfig | None = None,
+    artifact_runtime: Any = None,
 ) -> None:
     """Execute a pre-compiled program with user-provided tensors and scalars.
 
@@ -1642,14 +1667,21 @@ def _execute_compiled(  # noqa: PLR0913
     # orchestration cpp was hand-edited for a replay, still builds.
     from pypto.ir.compile import _ensure_orchestration_headers  # noqa: PLC0415
 
-    _ensure_orchestration_headers(str(work_dir))
+    if artifact_runtime is None:
+        _ensure_orchestration_headers(str(work_dir))
 
     from .device_runner import (  # noqa: PLC0415
         _compile_and_assemble,
         _execute_on_device,
     )
 
-    chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, platform)
+    if artifact_runtime is None:
+        chip_callable, runtime_name, runtime_config = _compile_and_assemble(work_dir, platform)
+    else:
+        if platform != artifact_runtime.platform:
+            raise ValueError("Cannot override the platform of an immutable runtime artifact")
+        chip_callable, runtime_name, runtime_config = artifact_runtime.load()["."]
+        work_dir = artifact_runtime.run_directory
     enable_sdma = bool(runtime_config.get("enable_sdma", False))
 
     # Caller-supplied values take precedence over the RUNTIME_CONFIG baked
@@ -1693,6 +1725,7 @@ def _execute_compiled(  # noqa: PLR0913
         _capture_deps_subprocess(
             {
                 "mode": "argspec",
+                **({"prebuilt": str(artifact_runtime.directory)} if artifact_runtime is not None else {}),
                 "args": _build_args_spec(args, dfx_dir, run_id),
                 "work_dir": str(work_dir),
                 "platform": platform,
@@ -1718,7 +1751,10 @@ def _execute_compiled(  # noqa: PLR0913
     # Original ``dfx`` drives collection so swimlane conversion auto-joins
     # ``deps.json`` and the deps-render hint fires only on explicit dep_gen.
     if dfx_dir is not None:
-        _collect_dfx_artifacts(dfx_dir, platform, dfx)
+        if artifact_runtime is None:
+            _collect_dfx_artifacts(dfx_dir, platform, dfx)
+        else:
+            _collect_dfx_artifacts(dfx_dir, platform, dfx, prebuilt_directory=artifact_runtime.directory)
 
 
 _EXECUTE_COMPILED_DEPRECATION = (

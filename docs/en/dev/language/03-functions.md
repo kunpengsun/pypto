@@ -5,11 +5,23 @@ print IR back to Python syntax.
 
 ## JIT constants and compilation reuse
 
-`@pl.jit` includes referenced `int`, `float`, and `bool` globals and closure
-bindings in its compilation key, including constants used by transitive JIT
-helpers and source annotations. Rebinding a referenced constant causes a new
-specialization; changing an unrelated global or a name shadowed by a body-local
-variable does not invalidate the body dependency key.
+A `@pl.jit` body is parsed into `@pl.program` source and re-parsed in a namespace
+holding only `pl` and `pld`, so any name it inherits from its own module or an
+enclosing function must be replaced, at its use site, by source text that
+evaluates back to the same value. That covers literals (`int`, `float`, `bool`,
+`str`, `None`), the `pl` dtype and enum constants (`pl.INT8`, `pl.Mem.Vec`,
+`pl.PadValue.zero`, `pl.NZ`), and lists/tuples nested from those — a shape or a
+rounding mode held in a constant, for instance. A value with no source form is
+left alone, so the name survives and the parser reports it.
+
+Every name that folds is also in the compilation key, including constants used by
+transitive JIT helpers and source annotations. The key hashes the *emitted text*
+for each name, straight from the function the specializer folds with, so the two
+cannot drift: a constant that changes the generated source changes the key by
+construction, and one that does not fold contributes nothing. Rebinding a
+referenced constant causes a new specialization; changing an unrelated global or a
+name shadowed by a body-local variable does not invalidate the body dependency
+key.
 
 ```python
 BLOCK = 32
@@ -43,8 +55,8 @@ source dependency hash without a separate closure-key component.
 
 The snapshot copies bindings only: mutating arbitrary configuration objects
 or editing compiler/source files during compilation is not supported by this
-constant-tracking mechanism. This behavior does not enable persistent artifact
-caching; compiled objects are still reused within the process.
+constant-tracking mechanism. Persistent reuse additionally requires the full
+[artifact identity and cache policy](../10-jit-cache.md).
 
 ### Compile options and diagnostic requests
 
@@ -83,6 +95,58 @@ cached = slice_kernel.compile()
 slice_kernel.compile(config=RunConfig(dump_passes=True, save_kernels_dir="debug_kernel"))
 assert slice_kernel.compile() is cached
 ```
+
+### Prepare binaries without executing
+
+`kernel.warmup()` uses the same specialization, configuration, and in-process
+object cache as `kernel.compile()`, and also prepares every kernel and
+orchestration binary before returning. It initializes no NPU and creates no
+runtime worker. The build host still needs the target compiler, SDK, and runtime
+Python/native dependencies.
+
+```python
+import pypto.language as pl
+from pypto.runtime import RunConfig
+
+@pl.jit
+def add_three(
+    x: pl.Tensor[[16, 16], pl.FP32],
+    out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        tile = pl.load(x, [0, 0], [16, 16])
+        pl.store(pl.add(tile, 3.0), [0, 0], out)
+    return out
+
+config = RunConfig(platform="a2a3")
+prepared = add_three.warmup(config=config)  # No sample tensor allocation.
+# Later, on a host with an available NPU:
+# prepared(x, out, config=config)
+```
+
+You can supply sample tensors as with `compile()`; warmup reads their metadata,
+not their contents. With complete tensor annotations, omit the tensors entirely:
+scalar parameters are runtime values, so they need no value here, and dynamic
+extents retain the existing compile rules. When calling the returned compiled
+object, supply its full parameter list, including scalar arguments — that is
+where each scalar's value is read.
+Execution-only settings such as `codegen_only` do not suppress binary preparation.
+
+The result is the same compiled object selected by `compile()`, with live IR
+retained for fresh compilation. Warmup prepares every chip-level child of a
+`DistributedCompiledProgram` and every orchestration sub-build of a
+multi-orchestration `CompiledProgram`. It does not call the distributed object's
+`prepare()`: that method creates a live worker for execution. Compilation errors
+propagate to the caller; a failed binary build can be retried by calling warmup
+again. Diagnostic/output requests still compile afresh as described above.
+
+With [persistent caching](../10-jit-cache.md) enabled, warmup automatically
+publishes or reuses READY artifacts through the [runtime protocol](../09-artifact-store.md).
+Persistence is disabled by default. Read-only misses, unsupported inputs and
+storage failures can prepare private results. A restored result has
+`.program is None`; disable persistence or use `specialize()`/`lower()` to require IR.
+The public cache policy, statistics and metadata-only warmup CLI are documented
+in [Persistent JIT Cache](../10-jit-cache.md).
 
 ## Functions
 

@@ -21,12 +21,14 @@ from unittest.mock import Mock
 
 import pypto.runtime._binary_cache as binary_cache
 import pytest
+from pypto.jit._artifact_manifest import BuildKind
 from pypto.runtime._binary_cache import (
     BinaryCacheContext,
     binary_context_path,
     prepare_binary_context,
     record_binary_context,
 )
+from pypto.runtime._prebuilt import BINARY_MANIFEST, prepare_prebuilt, read_prebuilt
 
 _RUNTIME_OLD = "a" * 40
 _RUNTIME_NEW = "b" * 40
@@ -411,6 +413,101 @@ def test_compile_and_assemble_serializes_same_work_dir(
         if process.is_alive():
             process.terminate()
         process.join(timeout=5)
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_prebuilt_records_final_bytes_only_after_complete_assembly(
+    device_runner, monkeypatch, tmp_path, fail
+):
+    chip_build = Mock(side_effect=RuntimeError("assembly failed")) if fail else Mock(return_value=object())
+    _stub_assembly(device_runner, monkeypatch, tmp_path, chip_build)
+    with (tmp_path / "kernel_config.py").open("a") as stream:
+        stream.write("KERNELS = [dict(func_id=3, name='final', source='kernel.cpp')]\n")
+    monkeypatch.setattr(device_runner, "_kernel_cache_file", Mock(return_value=tmp_path / "cache.bin"))
+    monkeypatch.setattr(device_runner, "_compile_single_kernel", Mock(return_value=(3, b"stripped kernel")))
+    monkeypatch.setattr(device_runner, "CoreCallable", SimpleNamespace(build=Mock(return_value=object())))
+    if fail:
+        with pytest.raises(RuntimeError, match="assembly failed"):
+            device_runner._compile_and_assemble(tmp_path, "a2a3sim", save_prebuilt=True)
+        assert not (tmp_path / BINARY_MANIFEST).exists()
+    else:
+        device_runner._compile_and_assemble(tmp_path, "a2a3sim", save_prebuilt=True)
+        record = read_prebuilt(tmp_path, "a2a3sim", BuildKind.SINGLE_CHIP)["."]
+        assert record["kernels"][0]["binary"] == b"stripped kernel"
+        assert record["orchestration"]["binary"] == b"orchestration binary"
+
+
+@pytest.mark.parametrize("cache_form", ["final", "sidecar"])
+def test_ready_promotion_ignores_inherited_mutable_binaries(device_runner, monkeypatch, tmp_path, cache_form):
+    _real_orchestration_compiler = device_runner._compile_single_orchestration
+    context = _stub_assembly(device_runner, monkeypatch, tmp_path, Mock(return_value=object()))
+    # Use sources outside the conventional kernels/ directory as well: the
+    # manifest, not an output-directory naming convention, defines each source.
+    source = _touch(tmp_path / "generated/updated.cpp", b"// new kernel")
+    with (tmp_path / "kernel_config.py").open("a") as stream:
+        stream.write(
+            f"KERNELS = [dict(func_id=3, name='updated', core_type='aiv', source={str(source)!r})]\n"
+        )
+    kernel_cache = tmp_path / "cache/kernel.bin"
+    if cache_form == "final":
+        _touch(kernel_cache, b"old kernel")
+        _touch(tmp_path / "cache/orch_main.bin", b"old orchestration")
+    else:
+        _touch(source.with_suffix(".so"), b"old kernel")
+        _touch(tmp_path / "orchestration/main.so", b"old orchestration")
+    record_binary_context(tmp_path, context)
+    compiler = SimpleNamespace(
+        compile_incore=Mock(return_value=b"new kernel"),
+        compile_orchestration=Mock(return_value=b"new orchestration"),
+    )
+    monkeypatch.setattr(device_runner, "KernelCompiler", Mock(return_value=compiler))
+    monkeypatch.setattr(device_runner, "_kernel_cache_file", Mock(return_value=kernel_cache))
+    monkeypatch.setattr(device_runner, "CoreCallable", SimpleNamespace(build=Mock(return_value=object())))
+    # _stub_assembly stubs this helper; restore it to exercise source-sidecar reuse.
+    monkeypatch.setattr(device_runner, "_compile_single_orchestration", _real_orchestration_compiler)
+    device_runner._compile_and_assemble(tmp_path, "a2a3sim", save_prebuilt=True)
+    record = read_prebuilt(tmp_path, "a2a3sim", BuildKind.SINGLE_CHIP)["."]
+    assert record["kernels"][0]["binary"] == b"new kernel"
+    assert record["orchestration"]["binary"] == b"new orchestration"
+    compiler.compile_incore.assert_called_once()
+    compiler.compile_orchestration.assert_called_once()
+
+
+@pytest.mark.parametrize("platform", ["a2a3sim", "a2a3"])
+def test_ready_compiler_retains_only_one_copy_of_final_binaries(
+    device_runner, monkeypatch, tmp_path, platform
+):
+    compile_orchestration = device_runner._compile_single_orchestration
+    _stub_assembly(device_runner, monkeypatch, tmp_path, Mock(return_value=object()))
+    source = _touch(tmp_path / "kernels/kernel.cpp", b"// kernel")
+    with (tmp_path / "kernel_config.py").open("a") as stream:
+        stream.write(f"KERNELS = [dict(func_id=3, name='k', core_type='aiv', source={str(source)!r})]\n")
+    kernel = b"k" * 100_000
+    orchestration = b"o" * 300_000
+    compiler = SimpleNamespace(
+        compile_incore=Mock(return_value=kernel if platform.endswith("sim") else kernel * 3),
+        compile_orchestration=Mock(return_value=orchestration),
+    )
+    monkeypatch.setattr(device_runner, "KernelCompiler", Mock(return_value=compiler))
+    monkeypatch.setattr(device_runner, "extract_text_section", Mock(return_value=kernel))
+    monkeypatch.setattr(device_runner, "_kernel_cache_file", Mock(return_value=tmp_path / "cache/kernel.bin"))
+    monkeypatch.setattr(device_runner, "CoreCallable", SimpleNamespace(build=Mock(return_value=object())))
+    monkeypatch.setattr(device_runner, "_compile_single_orchestration", compile_orchestration)
+    prepare_prebuilt(tmp_path, platform, BuildKind.SINGLE_CHIP)
+    records = read_prebuilt(tmp_path, platform, BuildKind.SINGLE_CHIP)["."]
+    assert records["kernels"][0]["binary"] == kernel
+    assert records["orchestration"]["binary"] == orchestration
+    files = {str(p.relative_to(tmp_path)): p.stat().st_size for p in tmp_path.rglob("*") if p.is_file()}
+    assert set(files) == {
+        "kernel_config.py",
+        "kernels/kernel.cpp",
+        "orchestration/main.cpp",
+        BINARY_MANIFEST,
+        "prebuilt/kernel_0.bin",
+        "prebuilt/orchestration.bin",
+    }
+    assert sum(files.values()) < 402_000
+    assert not (tmp_path / "cache").exists()
 
 
 if __name__ == "__main__":

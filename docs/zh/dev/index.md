@@ -36,4 +36,4 @@ PyPTO 的构成：IR、pass 流水线、代码生成，以及围绕它们的基�
 ## 另请参阅
 
 - [PTO ISA 参考](../reference/index.md) —— 后端所面向的硬件模型。
-- [运行时文档](https://hw-native-sys.github.io/simpler/) —— 执行已编译程序的调度器。
+- [运行时文档](https://www.pypto.ai/simpler/) —— 执行已编译程序的调度器。

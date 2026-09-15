@@ -29,6 +29,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -320,6 +321,17 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
       INTERNAL_CHECK_SPAN(src_type, span) << "tile.cast source must be TileType before InitMemRef";
       const DataType dst = call->GetKwarg<DataType>("target_type");
       if (!TcvtNeedsLevel3Scratch(src_type->dtype_, dst)) return std::nullopt;
+      // The scratch exists only for PTOAS's *non-saturating* narrowing helper,
+      // which emulates the target's overflow behavior with a chunked vector
+      // sequence. A saturating cast is a native conversion that takes no tmp, so
+      // synthesizing one would allocate Vec memory the emitted `pto.tcvt` never
+      // reads. Every pair reaching here narrows to an integer, whose default is
+      // saturating, so only a cast that explicitly opted out needs the buffer. A
+      // caller-supplied tmp is untouched either way: this arm only runs for the
+      // 1-argument form.
+      if (GetSaturationMode(call) != static_cast<int>(SaturationMode::kOff)) {
+        return std::nullopt;
+      }
       const int64_t bytes = TcvtScratchCapacityBytes(src_type, dst, span);
       return PtoScratchSpec{MakeStaticShape({1, bytes}, span), DataType::INT8, "tcvt"};
     }

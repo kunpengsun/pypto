@@ -37,6 +37,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/comm.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
@@ -627,6 +628,49 @@ std::string IRPythonPrinter::Print(const IRNodePtr& node) {
 }
 
 std::string IRPythonPrinter::Print(const TypePtr& type) {
+  // Buffer IR is internal: print native constructors without adding DSL types.
+  if (As<VoidType>(type)) {
+    return "pypto.ir.VoidType()";
+  }
+  if (auto buffer = As<BufferType>(type)) {
+    std::ostringstream oss;
+    auto print_dims = [&oss](const std::vector<int64_t>& dims) {
+      oss << "[";
+      for (size_t i = 0; i < dims.size(); ++i) {
+        if (i > 0) oss << ", ";
+        oss << dims[i];
+      }
+      oss << "]";
+    };
+    oss << "pypto.ir.BufferType(";
+    print_dims(buffer->shape_);
+    oss << ", pypto.ir.DataType." << DataTypeToString(buffer->dtype_) << ", pypto.ir.MemorySpace."
+        << MemorySpaceToString(buffer->memory_space_) << ", valid_shape=";
+    print_dims(buffer->valid_shape_);
+    oss << ", blayout=pypto.ir.TileLayout." << TileLayoutToString(buffer->blayout_)
+        << ", slayout=pypto.ir.TileLayout." << TileLayoutToString(buffer->slayout_)
+        << ", fractal=" << buffer->fractal_ << ", pad=pypto.ir.PadValue.";
+    switch (buffer->pad_) {
+      case PadValue::null:
+        oss << "null";
+        break;
+      case PadValue::zero:
+        oss << "zero";
+        break;
+      case PadValue::max:
+        oss << "max";
+        break;
+      case PadValue::min:
+        oss << "min";
+        break;
+    }
+    oss << ", compact=pypto.ir.CompactMode." << CompactModeToString(buffer->compact_) << ")";
+    return oss.str();
+  }
+  if (auto multi_buffer = As<MultiBufferType>(type)) {
+    return "pypto.ir.MultiBufferType(" + Print(multi_buffer->element_type_) + ", " +
+           std::to_string(multi_buffer->slot_count_) + ")";
+  }
   if (auto scalar_type = As<ScalarType>(type)) {
     // Print as pl.Scalar[pl.INT64] for proper round-trip support
     return prefix_ + ".Scalar[" + prefix_ + "." + DataTypeToString(scalar_type->dtype_) + "]";
@@ -1423,6 +1467,11 @@ void IRPythonPrinter::VisitExpr_(const CallPtr& op) {
         stream_ << prefix_ << ".PipeType." << PipeTypeToString(static_cast<PipeType>(int_val));
       } else if (key == "mode") {
         stream_ << "'" << CastModeToString(int_val) << "'";
+      } else if (key == "saturation_mode") {
+        // Print the DSL spelling ('off'/'on') rather than the raw code, the
+        // same way `mode` is restored, so a printed cast reparses as the call
+        // the author would have written.
+        stream_ << "'" << SaturationModeToName(int_val) << "'";
       } else if (key == "atomic") {
         // Stored as int (the DSL casts AtomicType -> int before stashing on
         // kwargs_; nb::isinstance<AtomicType> in bindings does the same). The
@@ -3022,7 +3071,10 @@ static std::unordered_map<const Var*, std::string> CollectDynVarMapping(const Pr
   };
 
   std::function<void(const TypePtr&)> collect_from_type = [&](const TypePtr& type) {
-    if (auto tensor_type = As<TensorType>(type)) {
+    // AsTensorTypeLike, not As<TensorType>: DistributedTensorType has its own
+    // ObjectKind, so the exact-match As<TensorType> misses it and the symbols a
+    // pld.DistributedTensor annotation declares never reach dyn_var_rename_map_.
+    if (auto tensor_type = AsTensorTypeLike(type)) {
       for (const auto& dim : tensor_type->shape_) {
         collect_vars_from_expr(dim);
       }
@@ -3225,6 +3277,9 @@ void IRPythonPrinter::VisitProgram(const ProgramPtr& program) {
   }
   if (body_str.find("pld.") != std::string::npos) {
     stream_ << "import pypto.language.distributed as pld\n";
+  }
+  if (body_str.find("pypto.ir.") != std::string::npos) {
+    stream_ << "import pypto\n";
   }
   stream_ << "\n" << body_str;
 }

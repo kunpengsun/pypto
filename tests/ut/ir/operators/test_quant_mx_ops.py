@@ -95,12 +95,11 @@ class TestQuantMxTypes:
         with pytest.raises(ValueError, match="group_axis must be 0 or 1"):
             pl.quant_mx(src, group_axis=2)
 
-    def test_public_rejects_unsupported_dtype(self):
+    @pytest.mark.parametrize("dtype", [pl.FP8E5M2, pl.FP4])
+    def test_public_rejects_unsupported_dtype(self, dtype):
         src = pl.Tile(expr=_tile("src", (16, 64), pl.FP16))
         with pytest.raises(ValueError, match="supports only FP8E4M3FN"):
-            pl.quant_mx(src, group_axis=1, dtype=pl.FP8E5M2)
-        with pytest.raises(ValueError, match="supports only FP8E4M3FN"):
-            pl.quant_mx(src, group_axis=1, dtype=pl.FP4)
+            pl.quant_mx(src, group_axis=1, dtype=dtype)
 
     @pytest.mark.parametrize(
         ("shape", "dtype", "group_axis", "message"),
@@ -162,6 +161,36 @@ class TestQuantMxTypes:
             ir.op.tile.tmov_x2zz(src0, _tile("tiny", (1, 16), pl.UINT8), group_axis=0)
         with pytest.raises(ValueError, match="requires dst_rows and dst_cols"):
             ir.op.tile.tmov_x2zz(src, tmp, group_axis=1)
+
+
+class TestTensorQuantMxTypes:
+    @pytest.mark.parametrize(
+        ("group_axis", "src_shape", "quant_shape", "scale_shape", "layout"),
+        [
+            (1, (16, 64), (16, 64), (16, 2), ir.TensorLayout.MX_A_ZZ),
+            (0, (32, 64), (64, 32), (2, 32), ir.TensorLayout.MX_B_NN),
+        ],
+    )
+    def test_tensor_quant_mx_returns_oriented_data_and_mx_scale(
+        self, group_axis, src_shape, quant_shape, scale_shape, layout
+    ):
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TensorType(src_shape, pl.BF16), span)
+
+        call = ir.op.tensor.quant_mx(src, group_axis=group_axis)
+
+        assert isinstance(call.type, ir.TupleType)
+        quant, scale = call.type.types
+        assert isinstance(quant, ir.TensorType) and quant.dtype == pl.FP8E4M3FN
+        assert isinstance(scale, ir.TensorType) and scale.dtype == pl.FP8E8M0
+        assert _shape_values(quant) == quant_shape
+        assert _shape_values(scale) == scale_shape
+        assert scale.tensor_view is not None and scale.tensor_view.layout == layout
+
+    def test_tensor_quant_mx_rejects_misaligned_shapes(self):
+        span = ir.Span.unknown()
+        with pytest.raises(ValueError, match="N divisible by 32"):
+            ir.op.tensor.quant_mx(ir.Var("src", ir.TensorType([16, 64], pl.FP16), span), group_axis=0)
 
 
 if __name__ == "__main__":

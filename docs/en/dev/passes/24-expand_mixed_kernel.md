@@ -73,15 +73,16 @@ points at the offending transpose with two fix directions:
 carries no split data — the no-op broadcast case — and is left split; a dynamic,
 non-`ConstInt` extent is treated as non-singleton and flagged conservatively).
 
-This whole-function check reads a **single** `func->GetSplitMode()`, so it cannot
-represent a multi-mode function. By the time `ExpandMixedKernel` runs, any
-first-class `SplitAivScopeStmt` regions have already been consumed and erased by
-[`LowerAutoVectorSplit`](23-lower_auto_vector_split.md) (pass 23), which validates
-**each region's** transpose hazard with that region's own split axis and stamps
-`split_aiv_region_validated` on the function. So this pass skips the single-func-mode
-transpose check for functions carrying `split_aiv_region_validated` (the AUTO
-whole-function path is unchanged); the scope node never reaches here — only the
-per-op `aiv_shard` / `aic_gather` markers remain.
+`SplitRegionConsumer` validates each retained or synthesized region using its
+own split axis, erases the wrapper, and records placement on the same consumed
+body used by both mixed-function classification and expansion. Pure-AIV functions
+also consume their regions here. Functions with no regions retain the existing
+whole-function transpose check and skip region consumption without rebuilding their bodies. Erased-region comments are prepended to the first emitted statement without mutating input metadata, including when a boundary expands into transport operations.
+
+The pass requires `AivSplitLoweredValid`. Source boundaries use strict operand
+memory rules; lowered verification retains those checks for locally defined operands. Expansion checks operand availability, using lexical placement for inline calls as well as bound values, on the producing
+lane, so parameters shared by both lanes remain valid regardless of their memory
+annotation. Boundary result memory still describes the consuming lane.
 
 Cross-core data transfer at CV boundaries is handled by splitting explicit `tile.move` ops into `tpush`/`tpop` pairs:
 
@@ -116,7 +117,7 @@ Ascend910B (a2a3) — cross-core transfer goes through GM → Mat, and Mat only 
 | Vec→Mat | preserve original | — |
 | Mat/Acc→Vec | preserve original | — |
 
-On both backends, the AIV push side (V→C) inserts a `tile.move` before `tpush_to_aic` to convert the source tile into the required fractal layout. The `tile.move` helper (`CreateMove`) propagates `blayout`/`slayout` kwargs when the result type carries a TileView.
+On both backends, the ordinary-data AIV push side (V→C) inserts a `tile.move` before `tpush_to_aic` to convert the source tile into the required fractal layout. The `tile.move` helper (`CreateMove`) propagates `blayout`/`slayout` kwargs when the result type carries a TileView. Ascend950 MX scales use the dedicated row/row carrier described below.
 
 ### Hand-written pipes get the same adapter
 
@@ -127,31 +128,18 @@ it. On a backend where `RequiresVtoCFractalAdapt()` holds, such a push would shi
 ND tile into a FIFO the cube reads as fractal, scattering every element of the popped
 tile.
 
-`AdaptManualVtoCPush` closes that gap. It runs as the pass's final phase, over **every**
-AIV function the pass emits — not over the functions it was handed. That distinction
-matters: `tile.tpush_to_aic` declares `CoreAffinity::VECTOR`, so a hand-written push is
-legal inside an InCore body, and such a body only becomes an AIV function during this
-pass. A pure-vector body reaches AIV through the non-mixed conversion, and a mixed body
-carries the statement into its expanded AIV half; both happen after the per-function loop,
-so an earlier hook would still leave the bare ND push behind.
+`AdaptManualVtoCPush` closes that gap. It runs as the pass's final phase over **every**
+AIV function the pass emits, including pure-vector InCore bodies converted to AIV and the
+AIV half of a mixed body. Ordinary data keeps the fixed cube-side Mat transfer view.
+For MX, the pass resolves the AIV import to its AIC reserve and pairs V2C operations by pipe
+`id` and occurrence order, so each push is planned from its actual consumer `tpop` contract.
+Missing peers, ambiguous initializers, mismatched push/pop counts or splits, and undersized
+slots are rejected instead of guessing a layout.
 
-Three properties keep the sweep cheap and safe:
-
-- **One fixed boundary, no cross-function analysis.** The adapter asks for the cube-side
-  transfer memory, `GetBoundaryTpopMemory(CoreSide::AIC)`, instead of locating the
-  matching `tpop` in the peer function. That is exact rather than approximate because
-  `BuildCrossCoreTransferView` maps `Mat`, `Left` and `Right` onto the same fractal view:
-  wherever the consumer pops to, the layout it expects is the one this produces.
-- **Idempotent, and it defers to the author.** A push whose source already carries the
-  boundary view is left alone. Re-running the pass adds nothing, a program that stages
-  the move by hand keeps its own, and the pushes the boundary-move path already adapted
-  are not touched twice.
-- **The backend is consulted lazily.** `RequiresVtoCFractalAdapt()` is read inside the
-  mutator, on the first V→C push it meets, so a program with no hand-written push does
-  not need a configured backend to walk past this phase.
-
-The rewritten push preserves the original call's kwargs — dropping `id` would collapse a
-multi-pipe program onto a single FIFO.
+The rewrite applies to FP8E8M0 MX scales as well as ordinary data tiles, preserves the
+original push kwargs and attrs (including `id`), and is idempotent: a push already staged
+into the boundary view is left unchanged. The backend capability is consulted only after a
+manual V→C push is encountered.
 
 ### GM-mediated cross-lane dependencies
 
@@ -188,12 +176,24 @@ Setup is derived from the split bodies:
 
 When cross-core directions use different tile sizes, the pass picks `max(all observed tile byte sizes)` as the common `slot_size` for `initialize_pipe`. Smaller tiles leave unused bytes in each slot but hardware correctness is preserved. Explicit user-authored programs can still create multiple independent pipes by supplying different `id` values to `initialize_pipe` and matching `tpush` / `tpop` / `tfree` ops.
 
-### Known limitation: MX quantization followed by matmul
+### MX scale V2C transport
 
-The automatic setup does not yet support carrying both `quant_mx` data and its
-FP8E8M0 scale to `matmul_mx` inside one mixed task. Keep the operations in
-separate AIV and AIC kernels and stage both values through GM. Automatic paired
-data/scale pipes are deferred to a follow-up change.
+On Ascend950, a mixed `quant_mx` → `matmul_mx` path transports both results over
+V2C. FP8E8M0 fractal-32 scales never use the NZ TINSERT path. A full-valid
+logical row/row scale is pushed directly. A logical col/col scale takes the
+official, zero-copy `tile.transpose_view` after any carrier preparation,
+producing a row/row carrier with the physically transposed shape. If producer
+and consumer logical layouts differ, a real Vec→Vec `tile.move` converts to the
+consumer layout before that carrier step.
+
+The AIC `tpop` keeps the consumer's public logical shape, layout, and
+`valid_shape`. For a partial logical scale, the producer transports the full
+physical box so the ND insert is contiguous and 32-byte aligned. The pass first
+materializes a private Vec carrier, then widens only that carrier with
+`tile.set_validshape`; this keeps slice/reshape views legal and leaves the
+original logical scale metadata unchanged. The consumer still ignores padding
+outside its original logical valid region. The carrier's full byte size must fit
+the paired pipe's `slot_size`.
 
 ### Overriding the slot count (`slot_num`)
 
@@ -326,7 +326,9 @@ Phase 2 — Expand each InCore function F:
       - Ascend950: Left→NZ, Right→ZN, Mat/Vec→preserve
       - Ascend910B: Left→NZ, Right→NZ (Mat only supports NZ), Mat/Vec→preserve
   6. Repair loop-carried state on both bodies
-     - Strip dead iter_args whose carried values are unused on this side
+     - Strip dead iter_args whose carried values are unused on this side —
+       "used" closes over the loop's own yield, so a carry read only to feed
+       another live slot (a multi-entry FIFO rotation) stays alive
      - Pull back missing init-value definitions for surviving iter_args
      - Rewrite dangling yields to identity yields when a branch-local value was stripped
      - Remap dangling tile.store result vars (SSA versions stripped by AIC-side splitting) to the corresponding output parameter
@@ -373,20 +375,26 @@ Phase 4 — Normalize hand-written mixed Group ABIs:
 | SHARED | Non-tile ops, function calls, control flow, scalar ops | — |
 | SHARED | `pld.system.notify`, `pld.system.wait` | Core-agnostic by ISA (pure scalar/GM), so no affinity is declared. `notify` also declares `set_no_duplicate()` (both `NotifyOp` forms) — a cube-lane copy can release the peer before the vector lane's TPUT lands the data; `wait` does not, since it *blocks* and its cube-lane copy is load-bearing |
 | MIXED | Compound statements containing both CUBE and VECTOR children | — |
-| VECTOR | any call stamped `attrs["core_placement"] = "aiv"` | Region placement — outranks every rule above |
+| VECTOR | Region-local, intrinsically SHARED no-duplicate call without a stated lane | Pass-local lexical placement |
 
-**Region placement outranks inference.** A call stamped
-`attrs["core_placement"] = "aiv"` resolves to `VECTOR`, keeping a
-`pld.system.notify` off the cube lane. The stamp, its carve-outs and its lifetime
-are documented at [`LowerAutoVectorSplit`](23-lower_auto_vector_split.md); this
-pass reads it, then **strips** it. It does not make the op run *once* — see
-[Scopes and Placement](../../user/language/04-scopes.md).
+Region placement keeps `pld.system.notify` off AIC. It preserves duplicate-safe
+`wait`, stated lane affinity, and both boundary endpoints. The map is internal to
+this pass; no call attributes carry placement. See
+[`LowerAutoVectorSplit`](23-lower_auto_vector_split.md) for the shared contract.
 
 **CV boundary detection**: A `tile.move` is a CV boundary when its source tile memory and target memory are on different core sides. Cube-side memory: Mat, Left, Right, Acc, Bias. Vector-side memory: Vec. Same-side moves (e.g. Mat→Left) are classified by their source memory as usual. Boundary leaf moves are tagged `MIXED` for affinity purposes and are also recorded in a separate `boundary_moves` map; the cross-core direction (Cube→Vector vs Vector→Cube) is recovered via `ClassifyMoveDirection` at the call sites that need it (`CollectCVBoundaryMoves`, `BuildCoreBody`).
 
 **Nested structure handling**: ForStmt, IfStmt, and WhileStmt containing mixed ops are duplicated into both AIC and AIV bodies with recursively pruned contents.
 
 **Loop-state repair after splitting**: mixed-loop control flow is intentionally preserved during body construction, which can leave one side with extra iter_args, missing init-value definitions, or yields that reference stripped branch-local values. The pass repairs those cases before DCE, then normalizes loop-carried state once more after DCE because dead shared aliases can disappear and make an iter_arg removable only at that stage. A final DCE pass cleans up any init-value chains that become dead after the second strip.
+
+**Which carries count as live**: an iter_arg read only by the loop's own trailing
+yield is still live when the slot it feeds is live — that is exactly the shape of
+a multi-entry FIFO, whose entry `N` is read nowhere but the yield that rotates it
+into entry `N-1`. Liveness therefore closes over the yield instead of being read
+off the body alone, and the strip asserts that no surviving yield value names a
+carry it just dropped. Dropping such a carry would leave a free Var that no later
+pass rejects and PTO codegen reports as "no MLIR mapping for MemRef base ...".
 
 **Group wrapper param-returns**: a newly created Group wrapper
 returns its own parameters when every return position traces to a param
@@ -548,9 +556,9 @@ class After:
 
 | Property | Value |
 | -------- | ----- |
-| Required | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure |
+| Required | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitLoweredValid |
 | Produced | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid, AccCompactValid |
-| Invalidated | AccCompactValid |
+| Invalidated | AccCompactValid, AivSplitLoweredValid |
 
 `HardSyncallOccupancyValid` is produced here not by anything this pass rewrites, but because resolving each kernel's `FunctionType` to AIV/AIC/Group is the precondition the hard-syncall occupancy verifier depends on. That verifier fires once, right after this pass.
 

@@ -21,7 +21,6 @@
 #include "pypto/ir/expr.h"
 #include "pypto/ir/memory_space.h"
 #include "pypto/ir/op_registry.h"
-#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/type.h"
 
 namespace pypto {
@@ -30,12 +29,21 @@ namespace core_affinity {
 
 bool IsCubeMemorySpace(MemorySpace ms) { return ms != MemorySpace::DDR && ms != MemorySpace::Vec; }
 
+// The memory space of the first tile-typed argument, whatever expression carries it.
+//
+// Matching only Var was wrong: a tuple projection consumed inline --
+// `pl.tile.store(pair[0], [0, 0], out)`, which the DSL produces verbatim because
+// neither the parser nor FlattenCallExpr hoists a projection into its own binding --
+// is a TupleGetItemExpr, so the whole call fell through to SHARED. That is not a
+// missing optimization: a vector store classified SHARED is replicated onto BOTH
+// lanes by ExpandMixedKernel and never reaches the split pass's offset localization,
+// so the two AIV lanes write the same rows. The question here is what the argument's
+// TYPE says, and every expression has one.
 std::optional<MemorySpace> GetFirstTileArgMemory(const CallPtr& call) {
   for (const auto& arg : call->args_) {
-    if (auto var = std::dynamic_pointer_cast<const Var>(arg)) {
-      if (auto tile_type = std::dynamic_pointer_cast<const TileType>(var->GetType())) {
-        return tile_type->memory_space_;
-      }
+    if (!arg) continue;
+    if (auto tile_type = std::dynamic_pointer_cast<const TileType>(arg->GetType())) {
+      return tile_type->memory_space_;
     }
   }
   return std::nullopt;
@@ -88,12 +96,7 @@ bool HasStatedLane(const CallPtr& call) {
   return IsOp(call, "system.syncall") || IsOp(call, "system.sync_set") || IsOp(call, "system.sync_wait");
 }
 
-bool IsAivRegionPlaced(const CallPtr& call) {
-  if (!call) return false;
-  return call->GetAttr<std::string>(kCorePlacementAttr) == kCorePlacementAiv;
-}
-
-CoreAffinity ClassifyIntrinsicCallAffinity(const CallPtr& call) {
+CoreAffinity ClassifyCallAffinity(const CallPtr& call) {
   if (!call || !call->op_) return CoreAffinity::SHARED;
   if (std::dynamic_pointer_cast<const GlobalVar>(call->op_)) {
     return CoreAffinity::SHARED;
@@ -189,73 +192,6 @@ CoreAffinity ClassifyIntrinsicCallAffinity(const CallPtr& call) {
   }
 
   return CoreAffinity::SHARED;
-}
-
-CoreAffinity ClassifyCallAffinity(const CallPtr& call) {
-  const CoreAffinity intrinsic = ClassifyIntrinsicCallAffinity(call);
-
-  // 0. `pl.split_aiv` REGION PLACEMENT — the authority that outranks inference.
-  //
-  // The region body IS the AIV lane's body, so a call the author wrote inside
-  // one belongs on the vector lane even when nothing about the op itself says
-  // so. This is what stops ExpandMixedKernel replicating a region statement
-  // onto BOTH lanes: a core-agnostic op (no declared affinity, no tile operand
-  // — `pld.system.notify` is the motivating case) classifies SHARED, and SHARED
-  // statements are duplicated, so the notify also lands on the CUBE lane, where
-  // it can publish the signal before the vector lane's TPUT has landed the data
-  // that signal releases. Placing it in a region pins it to AIV and removes the
-  // cube copy. It does NOT make it run once — the AIV body still runs on both
-  // AIV sub-lanes (dual_aiv_dispatch); sharding by aiv_id is the author's job,
-  // documented in docs/en/user/language/04-scopes.md and not diagnosed.
-  //
-  // It is applied last in the source but FIRST in authority: the override needs
-  // the intrinsic answer to know which of the three carve-outs applies.
-  //
-  // Those carve-outs are deliberately total rather than merely defensive.
-  // LowerAutoVectorSplit only ever stamps a call the region genuinely places
-  // (see RegionPlacementStamper), so in a compiler-produced program none of
-  // them is reachable — but the attr is ordinary IR that survives a print ->
-  // parse round-trip, so a hand-written or externally-produced program can
-  // carry it on any call, and every case must have a defined answer.
-  if (!IsAivRegionPlaced(call)) return intrinsic;
-
-  // Carve-out 1 — a STATED lane outranks placement. `tile.create` is SHARED by
-  // policy so both lanes can declare the buffer; a `system.syncall(mix)`
-  // rendezvouses both cores. Forcing either onto AIV would drop it from the
-  // cube lane and change what the program means. Placement authority exists to
-  // resolve what the compiler would otherwise INFER, not to overrule what the
-  // op or the author already declared (the same rule check (e) applies).
-  if (HasStatedLane(call)) return intrinsic;
-
-  switch (intrinsic) {
-    // Carve-out 2 — MIXED means "this call IS the cross-core transfer":
-    // `tile.aiv_shard` / `tile.aic_gather` and a C/V-crossing `tile.move`
-    // lower to a tpush on one lane plus a tpop on the other, so they
-    // legitimately need BOTH. Forcing them to VECTOR would leave the tpush
-    // without its tpop and strand the data.
-    case CoreAffinity::MIXED:
-    // Carve-out 3 — cube work inside a region is an authoring error, and
-    // check (a) rejects it with a user diagnostic naming the fix. Do NOT
-    // re-report it here: this is a shared classification utility called from
-    // many passes (and from a testing binding), so throwing would misattribute
-    // a user error as a compiler bug and fire from callers that only asked a
-    // question. Declining the override is also the conservative answer — the
-    // op stays on the cube lane exactly as it does today, so a build with
-    // verification disabled is no worse off than before this rule existed,
-    // rather than newly miscompiled onto the vector lane.
-    case CoreAffinity::CUBE:
-      // Both carve-outs decline the override: the intrinsic answer stands.
-      // They share one body deliberately — keeping them as two branches with
-      // identical `return intrinsic;` trips bugprone-branch-clone.
-      return intrinsic;
-    case CoreAffinity::VECTOR:
-    case CoreAffinity::SHARED:
-      // The override proper. VECTOR is already the answer (the region merely
-      // confirms it); SHARED is the case that matters, and the one the whole
-      // carrier exists for.
-      return CoreAffinity::VECTOR;
-  }
-  INTERNAL_UNREACHABLE << "Internal error: unhandled CoreAffinity in region placement override";
 }
 
 }  // namespace core_affinity

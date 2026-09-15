@@ -15,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "pypto/core/error.h"
@@ -243,6 +244,8 @@ struct FunctionSplitFacts {
   /// param, an IterArg or a loop return var has no defining call, and a check
   /// that cannot see how a value was produced must stay silent about it.
   std::unordered_map<const Var*, ValueDef> defs;
+  /// All local bindings, including loop carries and control-flow results.
+  std::unordered_set<const Var*> local_defs;
   /// The first boundary op of each transport class, for check (k). Only the
   /// first of each is kept: the check is "are both classes present", and one
   /// diagnostic naming one representative of each is the report — one per
@@ -270,7 +273,24 @@ class FunctionSplitFactScanner : public IRVisitor {
   void VisitStmt_(const AssignStmtPtr& op) override {
     if (op->var_) {
       facts_.defs[op->var_.get()] = ValueDef{std::dynamic_pointer_cast<const Call>(op->value_), cur_region_};
+      facts_.local_defs.insert(op->var_.get());
     }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const ForStmtPtr& op) override {
+    facts_.local_defs.insert(op->loop_var_.get());
+    RecordLoopDefs(op);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const WhileStmtPtr& op) override {
+    RecordLoopDefs(op);
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const IfStmtPtr& op) override {
+    for (const auto& var : op->return_vars_) facts_.local_defs.insert(var.get());
     IRVisitor::VisitStmt_(op);
   }
 
@@ -282,6 +302,12 @@ class FunctionSplitFactScanner : public IRVisitor {
   [[nodiscard]] const FunctionSplitFacts& facts() const { return facts_; }
 
  private:
+  template <typename T>
+  void RecordLoopDefs(const std::shared_ptr<const T>& op) {
+    for (const auto& var : op->iter_args_) facts_.local_defs.insert(var.get());
+    for (const auto& var : op->return_vars_) facts_.local_defs.insert(var.get());
+  }
+
   /// Classify one boundary op into its transport class, for check (k).
   ///
   /// Keyed on the op's OWN ``split`` kwarg rather than on the enclosing
@@ -432,7 +458,7 @@ void CheckSingleTransportClass(const FunctionSplitFacts& facts, std::vector<Diag
 //       mishandle one from elsewhere: with no boundary op of its own it halves
 //       every tile it computes along the split axis and localizes every store
 //       offset to the lane, so an already-per-lane value is halved twice and
-//       offset twice; with one, nothing is re-halved but ScanRegionHalfWidth is
+//       offset twice; with one, nothing is re-halved but AnalyzeSplitBody is
 //       seeded per REGION, so the incoming value is misjudged as full width. A
 //       mode=NONE region takes neither path and is exempt — that carve-out is
 //       what keeps the cross-core comm-kernel shape (shard in one region, consume
@@ -490,8 +516,8 @@ void CheckSingleTransportClass(const FunctionSplitFacts& facts, std::vector<Diag
 // (any dataflow approximation false-negatives the moment the index goes through
 // arithmetic). The rule is therefore stated for authors in
 // docs/en/user/language/04-scopes.md and the `pl.split_aiv` docstring, and left
-// unenforced. See the placement stamp (kCorePlacementAttr) for what the
-// compiler DOES guarantee: comm ops written in a region stay off the cube lane.
+// unenforced. ExpandMixedKernel consumes lexical regions to keep their
+// no-duplicate SHARED calls off the cube lane.
 //
 // The checked ops (matmul, reduces, aiv_shard/aic_gather, vector compute) are
 // always plain Calls with a non-null op_; Submits carry a GlobalVar callee and
@@ -499,11 +525,13 @@ void CheckSingleTransportClass(const FunctionSplitFacts& facts, std::vector<Diag
 class SplitAivStructuralVerifier : public IRVisitor {
  public:
   SplitAivStructuralVerifier(std::vector<Diagnostic>& diagnostics, const FunctionSplitFacts& facts,
-                             bool func_is_incore, bool func_from_outlining)
+                             bool func_is_incore, bool func_from_outlining, bool lowered = false)
       : diagnostics_(diagnostics),
         facts_(facts),
         func_is_incore_(func_is_incore),
-        func_from_outlining_(func_from_outlining) {}
+        func_from_outlining_(func_from_outlining),
+        allow_flat_(lowered && !facts.has_region && func_is_incore && func_from_outlining),
+        lowered_(lowered) {}
 
   // (h) PLACEMENT — a CORE_GROUP-level region must not be authored inside a
   // function that is already a core function.
@@ -623,7 +651,15 @@ class SplitAivStructuralVerifier : public IRVisitor {
         if (tile_boundary) CheckBoundaryMemory(op);
       } else {
         // Outside every region.
-        if (boundary) {
+        if (boundary && allow_flat_ && tile_boundary) {
+          if (!op->HasKwarg("split")) {
+            Err(op->span_, "lowered AIV boundary requires an explicit split mode");
+          } else {
+            const int split = op->GetKwarg<int>("split", 0);
+            if (split < 0 || split > 2) Err(op->span_, "invalid lowered AIV boundary split mode");
+          }
+          CheckBoundaryMemory(op);
+        } else if (boundary) {
           // (c) The AIV-split boundary op escaped its region.
           Err(op->span_, "'" + op->op_->name_ +
                              "' must appear inside a pl.split_aiv region (it marks the AIV-split "
@@ -764,7 +800,7 @@ class SplitAivStructuralVerifier : public IRVisitor {
   ///     twice and offset twice. The offset corruption is silent; the shape
   ///     corruption escapes pypto and surfaces from ptoas.
   ///   * EXPLICIT (this region writes its own aiv_shard / aic_gather): nothing is
-  ///     re-halved, but ScanRegionHalfWidth seeds its half-width set per REGION,
+  ///     re-halved, but AnalyzeSplitBody seeds its half-width set per REGION,
   ///     so the incoming value is misjudged as full width and the region is
   ///     rejected with a message that is factually wrong about it.
   /// A mode=NONE region takes neither path -- no split axis, no halving, no
@@ -860,7 +896,9 @@ class SplitAivStructuralVerifier : public IRVisitor {
     // the AIV half while the producer stays behind, leaving the cube half
     // referencing a value it never defines (which surfaces much later as an orphan
     // Mem.Vec allocation and an internal codegen error).
-    if (!op->args_.empty()) {
+    auto operand_var = op->args_.empty() ? nullptr : AsVarLike(op->args_[0]);
+    const bool shared_external = lowered_ && operand_var && !facts_.local_defs.count(operand_var.get());
+    if (!shared_external && !op->args_.empty()) {
       if (auto operand_ms = ResolvedTileMemory(op->args_[0]);
           operand_ms.has_value() && *operand_ms != contract->operand) {
         Err(op->span_, "'" + op->op_->name_ + "' operand is in " + MemorySpaceToString(*operand_ms) +
@@ -902,24 +940,28 @@ class SplitAivStructuralVerifier : public IRVisitor {
   const SplitAivScopeStmt* cur_region_ = nullptr;
   bool func_is_incore_ = false;       ///< Enclosing function is FunctionType::InCore, for check (h).
   bool func_from_outlining_ = false;  ///< It carries the outliner's ``split_aiv`` stamp, for check (h).
+  bool allow_flat_ = false;
+  // Lowered operands are checked by producer availability in ExpandMixedKernel.
+  // Parameters exist on both lanes regardless of their memory annotation.
+  bool lowered_ = false;
 };
 
 }  // namespace
 
-// Verifies IRProperty::AivSplitValid as a structural property of the first-class
-// SplitAivScopeStmt region. The node is live only between OutlineIncoreScopes
-// (which produces the property) and LowerAutoVectorSplit (which consumes/erases
-// the node and invalidates the property), so the verifier walks every function
-// body in that window and applies the region-scoped checks above. No
-// function-attr / split-mode gate — the node itself is the source of truth,
-// including for the manual-mode gate ((e) region presence), which the
-// per-function pre-pass derives by walking the body.
+// Shared source/lowered structural verifier. Lowered bodies retain the region
+// contract and additionally admit flat AUTO boundaries. Operand availability
+// at this stage is checked by ExpandMixedKernel's producer-lane analysis.
 class AivSplitValidPropertyVerifierImpl : public PropertyVerifier {
  public:
-  [[nodiscard]] std::string GetName() const override { return "AivSplitValid"; }
+  explicit AivSplitValidPropertyVerifierImpl(bool lowered = false) : lowered_(lowered) {}
+
+  [[nodiscard]] std::string GetName() const override {
+    return lowered_ ? "AivSplitLoweredValid" : "AivSplitValid";
+  }
 
   void Verify(const ProgramPtr& program, std::vector<Diagnostic>& diagnostics) override {
     if (!program) return;
+    const size_t first_diagnostic = diagnostics.size();
     for (const auto& [gv, func] : program->functions_) {
       if (!func || !func->body_) continue;
       // Pre-pass first: check (e) is gated on a whole-function fact (does this
@@ -935,14 +977,22 @@ class AivSplitValidPropertyVerifierImpl : public PropertyVerifier {
       // regions, and LowerAutoVectorSplit re-stamps it on the lowered result.
       SplitAivStructuralVerifier verifier(
           diagnostics, scanner.facts(), func->func_type_ == FunctionType::InCore,
-          func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false));
+          func->HasAttr(kAttrSplitAiv) && func->GetAttr<bool>(kAttrSplitAiv, false), lowered_);
       verifier.VisitStmt(func->body_);
     }
+    for (size_t i = first_diagnostic; i < diagnostics.size(); ++i) diagnostics[i].rule_name = GetName();
   }
+
+ private:
+  bool lowered_;
 };
 
 PropertyVerifierPtr CreateAivSplitValidPropertyVerifier() {
   return std::make_shared<AivSplitValidPropertyVerifierImpl>();
+}
+
+PropertyVerifierPtr CreateAivSplitLoweredValidPropertyVerifier() {
+  return std::make_shared<AivSplitValidPropertyVerifierImpl>(true);
 }
 
 }  // namespace ir

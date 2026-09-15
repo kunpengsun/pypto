@@ -8,11 +8,23 @@ Type-safe operator definitions with automatic type deduction, organized into mod
 | -------- | ----- | -------- | ------------- |
 | **TensorOp** | TensorType | N-D tensor operations with broadcasting | `src/ir/op/tensor_ops/` |
 | **TileOp** | TileType | Hardware-optimized tile operations | `src/ir/op/tile_ops/` |
+| **BufferOp** | BufferType, VoidType | Internal explicit storage and destination writes | `src/ir/op/buffer_ops/` |
 | **SyncOp** | UnknownType (barriers); ScalarType (task / launch queries) | Pipeline barriers, synchronization, TaskId and SPMD launch-shape queries | `src/ir/op/sync_ops/` |
 | **CrossCoreOp** | UnknownType/TileType | AIC↔AIV cross-core communication | `src/ir/op/sync_ops/cross_core.cpp` |
 | **PrefetchOp** | Opaque handles | Asynchronous GM→L2 cache prefetch | `src/ir/op/prefetch/prefetch_async.cpp` |
 
 **Key Features**: Fluent API, automatic type deduction, kwargs for metadata, NumPy-style broadcasting, type promotion, dynamic dimensions (`kDynamicDim`)
+
+The internal Buffer-stage GM and addition operations have no public DSL wrappers:
+
+| Operation | Positional operands | Result |
+| --------- | ------------------- | ------ |
+| `buffer.load` | GM tensor, offsets tuple, valid extents tuple, destination buffer | Void |
+| `buffer.store` | source buffer, offsets tuple, valid extents tuple, GM tensor | Void |
+| `buffer.add` | lhs buffer, rhs buffer, destination buffer | Void |
+
+These use separate data/metadata effects. See [Buffer contracts](02-types.md#buffer-operator-contracts)
+for shape, dtype, valid-state, and alias requirements.
 
 ## Type System
 
@@ -50,146 +62,9 @@ auto dynamic_dim = make_int(kDynamicDim);
 
 ### Argument effects
 
-> The whole chain that consumes these declarations is laid out in
-> [Parameter Direction Inference](08-param-directions.md).
-
-An operator that updates one of its arguments in place must say so. Direction
-inference, dependency analysis and the parameter-direction verifier all ask the
-registry the same question — *does this call write the buffer this argument
-names?* — and an operator that never answered reads as a pure consumer:
-
-```text
-tile.mscatter writes output_tensor, but never declared it
-  → the parameter it writes keeps direction In
-  → no RAW edge is emitted against the kernel that reads it
-  → the scheduler is free to run the reader first
-  → stale data, or a deadlock waiting on a signal nobody wrote
-```
-
-| Effect | Meaning | Examples |
-| ------ | ------- | -------- |
-| `ArgEffect::Read` | Read, never written. Default for an unnamed argument | `tile.store`'s source tile |
-| `ArgEffect::Write` | Overwritten without being read first | `tile.store`'s `output_tensor`, `pld.tile.get`'s `dst` |
-| `ArgEffect::ReadWrite` | Read *and* written | `tile.matmul_acc`'s accumulator, an atomic store's destination |
-
-**Partial overwrite is still `Write`.** A store that lands on a sub-region does
-not read the untouched remainder — nothing moves *into* the kernel — so its
-destination is a pure write. Declaring it `ReadWrite` is not a harmless
-approximation: it makes the enclosing parameter `InOut`, which stages the buffer
-host→device and, across ranks, invents a dependency between two ranks writing
-disjoint rows.
-
-Whether a destination is read is decided per operator, not per family: a
-gather or exchange destination is pushed into and never loaded from, so it is
-`Write`, while a reduce destination has its running value loaded back and is
-`ReadWrite`.
-
-**`ReadWrite` is for operators that genuinely read the slot**: an accumulator
-(`out += x` reads the running sum), an atomic store or assemble, or a
-destination-passing operator whose untouched positions flow through to its SSA
-result (`tile.scatter`, `array.update_element`).
-
-**Kwarg-dependent effects.** When a kwarg decides the answer, pass a resolver
-instead of a constant. A kwarg can decide *whether* an argument is written at
-all, not only how: `tile.mgather`'s third operand is a written GM scratch tensor
-in Mat element mode and a read-only `valid_shape` in Mat row mode. The other
-live cases are the `atomic` kwarg on the store family and the `op` kwarg on
-`pld.system.notify`, whose default is atomic-add — so an unannotated notify
-reads the slot it adds into:
-
-```cpp
-REGISTER_OP("tile.store")
-    // ... arguments, memory spec ...
-    .set_arg_effect(2,
-                    [](const std::vector<std::pair<std::string, std::any>>& kwargs) {
-                      return GetIntKwarg(kwargs, "atomic", static_cast<int>(AtomicType::kNone)) ==
-                                     static_cast<int>(AtomicType::kNone)
-                                 ? ArgEffect::Write
-                                 : ArgEffect::ReadWrite;
-                    })
-    .set_write_channel(WriteChannel::Dma)
-```
-
-**Declared-read-only is not the same as unclassified.** `HasDeclaredArgEffects()`
-distinguishes "a human decided this operator writes nothing" (`no_arg_writes()`,
-e.g. `pld.system.wait`) from "nobody has looked at this operator yet". An
-analysis that needs the answer can then refuse to guess instead of defaulting an
-unclassified writer to read-only.
-
-**Enforcement.** `OpRegistry::ValidateArgEffects()` runs at import and rejects
-two shapes, naming every offender and the fix rather than failing on first use:
-
-- an operator declaring `set_output_reuses_input(N)` — its SSA result *is*
-  argument N's buffer, so it writes through it — without a verdict about
-  argument N specifically. Classification is what is required, not a particular
-  answer: an operator whose in-place slot is metadata may declare it read-only.
-- an operator declaring a write channel while writing through no argument. A
-  channel says *how* an operator writes, so one without a write is either a
-  stray declaration or a missing one.
-
-The second rule matters more than it looks. `set_write_channel()` creates the
-effect spec as a side effect, so "the spec exists" cannot stand in for "a human
-decided" — otherwise an operator that declared a channel and forgot its
-`set_arg_effect` would pass the first rule with the argument it updates still
-defaulting to `Read`. `no_arg_writes()` records the all-arguments verdict
-explicitly, and combining it with `set_arg_effect` is rejected as
-contradictory.
-
-`set_write_channel` records whether the writes travel the MTE3/DMA path or the
-scalar D-cache path. PyPTO cannot order the two against one GM tensor, so a
-function mixing them on one buffer is rejected; the channel lets that diagnostic
-read the registry instead of re-listing operators.
-
-Declare it only for an operator whose writes really are one of those two paths,
-and leave it unset otherwise — an unset channel keeps the operator out of that
-diagnostic, which is where an operator belongs when neither path describes it:
-
-- `pld.system.notify` emits `pto.comm.tnotify`, a distinct comm instruction.
-  Claiming either channel would let the diagnostic reject a valid program.
-- `system.set_ffts` hands the workspace *pointer* to the FFTS unit rather than
-  moving data; the hardware writes that region on its own schedule, which no
-  dependency edge models. It declares `no_arg_writes()`.
-- A composite collective updates a data window and a signal through different
-  mechanisms, and one operator-level channel cannot describe both. Per-argument
-  channels would, but no case yet needs the distinction, and a wrong single
-  answer is worse than none.
-
-**`set_core_affinity` vs `set_no_duplicate`** — two orthogonal axes, and picking
-the wrong one makes a false claim about the ISA:
-
-- `set_core_affinity(...)` answers *which* core runs the op. Declare it only
-  when the hardware really constrains the op to one side. When left unset,
-  `ClassifyCallAffinity` derives placement from the call (memory spec, then the
-  first tile argument's memory space), falling back to `SHARED`.
-- `set_no_duplicate()` answers whether the op may run on a *second* core.
-  `ExpandMixedKernel` replicates `SHARED` statements onto both the AIC and the
-  AIV lane; mark an op for which that copy changes what the program means.
-
-`pld.system.notify` is the canonical case, and the hazard is **premature release
-from the wrong lane**, not non-idempotence: the AIC copy can publish the signal
-before the AIV lane's TPUT has landed the data that signal releases, so the peer
-reads stale bytes. That is why the flag is unconditional — a `NotifyOp::kSet`
-fires the same race as an atomic-add, even though only the atomic-add
-double-counts.
-
-Its sibling `pld.system.wait` stays **unmarked**, and deliberately so: TWAIT
-*blocks*, and its presence on the cube lane is load-bearing. Pinning it to the
-vector lane would let the matmul race past the peer data it waits on. Read the
-flag as "must not run on a second core", not as "not idempotent".
-
-`IsNoDuplicate()` reads the axis. Its only consumer is `LowerAutoVectorSplit`'s
-`pl.split_aiv` region placement stamp (pass 23), which pins exactly the
-no-duplicate calls inside a region to the AIV lane. No verifier rejects anything
-on this axis.
-
-An op pinned to one lane by `set_core_affinity(...)` is never duplicated in the
-first place and needs no flag. The flag exists precisely for the core-agnostic
-ops, where no affinity value can express "may run on either core, but must not
-run on both". Note that is a claim about *cores*, not about total executions: an
-AIV function body still runs on both AIV sub-lanes under `dual_aiv_dispatch`, so
-keeping an op off the cube lane does not make it happen once. That part is the
-author's, and is documented in
-[Scopes → pl.split_aiv](../../user/language/04-scopes.md).
+See [Operator effects](10-operator-effects.md) for argument access declarations,
+write channels, and core placement/replication contracts. Buffer-stage effects
+are described in [Buffer contracts](02-types.md#buffer-operator-contracts).
 
 **Type Deduction Signature:**
 
@@ -399,10 +274,10 @@ spaces are resolved.
 
 | IR / DSL | Notes |
 | -------- | ----- |
-| `tile.load` of `pl.Tensor[..., pl.MX_A_ZZ \| pl.MX_B_NN]` | The source TensorLayout carries the MX scale GM layout. Dtype is FP8E8M0 or UINT8, `target_memory=Mat` is required, and strided sources are rejected. |
+| `tile.load` of `pl.Tensor[..., pl.MX_A_ZZ \| pl.MX_B_NN]` | The source TensorLayout carries the MX scale GM layout. Dtype is FP8E8M0, and strided sources are rejected. Public `pl.load` defaults an omitted target to `Mat`; raw IR must carry `target_memory=Mat`. |
 | `tile.move(..., target_memory=LeftScale/RightScale)` | Mat-to-Scale move with hardware-fixed row/row/32 (left) or col/col/32 (right) layout; the source Mat tile and layout overrides must match exactly. |
 | `tile.create(..., target_memory=LeftScale/RightScale)` | Not supported; load MX scale data into Mat and then move it into scale memory. |
-| `tile.matmul_mx` / `pl.matmul_mx` | `Left, LeftScale, Right, RightScale → Acc`; both data operands reaching the op must be `FP8E4M3FN`, and scale is `FP8E8M0`. The supported FP4-input form is FP4 lhs × FP8 rhs with an explicit `pl.cast(fp4, pl.FP8E4M3FN)` before the op; native FP4×FP4 and FP8×FP4 are rejected. Physical M/K/N, valid K, and scale-group counts use the post-cast FP8 tile extents, never the packed x2 carrier shape. Physical `M % 16 == 0`, `K % 64 == 0`, and `N % 32 == 0`; valid K must satisfy `ceil(validK/32) == ceil(physicalK/32)`. Alignment / scale-group checks run only for constant extents; symbolic dims skip the numeric checks and fall back to the declared scale tile geometry (later PTOAS still verifies). |
+| `tile.matmul_mx` / `pl.matmul_mx` | `Left, LeftScale, Right, RightScale → Acc`; operand positions drive automatic placement, including Vec→Mat→LeftScale/RightScale staging for `quant_mx` scales. Both data operands reaching the op must be `FP8E4M3FN`, and scale is `FP8E8M0`; `lhs_scale` and `rhs_scale` must be distinct tiles. The supported FP4-input form is FP4 lhs × FP8 rhs with an explicit `pl.cast(fp4, pl.FP8E4M3FN)` before the op; native FP4×FP4 and FP8×FP4 are rejected. Physical M/K/N, valid K, and scale-group counts use the post-cast FP8 tile extents, never the packed x2 carrier shape. Physical `M % 16 == 0`, `K % 64 == 0`, and `N % 32 == 0`; valid K must satisfy `ceil(validK/32) == ceil(physicalK/32)`. Alignment / scale-group checks run only for constant extents; symbolic dims skip the numeric checks and fall back to the declared scale tile geometry (later PTOAS still verifies). |
 | `tile.matmul_mx_acc` / `pl.matmul_mx_acc` | `Acc, Left, LeftScale, Right, RightScale → Acc`; in-place through `set_output_reuses_input(0)`; accumulator physical and valid M/N must match the matmul output. |
 | `tile.matmul_mx_bias` / `pl.matmul_mx_bias` | `Left, LeftScale, Right, RightScale, Bias → Acc`; bias is `[1, N]` FP32. |
 | `tile.tget_scale_addr` | Compiler-generated A5 binding from `LeftScale↔Left` or `RightScale↔Right`; DPS in-place on `dst_scale`. Users write only the `matmul_mx` family. |
@@ -603,194 +478,10 @@ INT32 + INT64 → INT64  (larger size)
 UINT32 + INT32 → INT32 (signed precedence)
 ```
 
-## TensorOp: N-Dimensional Tensor Operations
+## Tensor and Tile Operators
 
-**Purpose**: General N-dimensional tensors with full broadcasting
-**Type**: `TensorType` (arbitrary dimensions)
-**Location**: `src/ir/op/tensor_ops/`
-**Python API**: `from pypto.ir.op import tensor`
-
-**Operations:** `tensor.add/sub/mul/div` (element-wise with full N-D broadcasting), `tensor.maximum/minimum` (element-wise max/min; rhs may be tensor or scalar — `ConvertTensorToTileOps` dispatches to `tile.maximum/minimum` or `tile.maximums/minimums` based on the rhs operand type), `tensor.set_validshape` (update valid-shape metadata without data movement; also reachable as `pl.set_validshape`), `tensor.sort32` / `tensor.mrgsort_format1` / `tensor.mrgsort_format2` (sorting; tensor-level counterparts of `tile.sort32` / `tile.mrgsort` — converted to tile ops by `ConvertTensorToTileOps`), `tensor.gather` (per-dim indexing; MVP supports rank-2 inputs with `dim=-1`, lowered by `ConvertTensorToTileOps` with a backend-specific strategy — on A5 (Ascend950) a last-dim gather becomes a single full-tile `tile.gather` over flat element offsets `flat[i, j] = i * src_cols + index[i, j]`, first materializing a strided tile source (e.g. a `tile.slice` view) into a contiguous tile so the flat index addresses it correctly; on A2A3 (Ascend910B) it keeps the legacy per-row `tile.gather` loop where the column index equals the flat index within each 1-row slice), `tensor.gather_mask` (mask-pattern gather; tensor-level counterpart of `tile.gather_mask`, with optional same-bit-width `output_dtype` — see [Mask patterns](#mask-patterns)), `tensor.scatter` (column scatter; the column-wise inverse of `tensor.gather`, MVP supports rank-2 inputs with `dim=-1` — `out[b, index[b, k]] = src[b, k]`, `index` same shape as `src` — and lowers to `tile.scatter` via `ConvertTensorToTileOps`), `tensor.scatter_mask` (mask-pattern row-scatter; tensor-level counterpart of `tile.scatter_mask`, expands a compact `input` tensor into the mask-marked columns of `dst` — see [Mask patterns](#mask-patterns)), `tensor.ci` / `tensor.arange` (contiguous integer sequence generation; lowers to `tile.ci`; also exposed at top level as `pl.arange`), `tensor.and/ands/or/ors/xor/xors/not/shl/shls/shr/shrs` (integer-only bitwise and shift ops. These are the registered *IR* names; the Python spellings for the three whose leaf is a Python keyword carry a trailing underscore -- `tensor.and_`, `tensor.or_`, `tensor.not_` -- and the printer emits that form so IR round-trips as valid Python; tensor-level counterparts of the matching `tile.*` ops. Both operands of a tensor-tensor form must have the same shape — there is no `tile.row_expand_and`, so broadcasting is rejected at type deduction rather than failing later in the pass. `tensor.not` is int16/uint16 only, matching `tile.not`/TNOT. Shifts keep the lhs element type; `and`/`or`/`xor` require matching 8/16/32-bit operand dtypes, and scalar forms use the same-width signless `iN` encoding required by their tile lowering. `ConvertTensorToTileOps` lowers nine of them 1:1, and synthesizes the `pto.txor` scratch operand for `tensor.xor`/`tensor.xors` so tensor-level callers never supply a `tmp`)
-
-`tensor.view` is a metadata-only zero-copy shape/layout reinterpret. It is registered as a `TensorOp` passthrough in `ConvertTensorToTileOps`; PTO in-core codegen lowers it to `pto.make_tensor_view` over the original base pointer. Targets require rank at least 1 (DN requires rank at least 2). Orchestration shape reinterpret is normally ND-only and cannot also change layout. FP8E8M0 dynamic scale storage additionally permits an equal-element-count shaped alias between packed ND and `MX_A_ZZ` or `MX_B_NN`; orchestration preserves the same runtime tensor without calling `reshape`. Shape reinterpretation of a partially valid source is limited to either a packed ND leading-dimension collapse to 2D or a contiguous-prefix linear collapse to `[1, product(shape)]`; both require an explicit target `valid_shape`. These forms preserve the source tensor kind and backing metadata.
-
-For plain `TensorType` operands, the supported Tensor-scalar arithmetic
-operators (`adds`, `subs`, `muls`, `divs`, `fmods`, and scalar `maximum` or
-`minimum`) and bitwise/shift operators (`ands`, `ors`, `shls`, and `shrs`)
-create fresh storage but cannot create valid data in padding. Their results
-therefore preserve the tensor operand's effective `valid_shape` while dropping
-source alias, layout, stride, and padding metadata. This matches the existing
-Tile-scalar rule and keeps a ragged tail narrow through Tensor-to-Tile lowering.
-Scalar comparison and XOR (`cmp` and `xors`) remain excluded.
-
-The ordinary arithmetic Tensor-tensor operators (`add`, `sub`, `mul`, `div`,
-`fmod`, `maximum`, and `minimum`) also preserve the effective `valid_shape`
-when both operands have identical physical shapes and their effective valid
-regions are provably equal. The same exact-region rule applies to `and`, `or`,
-`shl`, and `shr`. It needs no broadcast-axis mapping and agrees with the
-corresponding Tile result contract; the result remains fresh storage and
-therefore inherits no alias, layout, stride, or padding metadata. Comparison,
-XOR, `part_*`, broadcasting, different valid regions, and direct distributed
-window operands are not covered by this rule because their current lowering or
-combination contracts require separate handling.
-
-`pl.reinterpret_view(data, dtype, *, shape=None)` dispatches to the equivalent `pl.tensor` or `pl.tile` operator and returns the same kind. It is a zero-copy view over exactly the same bytes. General reinterpretation supports signed/unsigned 8/16/32/64-bit integers, FP16, BF16, and FP32; MX lowering additionally permits only the byte-identical INT8↔FP8E4M3FN and UINT8↔FP8E8M0 pairs. With no `shape`, ND/row-major scales the last axis and DN/col-major scales the penultimate axis by the source/target byte-width ratio. An explicit shape must be byte-equivalent and fully static unless it is provably identical to the auto-inferred shape; a partial `valid_shape` only permits that auto-equivalent shape. Zero/null padding metadata is preserved, while dtype-dependent max/min padding is cleared. The initial executable path supports packed ND in-core tensors and packed flat (`none_box`) row/col-major tiles; DN tensor inference is available but Tensor-to-Tile lowering rejects it, and orchestration tensors are unsupported.
-
-**Example:**
-
-```python
-from pypto.ir.op import tensor
-
-ib = IRBuilder()
-with ib.function("tensor_example") as f:
-    input_a = f.param("input_a", ir.TensorType([128, 64, 32], DataType.FP32))
-    input_b = f.param("input_b", ir.TensorType([128, 64, 32], DataType.FP32))
-    f.return_type(ir.TensorType([128, 64, 32], DataType.FP32))
-    result = ib.let("result", tensor.add(input_a, input_b))
-    ib.return_stmt(result)
-```
-
-## TileOp: Hardware-Optimized Tile Operations
-
-**Purpose**: Hardware-optimized tile operations with explicit memory management
-**Type**: `TileType` (tiles in unified buffers)
-**Location**: `src/ir/op/tile_ops/`
-**Python API**: `from pypto.ir.op import tile`
-
-**Design**: Uses `TileType` (not separate `BlockType`) for consistency. Namespace `tile.*` + `TileType` clearly indicates hardware-optimized tile operations.
-
-### Operations
-
-| Category | Operations | Description |
-| -------- | ---------- | ----------- |
-| **Memory** | `tile.get_block_idx` | Get hardware block index (→ ScalarType(DataType::UINT64)) |
-| - | `tile.load` | TensorType → TileType (DDR to unified buffer) |
-| - | `tile.store` | TileType → TensorType (unified buffer to DDR) |
-| - | `tile.move` | Move a tile between memory spaces (`target_memory`) — see [Result view of tile.move](#result-view-of-tilemove) |
-| **Element-wise** | `tile.add/sub/mul/div` | Tile-Tile operations |
-| - | `tile.adds/subs/muls/divs` | Tile-Scalar operations. A **constant** scalar operand adopts the tile's element dtype (a bare int literal is otherwise parsed as `index`, which no `pto.t*s` op accepts) — except a float literal on an integer tile, which keeps FP32 so promotion is preserved. An explicit `pl.const(v, dtype)` is a deliberate annotation and is left as-is, as is any non-constant expression; a non-constant `index` scalar (loop var, `pl.dim`) is rejected — convert it with `pl.cast`. Same rule for `tensor.*s`. |
-| **Unary** | `tile.sqrt` | Element-wise square root |
-| **Quantization** | `tile.tquant_mx` / `pl.quant_mx` | Ascend950-only **MXFP8** block-32 dynamic quantization returning `{FP8E4M3FN quant, FP8E8M0 scale}`. `dtype` must be `FP8E4M3FN`. `group_axis` is PTOAS `grpAxis` (`1` = A-side `[M,K]`, `0` = B-side `[N,K]` with transpose). Public scale shapes are `[M,K/32]` / `[K/32,N]`; requires a full valid region and `K % 64 == 0` (plus axis1 `M % 16 == 0`, axis0 `N % 32 == 0`). [Pass 13](../passes/13-lower_composite_ops.md) emits grouped TQUANT plus X-to-ZZ TMOV. Results feed `matmul_mx` via GM staging. MXFP4 quant is deferred. |
-| **Transform** | `tile.slice` | Extract a sub-tile with static shape, optional dynamic valid_shape, and optional `drop_dims` (numpy-style rank reduction over static unit axes; result clamped to a 2D minimum) |
-| - | `tile.extract` | Extract a sub-tile from `src` at `(index_row, index_col)` — ISA TEXTRACT Variant 1 (Mat→Left/Right, Acc→Mat). The result's layout comes from `target_memory`'s implicit view, except `Left`/`Right`, which take the TEXTRACT-side L0 formats (these differ from `tile.move`'s TMOV-side ones) |
-| - | `tile.reshape` | Reshape tile to new dimensions (element count must match). Carries the source's `valid_shape` through without widening it — see [Reshape and the valid region](#reshape-and-the-valid-region) |
-| - | `tile.reinterpret_view` | Zero-copy view with a different dtype and the same exact bytes; optional shape uses layout-aware inference (packed flat tiles only) |
-| - | `tile.transpose` | Swap two axes of a tile |
-| - | `tile.set_validshape` | Update valid-shape metadata without data movement |
-| - | `tile.ci` | Generate contiguous integer sequence (start + k / start - k); dtype ∈ {INT16, INT32}; innermost dim != 1 |
-| - | `tile.tri` | Generate a lower/upper triangular 0/1 mask with an INT32 diagonal offset; supports an optional partial `valid_shape`; maps to `pto.ttri`. |
-| **Reduction** | `tile.row_*` / `tile.col_*` | Direction-specific reduction (`row_sum`/`row_max`/`row_min`/`row_prod` collapse the last axis; `col_*` collapse axis 0). There is no axis-parameterized reduction — the ISA has only direction-specific intrinsics (`pto.trowsum`, `pto.tcolsum`, …) |
-| **Gather** | `tile.gatherb` | Gather 32-byte source blocks. Each UINT32 offset selects one block; each offset column expands to `32 / sizeof(output_dtype)` output elements, and valid shape expands identically. `output_dtype` defaults to the source dtype and may select another supported byte interpretation. Offset rows contain a positive multiple of eight entries. A sliced source must have a byte address provably aligned to 32 bytes; dynamic column offsets are rejected, while dynamic row offsets remain valid when the physical row stride preserves alignment. Maps to `pto.tgatherb`. |
-| - | `tile.mgather` | Gather from a GM tensor into a fresh Vec or Mat tile. Vec output uses an INT32 index tile (`[1,R]`, or A5 `[R,1]`); Mat output uses ND-layout GM source and INT32 index tensors plus canonical NZ layout, with physical rows aligned to 16 and columns aligned to `C0 = 32 / sizeof(dtype)`. Mat output accepts a smaller 2D `valid_shape` for padded tails. `coalesce="row"` gathers complete rows, while `"elem"` flat-indexes elements and requires a same-dtype, contiguous-ND GM `scratch` tensor with at least as many elements as the physical output. `gather_oob` selects `undefined`, `clamp`, `wrap`, or `zero`. Payload dtypes are I8/U8/I16/U16/I32/U32/FP16/BF16/FP32, plus the A5-only FP8E4M3FN/FP8E5M2/HF8 forms. |
-| **Scatter** | `tile.scatter` | Row-scatter `src` into `dst` at per-row indices (`pto.tscatter` index form; DPS — `dst` is in/out, the result aliases `dst`). `src`/`dst` dtype ∈ {I8, I16, I32, FP16, FP32, BF16}; `indexes` dtype ∈ {I16, I32}; element-size matching rule: 4-byte dst ↔ INT32, 2-byte dst ↔ INT16, 1-byte dst ↔ INT16. |
-| - | `tile.scatter_mask` | Mask-pattern row-scatter: write each `src` row into the mask-marked columns of `dst` (DPS — `dst` is in/out). A PyPTO codegen form lowered to a `pto.tscatter` mask emission — **not** a distinct pto-isa instruction (unlike `tile.gather_mask`). See [Mask patterns](#mask-patterns). |
-
-`quant_mx` and `matmul_mx` are not yet supported in the same InCore mixed task.
-Use separate AIV quantization and AIC matmul kernels, staging the quantized data
-and FP8E8M0 scales through GM. Automatic cross-core data-plus-scale transport is
-deferred to a follow-up change.
-
-`tile.reshape` preserves dtype, element count, and the source's valid region (see below); `tile.reinterpret_view(data, dtype, *, shape=None)` changes dtype while preserving exact byte size. Without `shape`, it scales the physically contiguous axis using the source/target dtype byte widths and tile layout. Under PTOAS memory planning, it lowers to the aliasing PTO `treshape` primitive for both same-shape and width-changing views.
-
-### Result view of `tile.move`
-
-The deduced result `TileView` splits by field:
-
-| Field | Source of the result value |
-| ----- | -------------------------- |
-| `blayout` / `slayout` | The **destination** space's implicit layout wherever it has one of its own (`Mat`, `Acc`, `Left`, `Right`, `LeftScale`, `RightScale`); for the flat spaces (`Vec`, `Bias`, …) the source tile's effective layout carries over. A `blayout` / `slayout` kwarg overrides either |
-| `fractal` | The **destination** space's boxing granularity: `Acc` (L0C, NZ-boxed) is 1024, MX scale tiles are 32, everything else 512. A byte-valued Vec-to-Vec MX-scale reorder is the narrow exception: it preserves the source's 32-byte scale boxes |
-| `valid_shape` / `pad` | Carried over from the source |
-| `stride` / `start_offset` | Dropped — the destination is a dense buffer |
-
-The layout comes from the destination because it describes how that buffer is
-boxed; `tile_view_semantics::GetImplicitTileLayout` supplies it. `Right` needs a
-local override — L0B requires `blayout=row_major` even for an `[N, 1]` shape,
-whose implicit `blayout` is `col_major`.
-
-`tile.move` stamps the destination `memory_space` itself (see the `TileType`
-contract in [Types](02-types.md#tiletype)), so a result view matching the
-destination's implicit view collapses to `nullopt` — the same per-space view
-[`InferTileMemorySpace`](../passes/20-infer_tile_memory_space.md) refreshes a
-retyped tile to.
-
-`tile.move` is not in-place safe: within one memory space, its source and result
-must resolve to distinct addresses. The PyPTO and DSA-RP planners enforce this
-constraint, and baked-address PTO codegen reports an error if an explicit
-MemRef binding or hand-built IR still presents a same-address move.
-
-### Reshape and the valid region
-
-A reshape is a zero-copy view, so it cannot invent data: `tensor.reshape` and
-`tile.reshape` share one rule that carries the source's `valid_shape` into the
-target shape and never widens it. A valid region is an origin-anchored box, so
-not every source region survives a repartition — the rule maps what it can:
-
-| Source region | Result |
-| ------------- | ------ |
-| Fully valid | `new_shape` — canonicalized away, so no view survives and no existing program changes |
-| Provably empty | An all-zero box |
-| Only full unit axes added / removed | Surviving axes map 1:1; an arbitrary rectangle is preserved exactly |
-| A contiguous flat prefix | The rectangle of `new_shape` spanning those same cells, if one exists |
-| Anything else | **Rejected** — `valid_shape` cannot describe the reshaped region |
-
-So `[8, 16]` valid `[5, 16]` (a flat prefix of 80 cells) maps to `[16, 8]` valid
-`[10, 8]` and to `[128]` valid `[80]`, while `[4, 32]` is rejected — 80 cells is
-not a whole number of 32-wide rows. `[1, 8, 16]` valid `[1, 8, 5]` is not a flat
-prefix at all, yet `[8, 16]` valid `[8, 5]` is exact, because dropping a full
-unit axis keeps rows as rows. `tensor.reshape`'s optional third `valid_shape`
-operand may only *narrow* the derived region, never claim data outside it.
-
-An **identity** `tile.reshape` — one whose target shape equals the source's —
-additionally keeps the source's layout triple (`blayout` / `slayout` / `fractal`) and its
-resolved memory space, instead of re-deriving the layout from the shape. Re-deriving
-yields the space-agnostic flat layout, which `NormalizeImplicitTileView` rescues only for
-a view that collapses; an Acc box that is narrowed, padded, or declared `compact` never
-collapses, so the flat layout would stick and its reader would walk L0C as a plain
-row-major buffer (issue #2470).
-
-**Data Flow:** `TensorType (DDR) → tile.load → TileType (Unified Buffer) → tile.{ops} → TileType → tile.store → TensorType (DDR)`
-
-### Mask patterns
-
-`*.gather_mask` / `*.scatter_mask` use a compile-time `MaskPattern` (`pl.tile.MaskPattern`, integer values 1–7, matching the hardware `VREDUCEv2` pattern modes) to mark a per-row subset of columns (names read **right-to-left**, rightmost bit = column 0). The same mark set drives the two ops in opposite directions. **`gather_mask`** *selects & compacts*: it reads the marked columns of a wide input into the leading columns of a narrower output (`out_cols = cols / stride`); this is a real pto-isa instruction (`pto.tgather` mask form), supported on A2/A3 **and A5**. **`scatter_mask`** *places & expands*: it writes a compact input into the marked columns of a wider `dst` (`dst_cols = cols * stride`), leaving unmarked columns at their prior `dst` value (DPS); this is a **PyPTO codegen-level form, not a distinct pto-isa instruction** — there is no `pto.tscatter` mask instruction (unlike gather) — and PyPTO emits it for A2/A3 / CPU-sim style lowering paths. E.g. for `[a0 a1 a2 a3 a4 a5 a6 a7]`: gather `P0101 → [a0 a2 a4 a6]`; scatter of `[s0 s1 s2 s3]` `P0101 → [s0 · s1 · s2 · s3 ·]` (`·` = preserved `dst`).
-
-| Pattern | int | Marks column `c` when | Marked columns | Stride |
-| ------- | --- | --------------------- | -------------- | ------ |
-| `P0101` | 1 | `c % 2 == 0` | 0, 2, 4, … | 2 |
-| `P1010` | 2 | `c % 2 == 1` | 1, 3, 5, … | 2 |
-| `P0001` | 3 | `c % 4 == 0` | 0, 4, 8, … | 4 |
-| `P0010` | 4 | `c % 4 == 1` | 1, 5, 9, … | 4 |
-| `P0100` | 5 | `c % 4 == 2` | 2, 6, 10, … | 4 |
-| `P1000` | 6 | `c % 4 == 3` | 3, 7, 11, … | 4 |
-| `P1111` | 7 | always | all | 1 |
-
-The last dim must be divisible by the stride. `gather_mask` also accepts an optional same-bit-width `output_dtype` (bit-reinterpret, not a value cast). Reference: gather selection is `MaskSelect` in `pto-isa` `include/pto/cpu/TGather.hpp`; pypto type deduction in `src/ir/op/tile_ops/gather.cpp` (gather) / `src/ir/op/tile_ops/scatter.cpp` (scatter).
-
-### Example Usage
-
-```python
-from pypto.ir.op import tile
-
-ib = IRBuilder()
-with ib.function("tile_computation") as f:
-    input_a = f.param("input_a", ir.TensorType([128, 128], DataType.FP32))
-    input_b = f.param("input_b", ir.TensorType([128, 128], DataType.FP32))
-    output = f.param("output", ir.TensorType([128, 1], DataType.FP32))
-    f.return_type(ir.TensorType([128, 1], DataType.FP32))
-
-    # Load, compute, reduce, store
-    tile_a = ib.let("tile_a", tile.load(input_a, [0, 0], [32, 128]))
-    tile_b = ib.let("tile_b", tile.load(input_b, [0, 0], [32, 128]))
-    tile_mul = ib.let("tile_mul", tile.mul(tile_a, tile_b))
-    tile_sqrt = ib.let("tile_sqrt", tile.sqrt(tile_mul))
-    # row_sum collapses the last axis -> [32, 1]. Its scratch tile must have
-    # the same dtype and rank and be at least as large as the input in every dimension.
-    tmp_tile = ib.let("tmp_tile", tile.create([32, 128], DataType.FP32))
-    tile_sum = ib.let("tile_sum", tile.row_sum(tile_sqrt, tmp_tile))
-    result = ib.let("result", tile.store(tile_sum, [0, 0], output))
-    ib.return_stmt(result)
-```
+See [Tensor and Tile Operators](05-tensor-tile-ops.md) for data-operator APIs,
+flat gather, valid-region semantics, tile layouts, and mask patterns.
 
 ## SyncOp: Synchronization Operations
 

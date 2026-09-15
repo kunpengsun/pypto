@@ -70,6 +70,7 @@ Framework for organizing and executing IR transformation passes on Programs with
 | `IterArgCarryClassified` | Every Orchestration ForStmt with iter_args carries its `iter_arg_rebind_<i>` carry plan, so codegen reads it instead of re-deriving it |
 | `AccToGmStoreValid` | Every `tile.store` from an Acc-resident tile targets a GM dtype the backend's fix-pipe can narrow into |
 | `AtomicAddDtypeValid` | Every atomic-add write into GM targets a destination dtype the backend's store pipe can combine |
+| `BufferIR` | InCore/AIC/AIV use explicit buffer handles and valid registered buffer calls; composes SSA, lexical use-after-definition, and assignment symmetry. Explicitly selected during buffer IR development; does not prove storage lifetimes or data initialization. |
 
 ### IRPropertySet
 
@@ -127,8 +128,8 @@ struct PassProperties {
 | InferTileMemorySpace | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure | SSAForm, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid, AccToGmStoreValid | AivSplitValid |
 | InsertMxScaleAddr | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | SSAForm, IncoreTileOps, SplitIncoreOrch, NormalizedStmtStructure, TileMemoryInferred | — |
 | ResolveBackendOpLayouts | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, NormalizedStmtStructure | — |
-| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | AivSplitValid |
-| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid | — |
+| LowerAutoVectorSplit | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitValid | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitLoweredValid | AivSplitValid |
+| ExpandMixedKernel | SSAForm, IncoreTileOps, SplitIncoreOrch, TileOps2D, TileMemoryInferred, NormalizedStmtStructure, AivSplitLoweredValid | SSAForm, MixedKernelExpanded, NormalizedStmtStructure, HardSyncallOccupancyValid, AccCompactValid | AccCompactValid, AivSplitLoweredValid |
 | InjectGMPipeBuffer | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | SSAForm, MixedKernelExpanded, NormalizedStmtStructure | — |
 | SplitVectorKernel | SSAForm, MixedKernelExpanded | SSAForm, VectorKernelSplit, NormalizedStmtStructure | — |
 | StampTfreeSplit | SplitIncoreOrch | — | — |
@@ -584,3 +585,9 @@ print(p.get_produced_properties())   # {SSAForm}
 - `tests/ut/ir/transforms/test_pass_pipeline.py` — Pipeline, PassContext, instruments, and automatic verification tests
 - `tests/ut/ir/transforms/test_pass_manager.py` — PassManager backward compatibility
 - `tests/ut/conftest.py` — Autouse fixture enabling AFTER verification for all tests
+
+### AIV split verification handoff
+
+`LowerAutoVectorSplit` requires `AivSplitValid` and produces `AivSplitLoweredValid`.
+`ExpandMixedKernel` consumes retained/synthesized regions and the supported flat
+fallback, then invalidates the lowered property. Pass order is unchanged.

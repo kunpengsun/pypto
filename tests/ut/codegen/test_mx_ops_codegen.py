@@ -115,6 +115,36 @@ class TestMxMatmulCodegen:
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions
         )
 
+    def test_mx_scale_load_joins_layout_and_cache_policy_in_one_attr_dict(self):
+        """An MX scale load declared `cache=BYPASS` carries BOTH attributes.
+
+        The MX ``layout`` and the L2-bypass ``cache_policy`` (pypto #2680) can
+        co-occur on one ``pto.tload``, and PTOAS takes all present attributes in
+        a single dict — two dicts, or a dropped attribute, would not assemble.
+        ``layout`` stays first so an MX load that declares no policy keeps its
+        byte-identical form.
+
+        Verified against a real ptoas v0.61 run of this emit (accepted; the load
+        lowers to ``TLOAD<pto::TLoadL2Hint::NotAllocKeep>``). UTs themselves run
+        with ``skip_ptoas=True``, so the assertion here is on the emitted text.
+        """
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+            ):
+                _ = pl.load(a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+
+        mlir = _emit_incore_mlir(Program)
+        tloads = [line for line in mlir.splitlines() if "pto.tload" in line]
+        assert len(tloads) == 1, f"expected one MX scale load:\n{mlir}"
+        assert (
+            "{layout = #pto.layout<mx_a_zz>, cache_policy = #pto.load_cache_policy<l2_bypass>}" in tloads[0]
+        ), tloads[0]
+
     def test_mx_scale_load_rejects_unprovable_dynamic_offset(self):
         """Unaligned / unprovable dynamic MX offsets fail at BlockMxScaleTensorViews."""
 
@@ -214,15 +244,11 @@ class TestMxMatmulCodegen:
                 b_s: pl.Tensor[[2, 64], pl.FP8E8M0, pl.MX_B_NN],
                 out: pl.Tensor[[128, 64], pl.FP32],
             ):
-                ta = pl.load(a, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
-                tas = pl.load(a_s, [0, 0], [128, 2], target_memory=pl.Mem.Mat)
-                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
-                tbs = pl.load(b_s, [0, 0], [2, 64], target_memory=pl.Mem.Mat)
-                la = pl.move(ta, target_memory=pl.Mem.Left)
-                las = pl.move(tas, target_memory=pl.Mem.LeftScale)
-                rb = pl.move(tb, target_memory=pl.Mem.Right)
-                rbs = pl.move(tbs, target_memory=pl.Mem.RightScale)
-                c = pl.matmul_mx(la, las, rb, rbs)
+                ta = pl.load(a, [0, 0], [128, 64])
+                tas = pl.load(a_s, [0, 0], [128, 2])
+                tb = pl.load(b, [0, 0], [64, 64])
+                tbs = pl.load(b_s, [0, 0], [2, 64])
+                c = pl.matmul_mx(ta, tas, tb, tbs)
                 pl.store(c, [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
@@ -301,14 +327,10 @@ class TestMxMatmulCodegen:
                 out: pl.Tensor[[128, 64], pl.FP32],
             ):
                 ta = pl.cast(pl.load(a, [0, 0], [128, 64]), pl.FP8E4M3FN)
-                tas = pl.load(a_s, [0, 0], [128, 2], target_memory=pl.Mem.Mat)
-                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
-                tbs = pl.load(b_s, [0, 0], [2, 64], target_memory=pl.Mem.Mat)
-                la = pl.move(ta, target_memory=pl.Mem.Left)
-                las = pl.move(tas, target_memory=pl.Mem.LeftScale)
-                rb = pl.move(tb, target_memory=pl.Mem.Right)
-                rbs = pl.move(tbs, target_memory=pl.Mem.RightScale)
-                pl.store(pl.matmul_mx(la, las, rb, rbs), [0, 0], out)
+                tas = pl.load(a_s, [0, 0], [128, 2])
+                tb = pl.load(b, [0, 0], [64, 64])
+                tbs = pl.load(b_s, [0, 0], [2, 64])
+                pl.store(pl.matmul_mx(ta, tas, tb, tbs), [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
         assert mlir.count("pto.tcvt") == 3

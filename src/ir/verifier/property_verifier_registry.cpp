@@ -52,6 +52,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::IncoreTileOps, CreateIncoreTileOpsPropertyVerifier);
   Register(IRProperty::MixedKernelExpanded, CreateMixedKernelExpandedPropertyVerifier);
   Register(IRProperty::AivSplitValid, CreateAivSplitValidPropertyVerifier);
+  Register(IRProperty::AivSplitLoweredValid, CreateAivSplitLoweredValidPropertyVerifier);
   Register(IRProperty::AllocatedMemoryAddr, CreateAllocatedMemoryAddrPropertyVerifier);
   Register(IRProperty::TileOps2D, CreateTileOps2DPropertyVerifier);
   Register(IRProperty::TileMemoryInferred, CreateTileMemoryInferredPropertyVerifier);
@@ -69,6 +70,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::IterArgCarryClassified, CreateIterArgCarryClassifiedPropertyVerifier);
   Register(IRProperty::CallDirectionsResolved, CreateCallDirectionsResolvedPropertyVerifier);
   Register(IRProperty::TileTypeCoherence, CreateTileTypeCoherencePropertyVerifier);
+  Register(IRProperty::BufferIR, CreateBufferIRPropertyVerifier);
   Register(IRProperty::AccToGmStoreValid, CreateAccToGmStoreValidPropertyVerifier);
   Register(IRProperty::AccCompactValid, CreateAccCompactValidPropertyVerifier);
   // AtomicAddDtypeValid: an atomic-add into a bf16 GM destination is A2/A3-only

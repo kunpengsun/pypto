@@ -33,6 +33,7 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/storage_size.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
@@ -225,6 +226,132 @@ void ValidateMeshSignalShape(const DistributedTensorTypePtr& signal_type, const 
         << " — a signal shaped for mode=\"ring\" allreduce ([2*(NR-1), NR]) cannot be shared with "
            "this collective; give it its own [NR, 1] signal window";
   }
+}
+
+/// Per-dtype UB chunking constants shared by every InCore collective lowering.
+/// ``storage_bits`` is the physical width of one logical element.
+/// ``chunk_elements`` is the widest logical-element count that fits one
+/// ``kAllReduceChunkBytes`` tile; ``alignment_elements`` is the logical-element
+/// count spanning one ``kPTOTileAlignmentBytes`` PTO tile row.
+struct CollectiveChunkGeometry {
+  int64_t storage_bits = 0;
+  int64_t chunk_elements = 0;
+  int64_t alignment_elements = 0;
+  ExprPtr alignment_elements_idx;
+  ExprPtr alignment_minus_one_idx;
+  ExprPtr max_chunk_cols;
+};
+
+/// Derives the chunk geometry for ``dtype``. ``op_name`` is woven into the
+/// diagnostics so a caller-specific message survives the extraction.
+CollectiveChunkGeometry MakeChunkGeometry(const DataType& dtype, const Span& span, const char* op_name) {
+  CollectiveChunkGeometry geo;
+  geo.storage_bits = static_cast<int64_t>(storage_size::GetStorageBitWidth(dtype));
+  INTERNAL_CHECK_SPAN(geo.storage_bits > 0, span)
+      << op_name << " target dtype has no storage width: " << dtype.ToString();
+  constexpr int64_t kBitsPerByte = 8;
+  const int64_t chunk_bits = kAllReduceChunkBytes * kBitsPerByte;
+  const int64_t alignment_bits = kPTOTileAlignmentBytes * kBitsPerByte;
+  INTERNAL_CHECK_SPAN(chunk_bits % geo.storage_bits == 0, span)
+      << op_name << " dtype storage width must divide the chunk bit budget";
+  geo.chunk_elements = chunk_bits / geo.storage_bits;
+  INTERNAL_CHECK_SPAN(geo.chunk_elements > 0, span)
+      << op_name << " dtype is wider than the chunk byte budget";
+  INTERNAL_CHECK_SPAN(alignment_bits % geo.storage_bits == 0, span)
+      << op_name << " dtype storage width must divide the tile-alignment bit budget";
+  geo.alignment_elements = alignment_bits / geo.storage_bits;
+  geo.alignment_elements_idx = std::make_shared<ConstInt>(geo.alignment_elements, DataType::INDEX, span);
+  geo.alignment_minus_one_idx = std::make_shared<ConstInt>(geo.alignment_elements - 1, DataType::INDEX, span);
+  geo.max_chunk_cols = std::make_shared<ConstInt>(geo.chunk_elements, DataType::INDEX, span);
+  return geo;
+}
+
+/// Picks the physical chunk width for a chunked collective. A statically known
+/// ``logical_extent`` smaller than one full chunk is rounded up to the nearest
+/// 32-byte-aligned element count, so a short collective does not reserve a full
+/// ``kAllReduceChunkBytes`` tile and the caller keeps its remaining VEC UB
+/// budget. Anything else — including a symbolic extent — uses the full chunk.
+ExprPtr SelectStaticChunkCols(const CollectiveChunkGeometry& geo, const ExprPtr& logical_extent,
+                              const Span& span) {
+  if (auto extent = As<ConstInt>(logical_extent);
+      extent && extent->value_ > 0 && extent->value_ < geo.chunk_elements) {
+    const int64_t aligned_extent =
+        ((extent->value_ - 1) / geo.alignment_elements + 1) * geo.alignment_elements;
+    return std::make_shared<ConstInt>(aligned_extent, DataType::INDEX, span);
+  }
+  return geo.max_chunk_cols;
+}
+
+/// Sizes the 2D VEC staging tile that a ``pld.tile.put`` / ``pld.tile.get``
+/// transfer slides through.
+///
+/// pto-isa TPUT/TGET read the full extent from the partition views and 2D-slide
+/// the transfer through the stage, so the stage only has to *fit within* the
+/// flattened transfer rather than equal it (see comm_op::ValidateStageFitsTransfer).
+/// Sizing the stage from the whole transfer therefore buys nothing and costs
+/// everything: a [1, 65537] FP32 transfer would reserve 256 KiB of VEC and fail
+/// in AllocateMemoryAddr. Cap it to one ``kAllReduceChunkBytes`` tile instead.
+///
+/// ``transfer_shape`` is flattened to [rows = prod(leading dims), cols = innermost].
+/// A dynamic dim contributes the chunk bound directly, matching MakeTputStageShape's
+/// contract for pld.tensor.put / pld.tensor.get: the stage is a static UB
+/// allocation, and pto-isa reads the runtime extent from the partition views.
+/// ``ValidateStageFitsTransfer`` therefore compares only statically known dims
+/// (``!cols_static || stage_cols <= transfer_cols``). A symbolic SIZE of runtime
+/// 17 still gets a 4096-element FP32 stage — that is the same bound a user-level
+/// ``chunk_cols`` would supply, not a stage-fits-transfer violation. The result
+/// never exceeds a *statically known* transfer dim.
+ExprPtr MakeCollectiveStageShape(const std::vector<ExprPtr>& transfer_shape,
+                                 const CollectiveChunkGeometry& geo, const Span& span, const char* op_name) {
+  INTERNAL_CHECK_SPAN(!transfer_shape.empty(), span) << op_name << " transfer shape must have rank >= 1";
+
+  int64_t cols_val = geo.chunk_elements;
+  if (auto cols_c = As<ConstInt>(transfer_shape.back()); cols_c && cols_c->value_ > 0) {
+    cols_val = std::min(cols_c->value_, geo.chunk_elements);
+    // Unlike SelectStaticChunkCols (allreduce's own accumulator scratch,
+    // decoupled from the transfer shape), this stage is the literal bounce
+    // buffer pld.tile.put/get slides the transfer through, so it can never
+    // exceed the transfer (comm_op::ValidateStageFitsTransfer,
+    // "!cols_static || stage_cols <= transfer_cols"). A short, non-tile-aligned
+    // length (e.g. 17 elements of FP32) must therefore round its column width
+    // DOWN to the nearest kPTOTileAlignmentBytes-aligned width rather than up
+    // — pto.alloc_tile requires the row byte size aligned, and the remainder
+    // (17 - 16 = 1 element here) rides the same auto-chunked partial last
+    // slide that already handles a transfer wider than one full chunk. Sizes
+    // below one alignment unit (< 8 elements of FP32) have no valid aligned
+    // width that still fits within the transfer; leave those unrounded — a
+    // pre-existing, narrower gap this cap fix does not claim to close.
+    if (cols_val >= geo.alignment_elements && cols_val < geo.chunk_elements) {
+      cols_val = (cols_val / geo.alignment_elements) * geo.alignment_elements;
+    }
+  }
+
+  // Keep a 2D stage (e.g. all_to_all_v's [MAX_RECV, SIZE]) inside the same
+  // byte budget by trading rows against the chosen column width.
+  const int64_t rows_budget = std::max<int64_t>(1, geo.chunk_elements / cols_val);
+  int64_t rows_prod = 1;
+  bool rows_static = true;
+  for (size_t d = 0; d + 1 < transfer_shape.size(); ++d) {
+    auto dim_c = As<ConstInt>(transfer_shape[d]);
+    if (!dim_c || dim_c->value_ <= 0) {
+      rows_static = false;
+      break;
+    }
+    // Only min(product, rows_budget) is observable. Saturate before
+    // multiplication so an otherwise-valid very large static shape cannot
+    // overflow int64_t while computing the bounded stage geometry.
+    if (rows_prod >= rows_budget || dim_c->value_ > rows_budget / rows_prod) {
+      rows_prod = rows_budget;
+    } else {
+      rows_prod *= dim_c->value_;
+    }
+  }
+  const int64_t rows_val = rows_static ? std::min(rows_prod, rows_budget) : 1;
+
+  return std::make_shared<MakeTuple>(
+      std::vector<ExprPtr>{std::make_shared<ConstInt>(rows_val, DataType::INDEX, span),
+                           std::make_shared<ConstInt>(cols_val, DataType::INDEX, span)},
+      span);
 }
 
 // ============================================================================
@@ -1092,18 +1219,10 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
   auto zero_idx = std::make_shared<ConstInt>(0, DataType::INDEX, span);
   auto one_idx = std::make_shared<ConstInt>(1, DataType::INDEX, span);
   auto one_i32 = std::make_shared<ConstInt>(1, DataType::INT32, span);
-  const int64_t element_bytes = static_cast<int64_t>(target_type->dtype_.GetByte());
-  INTERNAL_CHECK_SPAN(element_bytes > 0, span)
-      << "pld.tensor.allreduce target dtype has no storage width: " << target_type->dtype_.ToString();
-  const int64_t chunk_elements = kAllReduceChunkBytes / element_bytes;
-  INTERNAL_CHECK_SPAN(chunk_elements > 0, span)
-      << "pld.tensor.allreduce dtype is wider than the mesh chunk byte budget";
-  INTERNAL_CHECK_SPAN(kPTOTileAlignmentBytes % element_bytes == 0, span)
-      << "pld.tensor.allreduce dtype width must divide the tile alignment";
-  const int64_t alignment_elements = kPTOTileAlignmentBytes / element_bytes;
-  auto alignment_elements_idx = std::make_shared<ConstInt>(alignment_elements, DataType::INDEX, span);
-  auto alignment_minus_one_idx = std::make_shared<ConstInt>(alignment_elements - 1, DataType::INDEX, span);
-  auto max_chunk_cols = std::make_shared<ConstInt>(chunk_elements, DataType::INDEX, span);
+  const auto chunk_geometry = MakeChunkGeometry(target_type->dtype_, span, "pld.tensor.allreduce");
+  auto alignment_elements_idx = chunk_geometry.alignment_elements_idx;
+  auto alignment_minus_one_idx = chunk_geometry.alignment_minus_one_idx;
+  auto max_chunk_cols = chunk_geometry.max_chunk_cols;
 
   const auto* partial_valid_shape = GetPartialValidShape(target_type, span);
   // A fully-valid packed tensor is one logical 1D stream. Keep the view
@@ -1138,14 +1257,8 @@ ExprPtr LowerTensorAllReduceRule(const CallPtr& call, const std::vector<ExprPtr>
         << "pld.tensor.allreduce partial valid_shape must fit within one " << kAllReduceChunkBytes
         << "-byte mesh chunk using a statically bounded tile; chunking a partial rectangle with row gaps "
            "is not supported";
-  } else if (auto flat_extent = As<ConstInt>(flat_valid_shape[1]);
-             flat_extent && flat_extent->value_ > 0 && flat_extent->value_ < chunk_elements) {
-    // Do not reserve a full 16-KiB tile for a statically small allreduce. PTO
-    // tiles require a 32-byte-aligned row, so use the smallest legal physical
-    // width that covers the logical extent. Every chunk-local tile inherits
-    // this width, preserving the caller's remaining VEC UB budget.
-    const int64_t aligned_extent = ((flat_extent->value_ - 1) / alignment_elements + 1) * alignment_elements;
-    chunk_cols = std::make_shared<ConstInt>(aligned_extent, DataType::INDEX, span);
+  } else {
+    chunk_cols = SelectStaticChunkCols(chunk_geometry, flat_valid_shape[1], span);
   }
   auto flat_target = b.Bind(
       "target_2d", CreateAllReduceTargetView(target, flat_shape, flat_valid_shape, partial_valid_shape, span),
@@ -1398,18 +1511,10 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
   auto size_const = As<ConstInt>(size_expr);
   auto nr_const = As<ConstInt>(nr_expr);
 
-  const int64_t element_bytes = static_cast<int64_t>(target_type->dtype_.GetByte());
-  INTERNAL_CHECK_SPAN(element_bytes > 0, span)
-      << "pld.tensor.allreduce mode=ring target dtype has no storage width: "
-      << target_type->dtype_.ToString();
-  const int64_t max_chunk_elements = kAllReduceChunkBytes / element_bytes;
-  INTERNAL_CHECK_SPAN(max_chunk_elements > 0, span)
-      << "pld.tensor.allreduce mode=ring dtype is wider than the chunk byte budget";
-  INTERNAL_CHECK_SPAN(kPTOTileAlignmentBytes % element_bytes == 0, span)
-      << "pld.tensor.allreduce mode=ring dtype width must divide the tile alignment";
-  const int64_t alignment_elements = kPTOTileAlignmentBytes / element_bytes;
-  auto alignment_elements_idx = std::make_shared<ConstInt>(alignment_elements, DataType::INDEX, span);
-  auto alignment_minus_one_idx = std::make_shared<ConstInt>(alignment_elements - 1, DataType::INDEX, span);
+  const auto chunk_geometry = MakeChunkGeometry(target_type->dtype_, span, "pld.tensor.allreduce mode=ring");
+  const int64_t alignment_elements = chunk_geometry.alignment_elements;
+  auto alignment_elements_idx = chunk_geometry.alignment_elements_idx;
+  auto alignment_minus_one_idx = chunk_geometry.alignment_minus_one_idx;
 
   // FP32 keeps balanced floor(i * SIZE / NR) boundaries. FP16 rounds each
   // interior boundary up to a 32-byte position so every non-empty segment
@@ -1429,13 +1534,7 @@ ExprPtr LowerTensorRingAllReduceRule(const CallPtr& call, const std::vector<Expr
     }
   }
 
-  ExprPtr chunk_cols = std::make_shared<ConstInt>(max_chunk_elements, DataType::INDEX, span);
-  if (auto segment_const = As<ConstInt>(max_segment_cols);
-      segment_const && segment_const->value_ > 0 && segment_const->value_ < max_chunk_elements) {
-    const int64_t aligned_segment =
-        ((segment_const->value_ - 1) / alignment_elements + 1) * alignment_elements;
-    chunk_cols = std::make_shared<ConstInt>(aligned_segment, DataType::INDEX, span);
-  }
+  ExprPtr chunk_cols = SelectStaticChunkCols(chunk_geometry, max_segment_cols, span);
   auto chunk_shape = tile_conversion_utils::MakeShapeTuple({one_idx, chunk_cols}, span);
   // Own a single explicit linear ND view for every subchunk. Besides making
   // the [1, 1] column-vector exception unambiguous, this keeps the remote-load,
@@ -1843,19 +1942,12 @@ ExprPtr LowerTensorBroadcastRule(const CallPtr& call, const std::vector<ExprPtr>
   // Build a 2D VEC staging tile [rows, cols] where rows = prod(dims[:-1]),
   // cols = dims[-1], mirroring ConvertTensorToTileOps's lowering of
   // pld.tensor.get.
-  int64_t rows_val = 1;
-  for (size_t d = 0; d + 1 < target_type->shape_.size(); ++d) {
-    auto dim_c = As<ConstInt>(target_type->shape_[d]);
-    INTERNAL_CHECK_SPAN(dim_c, span) << "broadcast target shape must be static";
-    rows_val *= dim_c->value_;
-  }
-  auto last_dim_c = As<ConstInt>(target_type->shape_.back());
-  INTERNAL_CHECK_SPAN(last_dim_c, span) << "broadcast target shape must be static";
-  int64_t cols_val = last_dim_c->value_;
-
-  auto rows_expr = std::make_shared<ConstInt>(rows_val, DataType::INDEX, span);
-  auto cols_expr = std::make_shared<ConstInt>(cols_val, DataType::INDEX, span);
-  auto stage_shape_tuple = std::make_shared<MakeTuple>(std::vector<ExprPtr>{rows_expr, cols_expr}, span);
+  // The stage is a bounded bounce buffer, not a copy of the transfer, so the
+  // target shape no longer has to be static: a dynamic extent simply takes the
+  // chunk bound. pld.tile.get slides the full extent through it.
+  const auto chunk_geometry = MakeChunkGeometry(target_type->dtype_, span, "pld.tensor.broadcast");
+  auto stage_shape_tuple =
+      MakeCollectiveStageShape(target_type->shape_, chunk_geometry, span, "pld.tensor.broadcast");
 
   auto stage_tile =
       b.Bind("bcast_stage",
@@ -1886,7 +1978,9 @@ ExprPtr LowerTensorBroadcastRule(const CallPtr& call, const std::vector<ExprPtr>
 //   arg[2] = signal      — DistributedTensor INT32, cross-rank barrier
 //
 // Phases:
-//   0.  tile.create [1, SIZE] VEC — staging tile for auto-chunking
+//   0.  tile.create [stage_rows, stage_cols] VEC — bounded staging tile for
+//       auto-chunking; rows * cols fits one 16-KiB chunk and each row is
+//       32-byte aligned whenever the transfer is at least one alignment unit
 //   1.  for peer in 0..NR-1:
 //         pld.tile.put(target, peer, local_data, put_stage,
 //                      [my_rank, 0], [0, 0], [1, SIZE])
@@ -1949,11 +2043,17 @@ ExprPtr LowerTensorAllGatherRule(const CallPtr& call, const std::vector<ExprPtr>
   // Each peer receives this rank's chunk at target[my_rank, 0:SIZE].
   // Self-store (peer == my_rank) uses HCCL identity mapping — the same trust
   // model as the pld.tile.get self-path in the original pull-based allgather.
-  // pld.tile.put auto-chunks when SIZE exceeds the staging-tile capacity, so a
-  // single [1, SIZE] VEC staging tile suffices regardless of SIZE.
+  // pld.tile.put auto-chunks when SIZE exceeds the staging-tile capacity, so the
+  // stage is capped to one chunk rather than sized from SIZE — a [1, SIZE] stage
+  // would reserve SIZE * dtype bytes of VEC and overflow UB for a large SIZE.
+  // chunk_shape stays the *transfer* extent handed to pld.tile.put below.
+  const auto chunk_geometry = MakeChunkGeometry(target_type->dtype_, span, "pld.tensor.allgather");
+  auto stage_shape =
+      MakeCollectiveStageShape({std::make_shared<ConstInt>(1, DataType::INDEX, span), size_expr},
+                               chunk_geometry, span, "pld.tensor.allgather");
   auto put_stage =
       b.Bind("ag_stage",
-             reg.Create("tile.create", {chunk_shape},
+             reg.Create("tile.create", {stage_shape},
                         {{"dtype", target_type->dtype_}, {"target_memory", MemorySpace::Vec}}, span),
              span);
 
@@ -2188,11 +2288,16 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
   //      larger than the stage is auto-chunked. The self-rank case (peer ==
   //      my_rank) falls out of the same path via HCCL identity mapping.
   //
-  // One shared [1, SIZE] VEC staging tile is reused across all destinations,
-  // mirroring allgather's per-peer pld.tile.get.
+  // One shared VEC staging tile is reused across all destinations, mirroring
+  // allgather's. It is capped to one chunk rather than sized from SIZE: the
+  // stage is a bounce buffer the transfer slides through, so a [1, SIZE] stage
+  // would only waste UB. chunk_shape stays the transfer extent.
+  const auto chunk_geometry = MakeChunkGeometry(target_type->dtype_, span, "pld.tensor.all_to_all");
+  auto stage_shape =
+      MakeCollectiveStageShape({one_idx, size_expr}, chunk_geometry, span, "pld.tensor.all_to_all");
   auto put_stage =
       b.Bind("aa_stage",
-             reg.Create("tile.create", {chunk_shape},
+             reg.Create("tile.create", {stage_shape},
                         {{"dtype", target_type->dtype_}, {"target_memory", MemorySpace::Vec}}, span),
              span);
 
@@ -2229,13 +2334,11 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 // ============================================================================
 // LowerTensorAllToAllVRule — pld.tensor.all_to_all_v (variable-size all-to-all)
 //
-// Variable-size all-to-all (MPI_Alltoallv pattern).  Each rank pushes a full
-// MAX_RECV-row capacity block to every peer via a single static-shape
-// pld.tile.put per destination; only ``min(send_counts[dest], MAX_RECV)`` of
-// those rows are logically valid.  ``send_counts[dest]`` is a *runtime*,
-// data-dependent count read from device data during the exchange, but it
-// does not change the transfer size (PTOAS requires static partition-view
-// dims for pto.comm.tput).  The 5-arg API signature (input, target, signal,
+// Variable-size all-to-all (MPI_Alltoallv pattern). Each rank pushes a
+// runtime-sized block to every peer via one pld.tile.put per destination.
+// ``send_counts[dest]`` is read from device data and clamped to
+// ``[0, MAX_RECV]``; that clamped value becomes the dynamic transfer row count.
+// The 5-arg API signature (input, target, signal,
 // send_counts, recv_counts) extends the symmetric all_to_all's
 // window-as-result pattern: the intrinsic returns target, and the caller
 // reads back from the window with tile.load.  During the push phase each
@@ -2256,8 +2359,9 @@ ExprPtr LowerTensorAllToAllRule(const CallPtr& call, const std::vector<ExprPtr>&
 //       // Single pld.tile.put per destination: contiguous [rows, SIZE] block
 //       // at input[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :]. The
 //       // transfer shape is the runtime [rows, SIZE] (PTOAS accepts dynamic
-//       // partition-view dims on pto.comm.tput).  A [1, SIZE] staging tile
-//       // feeds the TPUT engine, which 2-D-slides the transfer through it.
+//       // partition-view dims on pto.comm.tput). A bounded
+//       // [stage_rows, stage_cols] tile feeds the TPUT engine, which
+//       // 2-D-slides the transfer through it.
 //
 //   Phase 2: self-clearing credit barrier
 //     EmitBarrier() — AtomicAdd(+1) on every peer cell, then Wait(Ge 1)
@@ -2332,28 +2436,40 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
   // MAX_RECV = target[0] / NR.  NR is extracted from signal[0]
   // (deducer-enforced compile-time constant).  Signal is required to be 2D
   // [NR, 1] so MakeSignalOffsets(rank) → [rank, 0] matches notify/wait.
+  // These three validate the caller's declared window/signal shapes, so a
+  // violation is a user error, not a compiler invariant — report it as such.
   auto total_rows_c = As<ConstInt>(target_type->shape_[0]);
-  INTERNAL_CHECK_SPAN(total_rows_c, span) << "target dim 0 must be a compile-time constant";
+  CHECK_SPAN(total_rows_c, span)
+      << "pld.tensor.all_to_all_v target dim 0 must be a compile-time constant (it is split as "
+         "NR * MAX_RECV to give every sender a fixed-capacity slot)";
   auto signal_type = As<DistributedTensorType>(signal->GetType());
   INTERNAL_CHECK_SPAN(signal_type, span) << "signal must be DistributedTensorType";
   ValidateMeshSignalShape(signal_type, "pld.tensor.all_to_all_v", span);
   auto nr_c = As<ConstInt>(signal_type->shape_[0]);
-  INTERNAL_CHECK_SPAN(nr_c, span) << "signal dim 0 (NR) must be a compile-time constant";
+  CHECK_SPAN(nr_c, span) << "pld.tensor.all_to_all_v signal dim 0 (NR) must be a compile-time constant";
   int64_t max_recv_value = total_rows_c->value_ / nr_c->value_;
-  INTERNAL_CHECK_SPAN(max_recv_value * nr_c->value_ == total_rows_c->value_, span)
-      << "target dim 0 (" << total_rows_c->value_ << ") must be divisible by NR (" << nr_c->value_ << ")";
+  // Divisibility is load-bearing, not incidental: the receiver locates sender
+  // s's block at row s * MAX_RECV without knowing s's count, so every sender
+  // needs an equal-capacity slot. This is deliberately not relaxed.
+  CHECK_SPAN(max_recv_value * nr_c->value_ == total_rows_c->value_, span)
+      << "pld.tensor.all_to_all_v target dim 0 (" << total_rows_c->value_ << ") must be divisible by NR ("
+      << nr_c->value_
+      << "): the receiver locates sender s's block at row s * MAX_RECV without knowing s's count, so "
+         "every sender needs an equal-capacity slot. Round the window's row count up to a multiple of NR";
   auto max_recv_expr = std::make_shared<ConstInt>(max_recv_value, DataType::INDEX, span);
 
-  // Per-destination staging tile: static [1, SIZE] — pto-isa auto-chunks the
-  // transfer through it. The stage stays static (UB is allocated statically)
-  // even though the transfer extent is dynamic.
-  auto stage_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{one_idx, size_expr}, span);
+  // Per-destination staging tile, capped to one chunk — pto-isa slides the
+  // static [MAX_RECV, SIZE] transfer through it, so the stage need not (and
+  // should not) be sized from SIZE.
+  const auto chunk_geometry = MakeChunkGeometry(target_type->dtype_, span, "pld.tensor.all_to_all_v");
+  auto stage_shape =
+      MakeCollectiveStageShape({max_recv_expr, size_expr}, chunk_geometry, span, "pld.tensor.all_to_all_v");
 
   // ---- Phase 1: push per-destination blocks to peer windows ----
-  // One shared [1, SIZE] VEC staging tile reused across all destinations;
-  // a single pld.tile.put per destination transfers [rows, SIZE], where rows is
-  // the runtime send count clamped to [0, MAX_RECV] — so only the payload
-  // crosses the wire, not the full capacity block.
+  // One shared bounded [stage_rows, stage_cols] VEC tile is reused across all
+  // destinations. A single pld.tile.put transfers [rows, SIZE], where rows is
+  // the runtime count clamped to [0, MAX_RECV], and 2-D-slides that transfer
+  // through the stage — so only the payload crosses the wire.
   // Flat row-index arithmetic:
   // source[dest*MAX_RECV, :] → target[my_rank*MAX_RECV, :].
   auto put_stage =
@@ -2408,8 +2524,8 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
                   span);
 
         // Single pld.tile.put per destination transferring exactly the rows
-        // being sent. The [1, SIZE] VEC staging tile feeds the TPUT engine,
-        // which 2-D-slides the larger transfer through it.
+        // being sent. The bounded [stage_rows, stage_cols] VEC tile feeds the
+        // TPUT engine, which 2-D-slides the larger transfer through it.
         // 2D source offsets: input[dest * MAX_RECV, :]
         auto src_offsets = std::make_shared<MakeTuple>(
             std::vector<ExprPtr>{dest_base, std::make_shared<ConstInt>(0, DataType::INDEX, span)}, span);
@@ -2421,7 +2537,7 @@ ExprPtr LowerTensorAllToAllVRule(const CallPtr& call, const std::vector<ExprPtr>
         // PTOAS accepts dynamic partition-view dims on pto.comm.tput
         // (TPutOp::verify passes CommGlobalShapePolicy::AllowDynamicPartitionView),
         // and pld.tile.put needs no chunk_rows attr: it takes an explicit
-        // [1, SIZE] staging tile, and ValidateStageFitsTransfer skips dynamic
+        // bounded 2-D staging tile, and ValidateStageFitsTransfer skips dynamic
         // dims because the runtime extent bounds them.
         auto transfer_shape = std::make_shared<MakeTuple>(std::vector<ExprPtr>{rows, size_expr}, span);
         // Skip the push entirely for a destination getting no rows — a

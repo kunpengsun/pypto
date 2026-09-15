@@ -27,6 +27,7 @@ import pypto.language.distributed as pld
 import pytest
 from pypto import ir, passes
 from pypto.language.parser.diagnostics.exceptions import ParserError
+from pypto.pypto_core import ir as _ir_core
 
 _OP_PLD_TILE_REMOTE_LOAD = ir.get_op("pld.tile.remote_load").name
 _OP_TILE_LOAD = ir.get_op("tile.load").name
@@ -758,9 +759,9 @@ _AAV_MAX_RECV = 2
 _AAV_TOTAL = _AAV_NRANKS * _AAV_MAX_RECV
 
 
-def _build_all_to_all_v_before():
+def _build_all_to_all_v_before(size: int = _AAV_SIZE):
     """InCore program calling ``pld.tensor.all_to_all_v`` with runtime counts."""
-    SIZE = _AAV_SIZE
+    SIZE = size
     nr = _AAV_NRANKS
     total = _AAV_TOTAL
 
@@ -3357,6 +3358,210 @@ def test_ring_allreduce_epilogue_resets_every_row():
         offsets = notify.args[2]
         assert isinstance(offsets, ir.MakeTuple)
         assert len(offsets.elements) == 2
+
+
+class _StageShapeCollector(ir.IRVisitor):
+    """Record the static shape of every ``tile.create`` Call encountered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.shapes: list[tuple[int, ...]] = []
+
+    def visit_call(self, op: ir.Call) -> None:
+        if op.op.name == _ir_core.get_op("tile.create").name and op.args:
+            shape = op.args[0]
+            if isinstance(shape, ir.MakeTuple):
+                dims = [d.value for d in shape.elements if isinstance(d, ir.ConstInt)]
+                if len(dims) == len(shape.elements):
+                    self.shapes.append(tuple(dims))
+        super().visit_call(op)
+
+
+def _stage_tile_shapes(prog) -> list[tuple[int, ...]]:
+    collector = _StageShapeCollector()
+    collector.visit_program(prog)
+    return collector.shapes
+
+
+def _expected_chunk_cols(size: int, chunk_elements: int = 4096, alignment: int = 8) -> int:
+    """Mirrors ``MakeCollectiveStageShape``'s column pick: a short extent
+    rounds DOWN to the nearest ``alignment``-element width — the stage is a
+    literal pld.tile.put/get bounce buffer and can never exceed the transfer
+    (ValidateStageFitsTransfer), so alignment can only come from shrinking it,
+    never padding past ``size`` — while anything at or past the chunk budget
+    takes the full chunk width. Only meaningful for ``size >= alignment``; a
+    shorter transfer has no valid aligned width that still fits within it.
+    """
+    if size >= chunk_elements:
+        return chunk_elements
+    if size >= alignment:
+        return (size // alignment) * alignment
+    return size
+
+
+@pytest.mark.parametrize("size", [17, 64, 65537])
+def test_broadcast_stage_tile_is_capped_to_one_chunk(size):
+    """The broadcast staging tile is a bounded bounce buffer, not a copy of the
+    transfer: pld.tile.get slides the full extent through it, so a large SIZE
+    must not scale the tile (a [1, 65537] FP32 stage is 256 KiB and overflows UB).
+    A short, non-tile-aligned SIZE (17) must round DOWN to a 32-byte-aligned
+    column width (never up -- the stage can never exceed the transfer) instead
+    of reserving that exact odd byte count.
+    """
+    nr = 2
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, size], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, size], pl.FP32]:
+            data = pld.tensor.broadcast(data, signal, root=0)
+            return data
+
+    After = passes.lower_composite_ops()(Before)
+    # 16 KiB budget / 4 B per FP32 = 4096 elements.
+    assert (1, _expected_chunk_cols(size)) in _stage_tile_shapes(After)
+
+
+def test_broadcast_accepts_dynamic_target_shape():
+    """The stage no longer derives from the target's static extent, so a dynamic
+    trailing dim lowers instead of tripping "broadcast target shape must be static".
+    """
+    nr = 2
+    n = pl.dynamic("BROADCAST_DYNAMIC_N")
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[1, n], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[1, n], pl.FP32]:
+            data = pld.tensor.broadcast(data, signal, root=0)
+            return data
+
+    # A dynamic dimension that appears only on DistributedTensor is not yet
+    # self-contained in Python printer roundtrips. Keep pass verification, but
+    # skip the unrelated RoundtripInstrument limitation (same workaround as
+    # test_allreduce_dynamic_mesh_lowering_reaches_pto_codegen).
+    from pypto.pypto_core import passes as _core_passes  # noqa: PLC0415
+
+    ctx = _core_passes.PassContext(
+        [_core_passes.VerificationInstrument(_core_passes.VerificationMode.BEFORE_AND_AFTER)]
+    )
+    with ctx:
+        After = passes.lower_composite_ops()(Before)
+
+    assert "pld.tensor.broadcast" not in set(_collect_op_names(After))
+    # A dynamic extent takes the full chunk bound.
+    assert (1, 4096) in _stage_tile_shapes(After)
+
+
+def test_broadcast_stage_row_product_saturates_without_overflow():
+    """Huge static leading dimensions saturate at the row budget safely."""
+    nr = 2
+    huge = 1 << 62
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def broadcast_step(
+            self,
+            data: pl.InOut[pld.DistributedTensor[[huge, 4, 64], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[huge, 4, 64], pl.FP32]:
+            return pld.tensor.broadcast(data, signal, root=0)
+
+    After = passes.lower_composite_ops()(Before)
+    # 4096 FP32 elements / 64 columns = 64 stage rows.
+    assert (64, 64) in _stage_tile_shapes(After)
+
+
+@pytest.mark.parametrize("size", [17, 64, 65537])
+def test_allgather_stage_tile_is_capped_to_one_chunk(size):
+    """Same cap on the allgather push stage; chunk_shape stays the transfer extent.
+    A short, non-tile-aligned SIZE (17) must round DOWN to a 32-byte-aligned
+    column width (never up -- the stage can never exceed the transfer) instead
+    of reserving that exact odd byte count.
+    """
+    nr = 2
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gather_step(
+            self,
+            inp: pl.Tensor[[1, size], pl.FP32],
+            data: pl.InOut[pld.DistributedTensor[[nr, size], pl.FP32]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, size], pl.FP32]:
+            result = pld.tensor.allgather(inp, data, signal)
+            return result
+
+    After = passes.lower_composite_ops()(Before)
+    assert (1, _expected_chunk_cols(size)) in _stage_tile_shapes(After)
+
+
+@pytest.mark.parametrize(
+    "size,expected_cols",
+    [
+        (34, 34),  # even, below one 64-element packed row: documented unrounded gap
+        (66, 64),  # even, just past one packed 32-byte row: floor, never round up
+        (65536, 32768),  # full 16-KiB packed-FP4 chunk, not the GetByte() ceiling
+    ],
+)
+def test_allgather_fp4_stage_uses_physical_storage_width(size, expected_cols):
+    """Packed FP4 geometry uses 4 physical bits per logical element.
+
+    A 16-KiB stage therefore holds 32768 FP4 elements, not 16384 as
+    ``DataType.get_byte()``'s byte-ceiling would imply. Packed last
+    dimensions must be even; 66 is the short aligned-floor case (64), and
+    34 is below one 32-byte packed row so it stays unrounded.
+    """
+    nr = 2
+
+    @pl.program
+    class Before:
+        @pl.function(type=pl.FunctionType.InCore)
+        def gather_step(
+            self,
+            inp: pl.Tensor[[1, size], pl.FP4],
+            data: pl.InOut[pld.DistributedTensor[[nr, size], pl.FP4]],
+            signal: pl.InOut[pld.DistributedTensor[[nr, 1], pl.INT32]],
+        ) -> pld.DistributedTensor[[nr, size], pl.FP4]:
+            return pld.tensor.allgather(inp, data, signal)
+
+    After = passes.lower_composite_ops()(Before)
+    assert (1, expected_cols) in _stage_tile_shapes(After)
+
+
+@pytest.mark.parametrize("size", [17, 64, 65537])
+def test_all_to_all_v_stage_tile_is_capped_to_one_chunk(size):
+    """Same cap on the all_to_all_v per-destination push stage — a 2D budget
+    trade-off, unlike the ``[1, SIZE]`` stage the other siblings use: rows
+    (MAX_RECV) shrink once the chosen column width alone saturates the chunk
+    byte budget (``MakeCollectiveStageShape``'s ``rows_budget = chunk_elements
+    // cols_val``). A short, non-tile-aligned SIZE (17) must also round its
+    column width DOWN to a 32-byte-aligned count, same as the other siblings.
+
+    all_to_all_v's own divisibility constraint stays a compile-time
+    ``[MAX_RECV, SIZE]`` (deliberately not relaxed — see Correction 3), but it
+    shares the same per-destination staging-tile bug as allgather/broadcast/
+    all_to_all: before this fix the stage was sized directly from ``SIZE``, so
+    a ``[MAX_RECV, 65537]`` FP32 stage still reserved 256 KiB and overflowed UB.
+    """
+    # 16 KiB budget / 4 B per FP32 = 4096 elements — mirrors MakeCollectiveStageShape's
+    # row/col trade-off exactly, rather than assuming rows stays fixed at MAX_RECV.
+    chunk_elements = 4096
+    cols = _expected_chunk_cols(size, chunk_elements=chunk_elements)
+    rows = min(_AAV_MAX_RECV, max(1, chunk_elements // cols))
+
+    After = passes.lower_composite_ops()(_build_all_to_all_v_before(size=size))
+    assert (rows, cols) in _stage_tile_shapes(After)
 
 
 if __name__ == "__main__":

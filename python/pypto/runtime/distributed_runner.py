@@ -324,7 +324,8 @@ def _load_generated_module(path: Path) -> Any:
         raise RuntimeError(f"Cannot load generated module from {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    # Read source directly: a published artifact must never acquire __pycache__.
+    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     # Generated modules live only in ``sys.modules`` — there is no
     # ``_pypto_generated`` package on disk to re-import them by name. The
     # runtime cloudpickles every registered callable to derive its hashid
@@ -347,6 +348,23 @@ def _load_generated_module(path: Path) -> Any:
     return module
 
 
+def _run_directory(compiled: Any) -> Path:
+    from ._artifact_runtime import runtime_output_directory  # noqa: PLC0415
+
+    return runtime_output_directory(compiled)
+
+
+def _collect_program_swimlane(compiled: Any) -> None:
+    if vars(compiled).get("_artifact_runtime") is None:
+        _collect_l3_swimlane(compiled.output_dir, compiled.platform)
+    else:
+        _collect_l3_swimlane(
+            vars(compiled)["_artifact_runtime"].directory,
+            compiled.platform,
+            run_directory=_run_directory(compiled),
+        )
+
+
 # ---------------------------------------------------------------------------
 # Setup steps shared by the one-shot ``_execute_distributed`` path and the
 # reusable ``DistributedWorker`` handle. Keeping them as free functions lets
@@ -366,6 +384,14 @@ def _assemble_chip_callables(
     it works identically for a freshly-compiled program and one reconstructed via
     :meth:`DistributedCompiledProgram.from_dir` (the ``runtime_dir`` replay path).
     """
+    artifact_runtime = vars(compiled).get("_artifact_runtime")
+    if artifact_runtime is not None:
+        chips = artifact_runtime.load()
+        return (
+            {name: value[0] for name, value in chips.items()},
+            next(iter(chips.values()))[1],
+            any(bool(value[2].get("enable_sdma", False)) for value in chips.values()),
+        )
     chip_callables: dict[str, Any] = {}
     runtime_name: str | None = None
     enable_sdma = False
@@ -751,9 +777,14 @@ def _run_l3_swimlane_two_pass(
 
     ``run_pass`` owns the execution lifecycle: the one-shot path creates a
     fresh Worker for each call, while a prepared ``DistributedWorker`` reuses
-    its existing Worker and waits on a submitted run handle. Both paths
-    reset their per-card dispatch counters, so matching graph/timing dispatches
-    land in the same ``rank{r}/d{k}`` directory.
+    its existing Worker and waits on a submitted run handle.
+
+    The two passes are two runs, and the ChipWorker child numbers its capture
+    directories per process — so the graph pass's ``deps.json`` and the timing
+    pass's records land in *different* ``rank{r}/d{k}`` directories.
+    :func:`_collect_l3_swimlane` pairs them back up from the child's identity
+    sidecars; without that pairing the converter sees no task graph and renders
+    a swimlane with no dependency edges.
 
     Both calls execute the program. As with the existing one-shot L3 protocol,
     mutable arguments are not snapshotted or restored between passes.
@@ -810,6 +841,18 @@ _DISPATCH_DIR_GLOB = "d[0-9]*"
 # ``next_levels/<program>`` — so naming a dispatch's tasks needs this marker
 # (issue #2169).
 _DISPATCH_PROGRAM_FILE = "dispatch_program.json"
+
+# Written by the ChipWorker child into every capture directory it creates. The
+# child numbers captures per *process* (``local_capture_index``), not per run, so
+# the swimlane two-pass files its graph capture and its timing capture under
+# different ``d{k}`` directories. This sidecar is what pairs them back together
+# (:func:`_pair_graph_capture`); it is absent on an older runtime, which numbered
+# both passes alike and needs no pairing.
+_DISPATCH_IDENTITY_FILE = "dispatch_identity.json"
+
+# The dep_gen pass's task graph. The converter needs it for dependency edges and
+# defaults to the one beside the records — which the two-pass split apart.
+_DEPS_JSON_FILE = "deps.json"
 
 
 def _dfx_rank_label(worker: int) -> str:
@@ -911,11 +954,13 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
     offline post-pass — and forwards ``config`` untouched.
 
     ``k`` comes from a per-card counter on ``orch`` reset at the top of every
-    run (see :func:`_reset_dfx_dispatch_state`), so the numbering is
-    deterministic, matches across the swimlane two-pass, and tracks the child's
-    own counter. The dispatched program is stamped into that directory by
-    :func:`_record_dispatch_program`, so the offline post-pass can label the
-    records with the right program's kernel names.
+    run (see :func:`_reset_dfx_dispatch_state`), so it is this run's dispatch
+    ordinal. The child's own counter spans the whole process, so the two
+    numberings agree only on a worker's first run: the marker
+    :func:`_record_dispatch_program` stamps here therefore lands on the first
+    run's capture directory — the graph pass of a swimlane two-pass — and
+    :func:`_collect_l3_swimlane` reads it back through the capture pairing
+    rather than expecting it beside the records.
 
     When DFX is off (``output_prefix`` unset) the call is forwarded unchanged.
 
@@ -943,10 +988,10 @@ def _submit_chip(orch: Any, callable_id: Any, task_args: Any, config: Any, worke
 def _clear_dfx_dispatch_dirs(dfx_base: Path) -> None:
     """Remove stale ``rank*/d{k}`` dispatch dirs before a fresh DFX run.
 
-    The per-card dispatch counter resets to ``d0`` at the start of every run, so
-    a prepared :class:`DistributedWorker` reusing one ``output_dir`` across
-    dispatches would otherwise leave higher-numbered ``d{k}`` dirs from an
-    earlier, larger run on disk. ``_collect_l3_swimlane`` globs ``d[0-9]*``, so
+    A prepared :class:`DistributedWorker` reusing one ``output_dir`` across runs
+    would otherwise leave ``d{k}`` dirs from an earlier, larger run on disk,
+    whether the child restarted its capture numbering or carried it forward.
+    ``_collect_l3_swimlane`` globs ``d[0-9]*``, so
     those stale dirs would be re-converted as if they belonged to the current
     run. Clearing them once, before the first dispatch of a DFX run, scopes the
     artifacts (and their post-processing) to exactly this run. Called only when
@@ -981,7 +1026,208 @@ def _read_dispatch_program(disp_dir: Path) -> str | None:
     return str(program)
 
 
-def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, dict[str, str]]) -> Path | None:
+def _read_dispatch_identity(disp_dir: Path) -> dict[str, Any] | None:
+    """The child's identity sidecar for this capture, or ``None`` if unusable.
+
+    Absent on a runtime that predates the sidecar, and best-effort like every
+    other marker here: an unreadable one costs the graph/timing pairing, never
+    the run.
+    """
+    try:
+        identity = json.loads((disp_dir / _DISPATCH_IDENTITY_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return identity if isinstance(identity, dict) else None
+
+
+def _pair_rank_captures(rank_dir: Path) -> dict[Path, Path]:
+    """Map each of this card's timing captures to the capture holding its task graph.
+
+    The two swimlane passes are two runs, and the child numbers captures per
+    process — so the ``deps.json`` the converter needs for dependency edges sits
+    in a *different* ``d{k}`` than the records. The identity sidecars say which
+    run each capture came from and which callable it ran, which is enough to pair
+    them *only* when both passes issued the same dispatches: ``run_id`` differs
+    across passes, and ``local_capture_index`` counts captures per process, so
+    nothing in a single sidecar identifies a dispatch across runs on its own.
+
+    So pair whole runs, not individual captures. A timing run pairs with a graph
+    run when their ordered ``callable_digest`` sequences are identical; the
+    dispatches then correspond position by position. When the sequences differ in
+    length or order the run pair is rejected outright: the passes do not restore
+    mutable arguments between them (see :func:`_run_l3_swimlane_two_pass`), so a
+    dispatch count that depends on data can genuinely differ, and a graph pass of
+    ``[A, A]`` against a timing pass of ``[A]`` would otherwise hand the
+    surviving dispatch the *first* ``A``'s edges — plausible and wrong. The
+    nearest earlier graph run wins, since its graph describes the state this
+    timing run started from.
+
+    A card whose captures carry no sidecar at all (an older runtime) pairs only
+    when exactly one capture holds the graph and exactly one holds records:
+    anything else cannot be told apart, and reusing one graph for several timing
+    captures would attach the same edges to different dispatches.
+
+    Captures that already hold both files need no pairing and are left out.
+    """
+    from .runner import _CHIP_SWIMLANE_RECORDS_NAME  # noqa: PLC0415
+
+    captures = {
+        d: _read_dispatch_identity(d) for d in sorted(rank_dir.glob(_DISPATCH_DIR_GLOB)) if d.is_dir()
+    }
+    graph_dirs = [d for d in captures if (d / _DEPS_JSON_FILE).exists()]
+    timing_dirs = [
+        d
+        for d in captures
+        if (d / _CHIP_SWIMLANE_RECORDS_NAME).exists() and not (d / _DEPS_JSON_FILE).exists()
+    ]
+    if not graph_dirs or not timing_dirs:
+        return {}
+
+    if all(identity is None for identity in captures.values()):
+        # Older runtime: one graph and one set of records on the card is the only
+        # shape with a single possible answer.
+        if len(graph_dirs) == 1 and len(timing_dirs) == 1:
+            return {timing_dirs[0]: graph_dirs[0]}
+        return {}
+
+    runs = _captures_by_run(captures)
+    graph_runs = {
+        run_id: sequence for run_id, sequence in runs.items() if all(d in graph_dirs for d, _ in sequence)
+    }
+    pairs: dict[Path, Path] = {}
+    for run_id, sequence in runs.items():
+        if not all(d in timing_dirs for d, _ in sequence):
+            continue
+        digests = [identity.get("callable_digest") for _, identity in sequence]
+        candidates = [
+            other_id
+            for other_id, other in graph_runs.items()
+            if [identity.get("callable_digest") for _, identity in other] == digests
+        ]
+        earlier = [other_id for other_id in candidates if other_id < run_id]
+        graph_run = max(earlier) if earlier else (min(candidates) if candidates else None)
+        if graph_run is None:
+            continue
+        for (timing_dir, _), (graph_dir, _) in zip(sequence, graph_runs[graph_run]):
+            pairs[timing_dir] = graph_dir
+    return pairs
+
+
+_CaptureRuns = dict[int, list[tuple[Path, dict[str, Any]]]]
+
+
+def _captures_by_run(captures: dict[Path, dict[str, Any] | None]) -> _CaptureRuns:
+    """Group a card's captures by ``run_id``, each run ordered by capture index.
+
+    A capture missing either field cannot be placed in a pass's sequence, and a
+    run holding one is dropped whole: a sequence with a hole cannot be compared
+    against another pass's, and comparing it anyway is how the wrong dispatch
+    gets paired.
+    """
+    runs: _CaptureRuns = {}
+    incomplete: set[int] = set()
+    for capture, identity in captures.items():
+        if identity is None:
+            continue
+        run_id = identity.get("run_id")
+        if run_id is None:
+            continue
+        if identity.get("local_capture_index") is None:
+            incomplete.add(run_id)
+            continue
+        runs.setdefault(run_id, []).append((capture, identity))
+    for run_id in incomplete:
+        runs.pop(run_id, None)
+    return {
+        run_id: sorted(sequence, key=lambda entry: entry[1]["local_capture_index"])
+        for run_id, sequence in runs.items()
+    }
+
+
+def _consolidate_two_pass_captures(rank_dir: Path, pairs: dict[Path, Path]) -> None:
+    """Fold each timing capture into the graph capture of the same dispatch.
+
+    A swimlane capture runs the dispatch twice and the child files each run
+    separately, so one dispatch ends up spread over two ``d{k}`` directories: the
+    task graph in one, the records in the other. Every consumer of these
+    artifacts — the converter, ``simpler_setup.tools.critical_path``, the
+    toolkit's viewers, this project's analysis scripts — looks for one dispatch's
+    files *together*, so the split does not merely cost dependency edges in the
+    merged trace: a tool that selects directories by "has ``deps.json`` and a
+    name map" matches neither half.
+
+    Fold forward, into the graph capture. The graph pass runs first, so its
+    captures carry the lower indices — for a card dispatching ``N`` times they
+    are ``d0..d(N-1)``, the dispatch ordinals themselves, while the timing pass's
+    ``dN..d(2N-1)`` are only that offset repeated. Keeping the first of each pair
+    therefore restores both halves of the layout every consumer expects: one
+    directory per dispatch, named by the dispatch.
+
+    Only paired captures are touched (see :func:`_pair_rank_captures`), only
+    after both passes have finished, and only where the pairing is one-to-one.
+    The timing capture's own identity sidecar is kept beside the graph pass's
+    under a distinct name rather than overwriting it — the two describe different
+    runs and both are evidence. Best-effort: a capture that cannot be folded is
+    left exactly as it was, and its records are still converted where they lie.
+    """
+    import collections  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+
+    # Several timed captures can share one graph pass — a benchmark loop repeats
+    # the timing run against the graph it captured once. Folding them all into
+    # that one directory would have them overwrite each other, so only a pair
+    # that owns its graph capture is folded; the rest keep their own directories
+    # and are converted against the shared graph by path.
+    fold_counts = collections.Counter(pairs.values())
+    for timing_dir, graph_dir in pairs.items():
+        if fold_counts[graph_dir] != 1:
+            continue
+        try:
+            for artifact in sorted(timing_dir.iterdir()):
+                if artifact.name == _DISPATCH_IDENTITY_FILE:
+                    target = graph_dir / "dispatch_identity.timing.json"
+                else:
+                    target = graph_dir / artifact.name
+                if target.exists():
+                    continue
+                shutil.move(str(artifact), str(target))
+            timing_dir.rmdir()
+        except OSError as e:
+            print(
+                f"Could not fold {rank_dir.name}/{timing_dir.name} into "
+                f"{rank_dir.name}/{graph_dir.name} ({type(e).__name__}: {e}); the dispatch's "
+                "artifacts stay split across both directories."
+            )
+
+
+def _resolve_capture_graph(
+    rank_dir: Path, disp_dir: Path, pairs: dict[Path, Path]
+) -> tuple[Path | None, Path | None]:
+    """The ``deps.json`` to convert *disp_dir* with, and the capture it came from.
+
+    Returns ``(None, None)`` when the task graph already sits beside the records —
+    the converter's own default, and what :func:`_consolidate_two_pass_captures`
+    normally arranges — and when no capture could be paired, which is reported
+    here because the resulting swimlane silently loses every dependency edge.
+    The graph capture is returned alongside the path: it also carries the
+    dispatch's program marker (see :func:`_submit_chip`).
+    """
+    if (disp_dir / _DEPS_JSON_FILE).exists():
+        return None, None
+    graph_dir = pairs.get(disp_dir)
+    if graph_dir is None:
+        print(
+            f"No task graph paired with {rank_dir.name}/{disp_dir.name}; its swimlane renders task "
+            "timings without dependency edges (the dep_gen pass writes "
+            f"{_DEPS_JSON_FILE} into its own capture directory)."
+        )
+        return None, None
+    return graph_dir / _DEPS_JSON_FILE, graph_dir
+
+
+def _write_dispatch_name_map(
+    disp_dir: Path, chip_dir: Path, cache: dict[str, dict[str, str]], *, prebuilt: bool = False
+) -> Path | None:
     """Write *disp_dir*'s ``name_map.json`` from *chip_dir*'s ``kernel_config.py``.
 
     The map is the one the L2 path synthesises (:func:`~pypto.runtime.runner._write_name_map`),
@@ -1001,11 +1247,16 @@ def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, di
         table: dict[str, str] = {}
         if kc.exists():
             try:
-                from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
-                    load_kernel_config,
-                )
+                if prebuilt:
+                    from ._prebuilt import kernel_name_map  # noqa: PLC0415
 
-                table = load_kernel_config(str(kc))
+                    table = kernel_name_map(chip_dir)
+                else:
+                    from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+                        load_kernel_config,
+                    )
+
+                    table = load_kernel_config(str(kc))
             except Exception as e:  # noqa: BLE001 - best-effort label resolution, never fatal
                 print(
                     f"Skipping L3 swimlane name_map for {program} ({type(e).__name__}: {e}); "
@@ -1023,13 +1274,15 @@ def _write_dispatch_name_map(disp_dir: Path, chip_dir: Path, cache: dict[str, di
     return name_map_path
 
 
-def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
+def _collect_l3_swimlane(output_dir: Path, platform: str, *, run_directory: Path | None = None) -> None:
     """Convert each dispatch's swimlane records into a ``merged_swimlane_*.json``.
 
     The runtime writes ``rank{r}/d{k}/deps.json`` in the graph pass and
-    ``rank{r}/d{k}/chip_swimlane_records.json`` in the clean timing pass
-    (the directory is namespaced by card *and* the card's k-th dispatch, and
-    both passes restart that numbering). Globbing ``rank*`` — rather
+    ``rank{r}/d{k}/chip_swimlane_records.json`` in the clean timing pass. The
+    directory is namespaced by card *and* by the child's own capture counter,
+    which spans the process rather than restarting per run — so those two files
+    belong to one dispatch but sit in two directories, and
+    :func:`_pair_rank_captures` is what joins them. Globbing ``rank*`` — rather
     than iterating a rank count — picks up
     whichever cards actually ran, so a comm-less / single-card L3 program (which never
     creates ``rank{0..n}``) still has its records converted. This best-effort
@@ -1075,7 +1328,7 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
     # ``_write_dispatch_name_map`` so each config is loaded once per run.
     name_map_cache: dict[str, dict[str, str]] = {}
 
-    dfx_base = output_dir / "dfx_outputs"
+    dfx_base = (output_dir if run_directory is None else run_directory) / "dfx_outputs"
     # See the docstring for why we glob rather than iterate a rank count.
     # 3.10-safe dir filter (``glob`` directory filtering is only reliable on 3.11+).
     rank_dirs = sorted(d for d in dfx_base.glob(_RANK_DIR_GLOB) if d.is_dir())
@@ -1083,6 +1336,12 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
         # One card may have run several dispatches: ``<rank>/d0``, ``d1``, ...
         # Match only ``d`` + digits (the names the runtime emits) so an
         # unrelated diagnostic dir under rank_dir is never picked up.
+        # One pairing per card: which graph capture belongs to which timing
+        # capture is a property of the two passes' dispatch sequences, not of a
+        # directory on its own. Fold the pairs back together before listing the
+        # directories, so what follows sees one directory per dispatch.
+        pairs = _pair_rank_captures(rank_dir)
+        _consolidate_two_pass_captures(rank_dir, pairs)
         dispatch_dirs = sorted(d for d in rank_dir.glob(_DISPATCH_DIR_GLOB) if d.is_dir())
         for disp_dir in dispatch_dirs:
             records = disp_dir / _CHIP_SWIMLANE_RECORDS_NAME
@@ -1101,7 +1360,10 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
                 # between ``--func-names``, ``-k`` and the sibling turns out to be.
                 for stale in disp_dir.glob("name_map*.json"):
                     stale.unlink(missing_ok=True)
+                deps_json, graph_dir = _resolve_capture_graph(rank_dir, disp_dir, pairs)
                 program = _read_dispatch_program(disp_dir)
+                if program is None and graph_dir is not None:
+                    program = _read_dispatch_program(graph_dir)
                 if program is None and len(chip_dirs) == 1:
                     # One L2 program in the build: no ambiguity to resolve, so an
                     # unmarked dispatch (e.g. artifacts from an older run) can
@@ -1124,8 +1386,16 @@ def _collect_l3_swimlane(output_dir: Path, platform: str) -> None:
                     # ``name_map`` passed as ``func_names`` takes precedence —
                     # both must name the program that ran this dispatch.
                     work_dir = chip_dirs[program]
-                    name_map_path = _write_dispatch_name_map(disp_dir, work_dir, name_map_cache)
-                _generate_swimlane(work_dir, disp_dir, records, func_names=name_map_path)
+                    if run_directory is None:
+                        name_map_path = _write_dispatch_name_map(disp_dir, work_dir, name_map_cache)
+                    else:
+                        name_map_path = _write_dispatch_name_map(
+                            disp_dir, work_dir, name_map_cache, prebuilt=True
+                        )
+                if run_directory is not None:
+                    # Never pass immutable Python sources to the converter's bytecode loader.
+                    work_dir = run_directory
+                _generate_swimlane(work_dir, disp_dir, records, func_names=name_map_path, deps_json=deps_json)
             except Exception as e:  # noqa: BLE001 - best-effort post-pass, never fatal
                 print(
                     f"Skipping L3 swimlane conversion for {disp_dir.name} of {rank_dir.name} "
@@ -1355,7 +1625,7 @@ def _execute_distributed(
             if w is not None:
                 _close_local_worker(w)
 
-    dfx_base = output_dir / "dfx_outputs"
+    dfx_base = _run_directory(compiled) / "dfx_outputs"
     swimlane = config is not None and config.enable_chip_swimlane > 0
 
     # Scope DFX artifacts to this run: drop any stale ``rank*/d{k}`` dirs from an
@@ -1374,7 +1644,7 @@ def _execute_distributed(
 
     # Offline post-pass (reads the per-dispatch deps.json + records on disk).
     if swimlane:
-        _collect_l3_swimlane(output_dir, compiled.platform)
+        _collect_program_swimlane(compiled)
 
 
 _EXECUTE_DISTRIBUTED_COMPILED_DEPRECATION = (
@@ -1724,7 +1994,7 @@ class DistributedWorker(Worker):
             prewarm_cc = self._states[primary]["call_config"]
             if config is not None:
                 prewarm_cc = _make_call_config(
-                    primary._distributed_config, config, dfx_base=primary.output_dir / "dfx_outputs"
+                    primary._distributed_config, config, dfx_base=_run_directory(primary) / "dfx_outputs"
                 )
             self._w.init(prewarm_config=prewarm_cc)
 
@@ -2865,7 +3135,7 @@ class DistributedWorker(Worker):
                         frame.keepalive,
                     ),
                 )
-                _collect_l3_swimlane(compiled.output_dir, compiled.platform)
+                _collect_program_swimlane(compiled)
                 self._release_unpublished_dispatch_frame(frame)
                 return DistributedRunHandle._completed(self)
 
@@ -2873,7 +3143,7 @@ class DistributedWorker(Worker):
             if config is not None and config.enable_chip_swimlane > 0:
 
                 def collect_swimlane() -> None:
-                    _collect_l3_swimlane(compiled.output_dir, compiled.platform)
+                    _collect_program_swimlane(compiled)
 
                 postprocess = collect_swimlane
             handle = DistributedRunHandle(self, None, frame, dispatch_id, postprocess)
@@ -2901,7 +3171,7 @@ class DistributedWorker(Worker):
         if config is None:
             return _make_call_config(compiled._distributed_config), None, False
 
-        dfx_base = compiled.output_dir / "dfx_outputs"
+        dfx_base = _run_directory(compiled) / "dfx_outputs"
         two_pass_swimlane = config.enable_chip_swimlane > 0 and not compiled.platform.endswith("sim")
         call_config = None
         if not two_pass_swimlane:

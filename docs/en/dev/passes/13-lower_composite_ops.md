@@ -1,6 +1,6 @@
 # LowerCompositeOps Pass
 
-Decomposes composite tile / distributed ops into primitive operations so codegen does not need to emit their high-level forms. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner), packed `tile.tquant_mx`, and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`). Mesh and ring allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window.
+Decomposes composite tile / distributed ops into primitive operations so codegen does not need to emit their high-level forms. Today the pass handles `tile.sin` / `tile.cos` (FP32 Cody-Waite + Horner), packed `tile.tquant_mx`, and `pld.tensor.*` distributed collectives (`allreduce` (mesh and ring), `allgather`, `reduce_scatter`, `broadcast`, `barrier`, `all_to_all`, `all_to_all_v`). Mesh and ring allreduce may also create a metadata-preserving `tensor.view` so tile load/remote/store operate on a 2D flattened target window.
 
 ## Overview
 
@@ -55,7 +55,7 @@ Multi-result rules return `MakeTuple`; the mutator maps both the original result
 
 The lowering creates source-dtype `max` / `scaling` write-only workspace tiles, then binds a value-returning `tile.tquant_mx_raw(src, max, scaling)` whose `TupleType{INT8 dst, UINT8 exp}` elements are projected with `TupleGetItem` (same SSA pattern as `tile.gather_compare`). Codegen resolves those projections via `ResolveTupleResultElements` and emits `pto.tquant.mx` with four outs (dst, exp, max, scaling). Public `group_axis` matches PTOAS `grpAxis`: axis1 keeps `[M,K]` and returns scale `[M,K/32]`; axis0 first transposes `[N,K]` to `[K,N]` and returns scale `[K/32,N]`. Both forms then bind value-returning `tile.tmov_x2zz(exp, tmp)`. Axis1 tmp capacity is `64 + ceil(rows/16)*cols` bytes (33-byte-aligned); axis0 uses a minimal 32-byte Vec pad required by `TMovDnTo2Zz`. Axis0 follows pto-isa `TMovDnTo2Zz` (pin `be5ccb76`): DN `[M̂,N]` → ZZ `[N,M̂]` row/row, then a zero-copy `tile.transpose_view` yields the public `[M̂,N]` col/col scale. A zero-copy FP8 data alias and FP8E8M0 scale alias complete the public tuple. Write effects on the workspace args keep the Calls alive under DCE when a public result is unused.
 
-Public usage still stages `quant_mx` and `matmul_mx` through separate AIV/AIC kernels and GM; same-InCore mixed-task transport of quant data plus scale is a follow-up (see [ExpandMixedKernel](24-expand_mixed_kernel.md#known-limitation-mx-quantization-followed-by-matmul)).
+On Ascend950, the public quant data and scale may feed `matmul_mx` in the same InCore mixed task. [ExpandMixedKernel](24-expand_mixed_kernel.md#mx-scale-v2c-transport) carries both results directly over V2C.
 
 The mutator records composite-produced `MakeTuple`s (and SSA aliases of those tuples) in a private `composite_tuples_` map so `TupleGetItem` projections fold without abusing global `var_remap_` for arbitrary `v = (a, b)` assignments. The internal `tile.tquant_mx_raw` / `tile.tmov_x2zz` ops are not registered as composite rules, preserving pass idempotency.
 
@@ -229,9 +229,9 @@ Mesh and ring lowering support FP16 and FP32 with `ReduceOp::kSum`, `kMax`,
 
 ### `pld.tensor.allgather`
 
-Signature: `allgather(local_data, target, signal)`. `local_data` is this rank's chunk (`Tensor` or `Tile` `[1, SIZE]`), `target` is a window-bound `DistributedTensor[NR, SIZE]` staging area that also serves as the result, and `signal` is the INT32 barrier. Push-based decomposition:
+Signature: `allgather(local_data, target, signal)`. `local_data` is this rank's chunk (plain `Tensor` `[1, SIZE]` on the InCore path), `target` is a window-bound `DistributedTensor[NR, SIZE]` staging area that also serves as the result, and `signal` is the INT32 barrier. Push-based decomposition:
 
-- ``tile.create([1, SIZE], dtype=..., target_memory=Vec)`` — allocate a VEC staging tile for ``pld.tile.put`` auto-chunking.  ``pld.tile.put`` reads directly from the ``local_data`` Tensor (or Tile) source — no explicit ``tile.load`` is emitted.
+- ``tile.create([1, stage_cols], dtype=..., target_memory=Vec)`` — allocate a VEC staging tile for ``pld.tile.put`` auto-chunking. For a static extent, ``stage_cols`` is ``min(SIZE, chunk_elements)`` floored to a 32-byte row boundary when it is below one full chunk; for example, FP32 ``SIZE=17`` produces ``stage_cols=16``, not 17. A transfer shorter than one alignment unit (8 FP32 elements, 64 packed-FP4 elements) has no positive stage width that is both aligned and no larger than the transfer, and remains unsupported. Symbolic extents use the full chunk bound — the same static-UB contract as `MakeTputStageShape` / `chunk_cols`, so a runtime width of 17 still allocates 4096 FP32 elements. The geometry uses physical storage bits, so a 16-KiB stage holds 4096 FP32 or 32768 packed-FP4 logical elements. The stage is a bounded bounce buffer, **not** a copy of the transfer: pto-isa reads the full extent from the partition views and 2-D-slides the transfer through it, so sizing the stage from ``SIZE`` would only waste UB (a ``[1, 65537]`` FP32 stage is 256 KiB and overflows the VEC budget). ``pld.tile.put`` reads directly from the ``local_data`` Tensor source — no explicit ``tile.load`` is emitted.
 - Phase 1: for `peer` in `0..NR-1`, `pld.tile.put(target, peer, local_data, put_stage, [my_rank, 0], [0, 0], [1, SIZE])` — push this rank's chunk into every peer's window at row `my_rank`. Self-store (`peer == my_rank`) uses HCCL identity mapping. `pld.tile.put` auto-chunks when SIZE exceeds the staging-tile capacity
 - Phase 2: barrier (generation 1) + epilogue (subtract 1 from every non-self cell)
 - Return `target` — the window IS the gathered `[NR, SIZE]` result (window-as-result, `DistributedTensor`)
@@ -256,10 +256,19 @@ All four `ReduceOp`s are supported — `kSum`, `kMax`, `kMin`, and `kProd` — r
 
 Decomposes into a 3-phase recipe:
 
-- Phase 2: barrier (generation 1) + epilogue (subtract 1 from every non-self cell)
-- Phase 3: `tile.create` (VEC staging tile) + `pld.tile.get(target, peer=root, target, stage)` on every rank — each rank reads root's slice into its own `target`. For `peer == root` the HCCL identity mapping makes the get a local no-op, so root keeps its own data while non-root ranks receive root's.
+- Phase 2: barrier (generation 1)
+- Phase 3: `tile.create` (VEC staging tile, capped at one 16-KiB chunk like allgather's) + `pld.tile.get(target, peer=root, target, stage)` on every rank — each rank reads root's slice into its own `target`. For `peer == root` the HCCL identity mapping makes the get a local no-op, so root keeps its own data while non-root ranks receive root's. Because the stage no longer derives from the target's extent, a **dynamic** target shape is accepted — the dynamic dim simply takes the chunk bound.
+- Epilogue: subtract 1 from every non-self cell
 
 `root` is a static `int` kwarg known at compile time.
+
+### `pld.tensor.all_to_all`
+
+Symmetric push: each rank writes `input[dest, :]` into every peer window at row `my_rank` via `pld.tile.put`, then barriers. The shared VEC stage is the same capped `[stage_rows, stage_cols]` bounce buffer as allgather.
+
+### `pld.tensor.all_to_all_v`
+
+Variable-size push (`MPI_Alltoallv` pattern). Each destination transfers `clamp(send_counts[dest], 0, MAX_RECV)` rows through the same capped 2-D stage; `target.shape[0] % NR == 0` stays load-bearing so the receiver can index sender `s` at row `s * MAX_RECV`. The runtime row count is a dynamic partition-view dim; the stage itself stays a static chunk bound.
 
 ### `pld.tensor.barrier`
 

@@ -402,6 +402,11 @@ void BindIR(nb::module_& m) {
       "get", []() { return GetUnknownType(); }, "Get the singleton UnknownType instance");
   BindFields<UnknownType>(unknown_type_class);
 
+  auto void_type_class = nb::class_<VoidType, Type>(ir, "VoidType", "Known absence of an SSA result");
+  void_type_class.def(nb::init<>(), "Create a void type");
+  void_type_class.def_static("get", &GetVoidType, "Get the singleton VoidType instance");
+  BindFields<VoidType>(void_type_class);
+
   // ScalarType - const shared_ptr
   auto scalar_type_class = nb::class_<ScalarType, Type>(ir, "ScalarType", "Scalar type representation");
   scalar_type_class.def(nb::init<DataType>(), nb::arg("dtype"), "Create a scalar type");
@@ -505,7 +510,7 @@ void BindIR(nb::module_& m) {
   tvs.def("build_logical_strides_from_layout", &tensor_view_semantics::BuildLogicalStridesFromLayout,
           nb::arg("shape"), nb::arg("layout"),
           "Build packed canonical strides for (shape, layout). "
-          "NZ is row-major over its blocked rank-(r+2) shape, the same rule as ND. "
+          "NZ is row-major over its blocked rank-5 shape, the same rule as ND. "
           "Raises ValueError on DN with rank < 2.");
 
   tvs.def(
@@ -744,6 +749,26 @@ void BindIR(nb::module_& m) {
       .value("null", CompactMode::null, "Ordinary non-compact layout")
       .value("normal", CompactMode::normal, "Compact valid-region layout");
 
+  // Final device buffer descriptors carry no MemRef or runtime expressions.
+  auto buffer_type_class = nb::class_<BufferType, Type>(
+      ir, "BufferType", "Physical descriptor for a mutable on-chip buffer handle");
+  buffer_type_class.def(
+      nb::init<std::vector<int64_t>, DataType, MemorySpace, std::vector<int64_t>, TileLayout, TileLayout,
+               uint64_t, PadValue, CompactMode>(),
+      nb::arg("shape"), nb::arg("dtype"), nb::arg("memory_space"),
+      nb::arg("valid_shape") = std::vector<int64_t>{}, nb::arg("blayout") = TileLayout::row_major,
+      nb::arg("slayout") = TileLayout::none_box, nb::arg("fractal") = 512, nb::arg("pad") = PadValue::null,
+      nb::arg("compact") = CompactMode::null,
+      "Create a static physical descriptor; -1 in valid_shape denotes a runtime valid extent");
+  BindFields<BufferType>(buffer_type_class);
+
+  auto multi_buffer_type_class = nb::class_<MultiBufferType, Type>(
+      ir, "MultiBufferType", "Descriptor for an explicit multi-slot buffer allocation");
+  multi_buffer_type_class.def(nb::init<BufferTypePtr, int64_t>(), nb::arg("element_type"),
+                              nb::arg("slot_count"),
+                              "Create a multi-buffer descriptor with positive slot count");
+  BindFields<MultiBufferType>(multi_buffer_type_class);
+
   // TileView - immutable struct for tile view information.
   //
   // Fields are read-only from Python so that hash and equality remain stable
@@ -812,6 +837,43 @@ void BindIR(nb::module_& m) {
   comm_layout_mod.attr("COMM_CTX_SIZE") = pypto::codegen::distributed::comm_layout::kCommCtxSize;
 
   // OpRegistry
+  nb::enum_<OpIRStage>(ir, "OpIRStage", "Representation consumed and produced by an operator")
+      .value("Functional", OpIRStage::Functional)
+      .value("Buffer", OpIRStage::Buffer);
+  nb::enum_<BufferAccess>(ir, "BufferAccess", "Access to buffer data or descriptor metadata")
+      .value("None_", BufferAccess::None)
+      .value("Read", BufferAccess::Read)
+      .value("Write", BufferAccess::Write)
+      .value("ReadWrite", BufferAccess::ReadWrite);
+  nb::enum_<BufferResultBehavior>(ir, "BufferResultBehavior", "Storage ownership of an actual SSA result")
+      .value("None_", BufferResultBehavior::None)
+      .value("Allocate", BufferResultBehavior::Allocate)
+      .value("Alias", BufferResultBehavior::Alias)
+      .value("Borrow", BufferResultBehavior::Borrow)
+      .value("Value", BufferResultBehavior::Value);
+  nb::class_<BufferArgEffect>(ir, "BufferArgEffect", "Explicit data and metadata effects of one operand")
+      .def_ro("data", &BufferArgEffect::data)
+      .def_ro("metadata", &BufferArgEffect::metadata)
+      .def_ro("non_memory", &BufferArgEffect::non_memory);
+  nb::class_<BufferResultSpec>(ir, "BufferResultSpec", "Ownership and alias source of one SSA result")
+      .def_ro("behavior", &BufferResultSpec::behavior)
+      .def_ro("alias_arg", &BufferResultSpec::alias_arg);
+  ir.def(
+      "get_op_ir_stage",
+      [](const std::string& op_name) { return OpRegistry::GetInstance().GetEntry(op_name).GetIRStage(); },
+      nb::arg("op_name"), "Get the operator's explicitly declared IR stage");
+  ir.def(
+      "get_op_buffer_arg_effect",
+      [](const std::string& op_name, size_t arg_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetBufferArgEffect(arg_index);
+      },
+      nb::arg("op_name"), nb::arg("arg_index"), "Get explicit data and metadata effects of a buffer operand");
+  ir.def(
+      "get_op_buffer_result_spec",
+      [](const std::string& op_name, size_t result_index) {
+        return OpRegistry::GetInstance().GetEntry(op_name).GetBufferResultSpec(result_index);
+      },
+      nb::arg("op_name"), nb::arg("result_index") = 0, "Get ownership and alias source of one buffer result");
   ir.def(
       "create_op_call",
       [](const std::string& op_name, const std::vector<ExprPtr>& args, const Span& span) {
@@ -839,7 +901,8 @@ void BindIR(nb::module_& m) {
   // re-checks the invariants the printer stamps before calling in, so the
   // guard `internal_only` provides is enforced at the user-facing surface
   // rather than dropped. `create_op_call` still routes through
-  // `CreateUserFacing` and is unaffected.
+  // `CreateUserFacing` and is unaffected. Buffer lowering additionally supplies
+  // an explicit result descriptor for allocation and view operators.
   ir.def(
       "_create_internal_op_call",
       [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
@@ -849,6 +912,16 @@ void BindIR(nb::module_& m) {
       },
       nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("span"),
       "Create a Call expression for a compiler-internal operator (round-trip parser only)");
+
+  ir.def(
+      "_create_internal_op_call",
+      [](const std::string& op_name, const std::vector<ExprPtr>& args, const nb::dict& kwargs_dict,
+         const TypePtr& result_type, const Span& span) {
+        auto kwargs = ConvertKwargsDict(kwargs_dict);
+        return OpRegistry::GetInstance().CreateInternal(op_name, args, kwargs, result_type, span);
+      },
+      nb::arg("op_name"), nb::arg("args"), nb::arg("kwargs"), nb::arg("type"), nb::arg("span"),
+      "Create an internal Buffer call with a validated explicit result descriptor");
 
   ir.def(
       "set_call_attrs",
@@ -877,7 +950,7 @@ void BindIR(nb::module_& m) {
   ir.def(
       "get_op_output_arity",
       [](const std::string& op_name) { return OpRegistry::GetInstance().GetEntry(op_name).GetOutputArity(); },
-      nb::arg("op_name"), "Number of values an operator produces (>1 means a TupleType result)");
+      nb::arg("op_name"), "Number of SSA results (0 means VoidType, >1 means TupleType)");
 
   ir.def(
       "op_arg_is_workspace",

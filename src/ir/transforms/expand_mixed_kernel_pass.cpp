@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -43,7 +44,6 @@
 #include "pypto/ir/transforms/pass_context.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
-#include "pypto/ir/transforms/utils/attrs.h"
 #include "pypto/ir/transforms/utils/core_affinity.h"
 #include "pypto/ir/transforms/utils/core_side_ops.h"
 #include "pypto/ir/transforms/utils/cross_core_pipe.h"
@@ -86,6 +86,122 @@ using tpop_tfree::FinalizeTpopTfrees;
 
 // Use the shared utility; local alias preserves call sites.
 const auto& FlattenBody = transform_utils::FlattenToStmts;
+
+using AivPlacement = std::unordered_set<const Call*>;
+
+class SplitRegionFinder : public IRVisitor {
+ public:
+  bool found = false;
+  void VisitStmt(const StmtPtr& stmt) override {
+    if (!found) IRVisitor::VisitStmt(stmt);
+  }
+  void VisitStmt_(const SplitAivScopeStmtPtr&) override { found = true; }
+};
+
+// Shallow-copy only the statement receiving an erased wrapper's comments.
+// Descendants and variable identities stay shared; input metadata stays intact.
+class StatementCommentPrepender : public IRMutator {
+ public:
+  explicit StatementCommentPrepender(std::vector<std::string> comments) : comments_(std::move(comments)) {}
+
+ protected:
+#define COPY_COMMENTED_STMT(Type)                                                                            \
+  StmtPtr VisitStmt_(const Type##Ptr& op) override {                                                         \
+    auto result = MutableCopy(op);                                                                           \
+    result->leading_comments_.insert(result->leading_comments_.begin(), comments_.begin(), comments_.end()); \
+    return result;                                                                                           \
+  }
+  COPY_COMMENTED_STMT(AssignStmt)
+  COPY_COMMENTED_STMT(IfStmt)
+  COPY_COMMENTED_STMT(YieldStmt)
+  COPY_COMMENTED_STMT(ReturnStmt)
+  COPY_COMMENTED_STMT(ForStmt)
+  COPY_COMMENTED_STMT(WhileStmt)
+  COPY_COMMENTED_STMT(InCoreScopeStmt)
+  COPY_COMMENTED_STMT(ClusterScopeStmt)
+  COPY_COMMENTED_STMT(GraphScopeStmt)
+  COPY_COMMENTED_STMT(HierarchyScopeStmt)
+  COPY_COMMENTED_STMT(SpmdScopeStmt)
+  COPY_COMMENTED_STMT(RuntimeScopeStmt)
+  COPY_COMMENTED_STMT(CommDomainScopeStmt)
+  COPY_COMMENTED_STMT(EvalStmt)
+  COPY_COMMENTED_STMT(BreakStmt)
+  COPY_COMMENTED_STMT(ContinueStmt)
+  COPY_COMMENTED_STMT(InlineStmt)
+#undef COPY_COMMENTED_STMT
+
+ private:
+  std::vector<std::string> comments_;
+};
+
+// Consume the lexical contract once. All later analyses use this same body and
+// placement map; neither is serialized or shared between pass invocations.
+class SplitRegionConsumer : public IRMutator {
+ public:
+  AivPlacement aiv_only_calls;
+  bool had_regions = false;
+
+ protected:
+  StmtPtr VisitStmt_(const SplitAivScopeStmtPtr& op) override {
+    std::vector<StmtPtr> body;
+    AppendConsumed(op, body);
+    return MakeBody(body, op->span_);
+  }
+
+  StmtPtr VisitStmt_(const SeqStmtsPtr& op) override {
+    std::vector<StmtPtr> body;
+    AppendConsumed(op, body);
+    auto result = MutableCopy(op);
+    result->stmts_ = std::move(body);
+    return result;
+  }
+
+  ExprPtr VisitExpr_(const CallPtr& op) override {
+    auto result = IRMutator::VisitExpr_(op);
+    auto call = As<Call>(result);
+    if (region_depth_ > 0 && call && !core_affinity::HasStatedLane(call) &&
+        core_affinity::ClassifyCallAffinity(call) == CoreAffinity::SHARED &&
+        core_affinity::IsNoDuplicateCall(call)) {
+      aiv_only_calls.insert(call.get());
+    }
+    return result;
+  }
+
+ private:
+  // Append straight-line contents directly into their enclosing statement list.
+  // Nested wrappers therefore do not repeatedly copy the same descendants.
+  void AppendConsumed(const StmtPtr& stmt, std::vector<StmtPtr>& body) {
+    if (auto region = As<SplitAivScopeStmt>(stmt)) {
+      had_regions = true;
+      if (region->split_ != SplitMode::None) {
+        auto hazard =
+            split_axis::FindTransposeSplitHazard(region->body_, split_axis::SplitDimension(region->split_));
+        CHECK_SPAN(!hazard.call, region->span_)
+            << "ExpandMixedKernel: a pl.split_aiv region contains a transpose that swaps its split axis";
+      }
+      pending_comments_.insert(pending_comments_.end(), region->leading_comments_.begin(),
+                               region->leading_comments_.end());
+      ++region_depth_;
+      AppendConsumed(region->body_, body);
+      --region_depth_;
+    } else if (auto seq = As<SeqStmts>(stmt)) {
+      for (const auto& child : seq->stmts_) AppendConsumed(child, body);
+    } else {
+      auto comments = std::move(pending_comments_);
+      pending_comments_.clear();
+      auto visited = VisitStmt(stmt);
+      if (!comments.empty()) visited = StatementCommentPrepender(std::move(comments)).VisitStmt(visited);
+      body.push_back(visited);
+    }
+  }
+
+  int region_depth_ = 0;
+  std::vector<std::string> pending_comments_;
+};
+
+CoreAffinity ClassifyPlacedCall(const CallPtr& call, const AivPlacement& placement) {
+  return placement.count(call.get()) ? CoreAffinity::VECTOR : ClassifyCallAffinity(call);
+}
 
 /// Validate that a deferred waiter is reached only through the task-level
 /// orchestration dispatch shape produced by ScopeOutliner. The marker is
@@ -284,28 +400,29 @@ TpopDefs CollectTpopDefs(const std::vector<StmtPtr>& stmts) {
 // Forward declare
 CoreAffinity AnalyzeStmtAffinity(const StmtPtr& stmt, std::unordered_map<const Stmt*, CoreAffinity>& stmt_map,
                                  std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                 const TpopDefs& tpop_defs);
+                                 const TpopDefs& tpop_defs, const AivPlacement& placement);
 
 CoreAffinity AnalyzeStmtsAffinity(const std::vector<StmtPtr>& stmts,
                                   std::unordered_map<const Stmt*, CoreAffinity>& stmt_map,
                                   std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                  const TpopDefs& tpop_defs = {}) {
+                                  const TpopDefs& tpop_defs = {}, const AivPlacement& placement = {}) {
   CoreAffinity combined = CoreAffinity::SHARED;
   for (const auto& stmt : stmts) {
-    combined = CombineAffinity(combined, AnalyzeStmtAffinity(stmt, stmt_map, var_affinity, tpop_defs));
+    combined =
+        CombineAffinity(combined, AnalyzeStmtAffinity(stmt, stmt_map, var_affinity, tpop_defs, placement));
   }
   return combined;
 }
 
 CoreAffinity AnalyzeStmtAffinity(const StmtPtr& stmt, std::unordered_map<const Stmt*, CoreAffinity>& stmt_map,
                                  std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                 const TpopDefs& tpop_defs) {
+                                 const TpopDefs& tpop_defs, const AivPlacement& placement) {
   CoreAffinity result = CoreAffinity::SHARED;
 
   if (auto assign = std::dynamic_pointer_cast<const AssignStmt>(stmt)) {
     auto call = std::dynamic_pointer_cast<const Call>(assign->value_);
     if (call) {
-      result = ClassifyCallAffinity(call);
+      result = ClassifyPlacedCall(call, placement);
       // tile.move from a tpop result is not a cross-core boundary: the data already
       // arrived via tpop, so the move is just internal data placement on the consuming
       // core. ClassifyCallAffinity returns MIXED for *any* C/V-crossing tile.move,
@@ -328,20 +445,22 @@ CoreAffinity AnalyzeStmtAffinity(const StmtPtr& stmt, std::unordered_map<const S
     var_affinity[assign->var_.get()] = result;
   } else if (auto eval = std::dynamic_pointer_cast<const EvalStmt>(stmt)) {
     auto call = std::dynamic_pointer_cast<const Call>(eval->expr_);
-    if (call) result = ClassifyCallAffinity(call);
+    if (call) result = ClassifyPlacedCall(call, placement);
   } else if (auto for_stmt = std::dynamic_pointer_cast<const ForStmt>(stmt)) {
-    result = AnalyzeStmtsAffinity(FlattenBody(for_stmt->body_), stmt_map, var_affinity, tpop_defs);
+    result = AnalyzeStmtsAffinity(FlattenBody(for_stmt->body_), stmt_map, var_affinity, tpop_defs, placement);
   } else if (auto if_stmt = std::dynamic_pointer_cast<const IfStmt>(stmt)) {
-    result = AnalyzeStmtsAffinity(FlattenBody(if_stmt->then_body_), stmt_map, var_affinity, tpop_defs);
+    result =
+        AnalyzeStmtsAffinity(FlattenBody(if_stmt->then_body_), stmt_map, var_affinity, tpop_defs, placement);
     const auto& else_body = if_stmt->else_body_;
     if (else_body.has_value()) {
-      result = CombineAffinity(
-          result, AnalyzeStmtsAffinity(FlattenBody(*else_body), stmt_map, var_affinity, tpop_defs));
+      result = CombineAffinity(result, AnalyzeStmtsAffinity(FlattenBody(*else_body), stmt_map, var_affinity,
+                                                            tpop_defs, placement));
     }
   } else if (auto while_stmt = std::dynamic_pointer_cast<const WhileStmt>(stmt)) {
-    result = AnalyzeStmtsAffinity(FlattenBody(while_stmt->body_), stmt_map, var_affinity, tpop_defs);
+    result =
+        AnalyzeStmtsAffinity(FlattenBody(while_stmt->body_), stmt_map, var_affinity, tpop_defs, placement);
   } else if (auto seq = std::dynamic_pointer_cast<const SeqStmts>(stmt)) {
-    result = AnalyzeStmtsAffinity(seq->stmts_, stmt_map, var_affinity, tpop_defs);
+    result = AnalyzeStmtsAffinity(seq->stmts_, stmt_map, var_affinity, tpop_defs, placement);
   }
 
   stmt_map[stmt.get()] = result;
@@ -433,7 +552,8 @@ std::optional<CoreAffinity> BoundaryResultLane(const CallPtr& call) {
 /// diagnostic.
 std::optional<CoreAffinity> OperandDefiningLane(
     const ExprPtr& operand, const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-    const std::unordered_map<const Var*, StmtPtr>& def_map, CallPtr* producer_call) {
+    const std::unordered_map<const Var*, StmtPtr>& def_map, const AivPlacement& placement,
+    CallPtr* producer_call) {
   // An operand written inline rather than bound to a name — `aiv_shard(full(...))`
   // — has no defining statement to filter out of a lane, so nothing dangles; it is
   // instead EMITTED inside the tpush, asking the pushing lane to run the op itself
@@ -442,7 +562,7 @@ std::optional<CoreAffinity> OperandDefiningLane(
   // (a nested crossing) and SHARED have no one producing lane here.
   if (auto call = transform_utils::AsCallOrSubmitView(operand)) {
     *producer_call = call;
-    const CoreAffinity affinity = ClassifyCallAffinity(call);
+    const CoreAffinity affinity = ClassifyPlacedCall(call, placement);
     if (affinity == CoreAffinity::CUBE || affinity == CoreAffinity::VECTOR) return affinity;
     return std::nullopt;
   }
@@ -504,13 +624,14 @@ std::optional<CoreAffinity> OperandDefiningLane(
 void CheckOpDrivenBoundaryOperands(const std::vector<StmtPtr>& stmts,
                                    const std::map<const Stmt*, CVBoundaryMove>& boundary_moves,
                                    const std::unordered_map<const Var*, CoreAffinity>& var_affinity,
-                                   const std::unordered_map<const Var*, StmtPtr>& def_map) {
+                                   const std::unordered_map<const Var*, StmtPtr>& def_map,
+                                   const AivPlacement& placement) {
   for (const auto& stmt : stmts) {
     if (auto bm_it = boundary_moves.find(stmt.get()); bm_it != boundary_moves.end()) {
       const auto& bm = bm_it->second;
       if (bm.op_driven) {
         CallPtr producer_call;
-        auto lane = OperandDefiningLane(bm.source_tile, var_affinity, def_map, &producer_call);
+        auto lane = OperandDefiningLane(bm.source_tile, var_affinity, def_map, placement, &producer_call);
         const bool cube_to_vector = (bm.direction == CVDirection::CUBE_TO_VECTOR);
         const CoreAffinity pushing = cube_to_vector ? CoreAffinity::CUBE : CoreAffinity::VECTOR;
         if (lane.has_value() && *lane != pushing) {
@@ -544,17 +665,20 @@ void CheckOpDrivenBoundaryOperands(const std::vector<StmtPtr>& stmts,
     }
 
     if (auto for_stmt = As<ForStmt>(stmt)) {
-      CheckOpDrivenBoundaryOperands(FlattenBody(for_stmt->body_), boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(FlattenBody(for_stmt->body_), boundary_moves, var_affinity, def_map,
+                                    placement);
     } else if (auto if_stmt = As<IfStmt>(stmt)) {
-      CheckOpDrivenBoundaryOperands(FlattenBody(if_stmt->then_body_), boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(FlattenBody(if_stmt->then_body_), boundary_moves, var_affinity, def_map,
+                                    placement);
       if (if_stmt->else_body_.has_value()) {
         CheckOpDrivenBoundaryOperands(FlattenBody(*if_stmt->else_body_), boundary_moves, var_affinity,
-                                      def_map);
+                                      def_map, placement);
       }
     } else if (auto while_stmt = As<WhileStmt>(stmt)) {
-      CheckOpDrivenBoundaryOperands(FlattenBody(while_stmt->body_), boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(FlattenBody(while_stmt->body_), boundary_moves, var_affinity, def_map,
+                                    placement);
     } else if (auto seq = As<SeqStmts>(stmt)) {
-      CheckOpDrivenBoundaryOperands(seq->stmts_, boundary_moves, var_affinity, def_map);
+      CheckOpDrivenBoundaryOperands(seq->stmts_, boundary_moves, var_affinity, def_map, placement);
     }
   }
 }
@@ -623,6 +747,28 @@ CallPtr CreateMove(const ExprPtr& tile, MemorySpace target_memory, const TypePtr
   return std::make_shared<Call>(op, std::vector<ExprPtr>{tile}, std::move(kwargs), result_type, span);
 }
 
+bool IsMxScaleView(const TileType& type) {
+  const TileView view = tile_view_semantics::GetEffectiveTileView(type);
+  return type.dtype_ == DataType::FP8E8M0 && view.fractal == tile_view_semantics::kMXScaleFractal &&
+         view.blayout == view.slayout &&
+         (view.blayout == TileLayout::row_major || view.blayout == TileLayout::col_major);
+}
+
+// Route every FP8E8M0 scale-view V2C boundary through the dedicated MX carrier
+// planner. It handles both matching layouts and real producer-to-consumer
+// layout conversion before constructing the physical row/row carrier.
+bool IsMxScaleBoundary(const CVBoundaryMove& boundary) {
+  if (boundary.op_driven || boundary.direction != CVDirection::VECTOR_TO_CUBE) return false;
+  auto source_type = As<TileType>(boundary.source_tile->GetType());
+  auto dest_type = As<TileType>(boundary.dest_var->GetType());
+  if (!source_type || !dest_type || !IsMxScaleView(*source_type) || !IsMxScaleView(*dest_type) ||
+      (source_type->memory_space_.has_value() && source_type->memory_space_ != MemorySpace::Vec) ||
+      dest_type->memory_space_ != MemorySpace::Mat) {
+    return false;
+  }
+  return true;
+}
+
 MemorySpace GetBoundaryTpopMemory(CoreSide side) {
   return (side == CoreSide::AIC) ? MemorySpace::Mat : MemorySpace::Vec;
 }
@@ -630,6 +776,394 @@ MemorySpace GetBoundaryTpopMemory(CoreSide side) {
 // ============================================================================
 // Hand-written cross-core pipe: V->C push layout adaptation
 // ============================================================================
+
+struct MxV2CContract {
+  std::shared_ptr<const TileType> consumer_type;
+  int pipe_id = 0;
+  int split = 0;
+  int slot_size = 0;
+};
+
+using MxV2CContracts = std::unordered_map<const Call*, MxV2CContract>;
+
+struct PipeFunctionFacts {
+  FunctionPtr function;
+  std::unordered_map<const Var*, CallPtr> definitions;
+  std::vector<CallPtr> initializes;
+  std::vector<CallPtr> v2c_pushes;
+  std::vector<std::pair<CallPtr, std::shared_ptr<const TileType>>> v2c_pops;
+};
+
+struct PipePopEndpoint {
+  CallPtr call;
+  std::shared_ptr<const TileType> type;
+};
+
+struct PipeFunctionIndex {
+  std::unordered_map<int, std::vector<CallPtr>> v2c_initializes;
+  std::unordered_map<int, std::vector<CallPtr>> v2c_pushes;
+  std::unordered_map<const Call*, size_t> v2c_push_ordinals;
+  std::unordered_map<int, std::vector<PipePopEndpoint>> v2c_pops;
+};
+
+class PipeFunctionFactsCollector : public IRVisitor {
+ public:
+  explicit PipeFunctionFactsCollector(FunctionPtr function) { facts_.function = std::move(function); }
+
+  [[nodiscard]] PipeFunctionFacts Take() { return std::move(facts_); }
+
+ protected:
+  void VisitStmt_(const AssignStmtPtr& op) override {
+    if (auto call = As<Call>(op->value_)) {
+      facts_.definitions[op->var_.get()] = call;
+      if (IsOp(call, "tile.tpop_from_aiv")) {
+        auto type = As<TileType>(op->var_->GetType());
+        INTERNAL_CHECK_SPAN(type, op->span_) << "tile.tpop_from_aiv result must be a TileType";
+        facts_.v2c_pops.emplace_back(call, type);
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const EvalStmtPtr& op) override {
+    if (auto call = As<Call>(op->expr_)) {
+      if (IsOp(call, "system.aic_initialize_pipe") || IsOp(call, "system.aiv_initialize_pipe")) {
+        facts_.initializes.push_back(call);
+      } else if (IsOp(call, "tile.tpush_to_aic")) {
+        facts_.v2c_pushes.push_back(call);
+      }
+    }
+    IRVisitor::VisitStmt_(op);
+  }
+
+ private:
+  PipeFunctionFacts facts_;
+};
+
+bool SameMxTypeContract(const TileType& lhs, const TileType& rhs) {
+  const TileView lhs_view = tile_view_semantics::GetEffectiveTileView(lhs);
+  const TileView rhs_view = tile_view_semantics::GetEffectiveTileView(rhs);
+  return lhs.dtype_ == rhs.dtype_ && tile_view_semantics::ShapeExprListsEquivalent(lhs.shape_, rhs.shape_) &&
+         tile_view_semantics::ShapeExprListsEquivalent(lhs_view.valid_shape, rhs_view.valid_shape) &&
+         lhs_view == rhs_view;
+}
+
+PipeFunctionIndex BuildPipeFunctionIndex(const PipeFunctionFacts& facts) {
+  PipeFunctionIndex index;
+  for (const auto& call : facts.initializes) {
+    if ((call->GetKwarg<int>("dir_mask", 0) & core_affinity::kDirMaskV2C) == 0) continue;
+    index.v2c_initializes[call->GetKwarg<int>("id", 0)].push_back(call);
+  }
+  for (const auto& call : facts.v2c_pushes) {
+    auto& pushes = index.v2c_pushes[call->GetKwarg<int>("id", 0)];
+    index.v2c_push_ordinals.emplace(call.get(), pushes.size());
+    pushes.push_back(call);
+  }
+  for (const auto& [call, type] : facts.v2c_pops) {
+    index.v2c_pops[call->GetKwarg<int>("id", 0)].push_back(PipePopEndpoint{call, type});
+  }
+  return index;
+}
+
+const CallPtr& GetUniqueV2CInitialize(const PipeFunctionIndex& index, int pipe_id, const Span& span,
+                                      const std::string& side) {
+  auto it = index.v2c_initializes.find(pipe_id);
+  CHECK_SPAN(it != index.v2c_initializes.end(), span)
+      << "MX V2C pipe id " << pipe_id << " has no matching " << side << " initialize_pipe call";
+  CHECK_SPAN(it->second.size() == 1, span)
+      << "MX V2C pipe id " << pipe_id << " has ambiguous " << side << " initialize_pipe calls";
+  const auto& match = it->second.front();
+  CHECK_SPAN(match->args_.size() == 2, span)
+      << "MX V2C " << side << " initialize_pipe must carry c2v and v2c buffer arguments";
+  return match;
+}
+
+CallPtr ResolveBufferDefinition(const PipeFunctionFacts& facts, const ExprPtr& buffer, const Span& span,
+                                const std::string& expected_op) {
+  auto var = AsVarLike(buffer);
+  CHECK_SPAN(var, span) << "MX V2C initialize_pipe requires an SSA v2c buffer";
+  auto it = facts.definitions.find(var.get());
+  CHECK_SPAN(it != facts.definitions.end() && IsOp(it->second, expected_op), span)
+      << "MX V2C initialize_pipe v2c buffer must come from " << expected_op;
+  return it->second;
+}
+
+MxV2CContracts BuildMxV2CContracts(const std::vector<FunctionPtr>& functions) {
+  std::vector<PipeFunctionFacts> all_facts;
+  std::vector<PipeFunctionIndex> all_indexes;
+  std::unordered_map<std::string, size_t> function_index;
+  bool has_mx_push = false;
+  for (const auto& function : functions) {
+    PipeFunctionFactsCollector collector(function);
+    collector.VisitStmt(function->body_);
+    auto facts = collector.Take();
+    for (const auto& push : facts.v2c_pushes) {
+      if (push->args_.size() == 1) {
+        auto source_type = As<TileType>(push->args_[0]->GetType());
+        has_mx_push = has_mx_push || (source_type && IsMxScaleView(*source_type));
+      }
+    }
+    CHECK(function_index.emplace(function->name_, all_facts.size()).second)
+        << "ExpandMixedKernel found duplicate function name while pairing MX V2C pipes: " << function->name_;
+    all_facts.push_back(std::move(facts));
+  }
+  all_indexes.reserve(all_facts.size());
+  for (const auto& facts : all_facts) {
+    all_indexes.push_back(BuildPipeFunctionIndex(facts));
+  }
+
+  MxV2CContracts contracts;
+  if (!has_mx_push || !PassContext::Current()->GetBackendHandler()->RequiresVtoCFractalAdapt()) {
+    return contracts;
+  }
+
+  for (size_t producer_index = 0; producer_index < all_facts.size(); ++producer_index) {
+    const auto& producer = all_facts[producer_index];
+    const auto& producer_pipe_index = all_indexes[producer_index];
+    if (producer.function->func_type_ != FunctionType::AIV) continue;
+    for (const auto& push : producer.v2c_pushes) {
+      if (push->args_.size() != 1) continue;
+      auto source_type = As<TileType>(push->args_[0]->GetType());
+      if (!source_type || !IsMxScaleView(*source_type)) continue;
+
+      const int pipe_id = push->GetKwarg<int>("id", 0);
+      const int split = push->GetKwarg<int>("split", 0);
+      CHECK_SPAN(IsValidSplitCode(split), push->span_)
+          << "MX V2C pipe id " << pipe_id << " has invalid tpush split code " << split;
+      const auto& producer_init = GetUniqueV2CInitialize(producer_pipe_index, pipe_id, push->span_, "AIV");
+      const int producer_slot_size = producer_init->GetKwarg<int>("slot_size", -1);
+      CHECK_SPAN(producer_slot_size > 0, push->span_)
+          << "MX V2C pipe id " << pipe_id << " requires a positive AIV slot_size";
+      auto import = ResolveBufferDefinition(producer, producer_init->args_[1], push->span_,
+                                            "system.import_peer_buffer");
+      const std::string buffer_name = import->GetKwarg<std::string>("name");
+      const std::string peer_name = import->GetKwarg<std::string>("peer_func");
+      auto peer_it = function_index.find(peer_name);
+      CHECK_SPAN(peer_it != function_index.end(), push->span_)
+          << "MX V2C pipe id " << pipe_id << " imports buffer '" << buffer_name
+          << "' from missing peer function '" << peer_name << "'";
+      const auto& consumer = all_facts[peer_it->second];
+      const auto& consumer_pipe_index = all_indexes[peer_it->second];
+      CHECK_SPAN(consumer.function->func_type_ == FunctionType::AIC, push->span_)
+          << "MX V2C pipe id " << pipe_id << " peer function '" << peer_name << "' is not AIC";
+
+      const auto& consumer_init = GetUniqueV2CInitialize(consumer_pipe_index, pipe_id, push->span_, "AIC");
+      const int consumer_slot_size = consumer_init->GetKwarg<int>("slot_size", -1);
+      CHECK_SPAN(consumer_slot_size == producer_slot_size, push->span_)
+          << "MX V2C pipe id " << pipe_id << " has mismatched AIV/AIC slot_size values " << producer_slot_size
+          << " and " << consumer_slot_size;
+      auto reserve =
+          ResolveBufferDefinition(consumer, consumer_init->args_[1], push->span_, "system.reserve_buffer");
+      CHECK_SPAN(reserve->GetKwarg<std::string>("name") == buffer_name, push->span_)
+          << "MX V2C pipe id " << pipe_id << " imports buffer '" << buffer_name
+          << "' but the AIC initializer reserves '" << reserve->GetKwarg<std::string>("name") << "'";
+
+      auto pushes_it = producer_pipe_index.v2c_pushes.find(pipe_id);
+      INTERNAL_CHECK_SPAN(pushes_it != producer_pipe_index.v2c_pushes.end(), push->span_)
+          << "Internal error: indexed MX V2C push is missing from its pipe group";
+      auto ordinal_it = producer_pipe_index.v2c_push_ordinals.find(push.get());
+      INTERNAL_CHECK_SPAN(ordinal_it != producer_pipe_index.v2c_push_ordinals.end(), push->span_)
+          << "Internal error: indexed MX V2C push has no pipe ordinal";
+      const size_t push_ordinal = ordinal_it->second;
+      const size_t push_count = pushes_it->second.size();
+      auto pops_it = consumer_pipe_index.v2c_pops.find(pipe_id);
+      const size_t pop_count = (pops_it == consumer_pipe_index.v2c_pops.end()) ? 0 : pops_it->second.size();
+      CHECK_SPAN(pop_count == push_count, push->span_)
+          << "MX V2C pipe id " << pipe_id << " has " << push_count << " tpush calls but " << pop_count
+          << " tpop calls";
+      const auto& [pop, consumer_type] = pops_it->second[push_ordinal];
+      const int pop_split = pop->GetKwarg<int>("split", 0);
+      CHECK_SPAN(pop_split == split, push->span_)
+          << "MX V2C pipe id " << pipe_id << " has mismatched tpush/tpop split codes " << split << " and "
+          << pop_split;
+      CHECK_SPAN(IsMxScaleView(*consumer_type), push->span_)
+          << "MX V2C pipe id " << pipe_id << " pairs an MX push with a non-MX tpop";
+      contracts.emplace(push.get(), MxV2CContract{consumer_type, pipe_id, split, producer_slot_size});
+    }
+  }
+  return contracts;
+}
+
+using TileDefMap = std::unordered_map<const Var*, CallPtr>;
+
+TileDefMap BuildTileDefMap(const StmtPtr& body) {
+  class Collector : public IRVisitor {
+   public:
+    TileDefMap definitions;
+
+   protected:
+    void VisitStmt_(const AssignStmtPtr& op) override {
+      if (auto call = As<Call>(op->value_)) definitions[op->var_.get()] = call;
+      IRVisitor::VisitStmt_(op);
+    }
+  } collector;
+  collector.VisitStmt(body);
+  return std::move(collector.definitions);
+}
+
+bool IsFullValid(const TileType& type) {
+  return tile_view_semantics::ShapeExprListsEquivalent(
+      tile_view_semantics::GetEffectiveTileView(type).valid_shape, type.shape_);
+}
+
+bool SameMxLogicalTile(const TileType& lhs, const TileType& rhs) {
+  const TileView lhs_view = tile_view_semantics::GetEffectiveTileView(lhs);
+  const TileView rhs_view = tile_view_semantics::GetEffectiveTileView(rhs);
+  return lhs.dtype_ == rhs.dtype_ && lhs.shape_.size() == 2 && rhs.shape_.size() == 2 &&
+         tile_view_semantics::ShapeExprListsEquivalent(lhs.shape_, rhs.shape_) &&
+         tile_view_semantics::ShapeExprListsEquivalent(lhs_view.valid_shape, rhs_view.valid_shape);
+}
+
+std::shared_ptr<const TileType> RequireMxCallType(const CallPtr& call, const TileType& expected,
+                                                  const Span& span, const std::string& op_name) {
+  auto actual = As<TileType>(call->GetType());
+  CHECK_SPAN(actual && actual->dtype_ == expected.dtype_ &&
+                 tile_view_semantics::ShapeExprListsEquivalent(actual->shape_, expected.shape_) &&
+                 tile_view_semantics::GetEffectiveTileView(*actual) ==
+                     tile_view_semantics::GetEffectiveTileView(expected) &&
+                 actual->memory_space_ == MemorySpace::Vec,
+             span)
+      << op_name << " could not construct the required MX V2C carrier type";
+  return actual;
+}
+
+bool IsCanonicalMxCarrier(const ExprPtr& source, const TileType& consumer, const TileDefMap& definitions) {
+  auto source_type = As<TileType>(source->GetType());
+  if (!source_type || !IsFullValid(*source_type)) return false;
+  const TileView consumer_view = tile_view_semantics::GetEffectiveTileView(consumer);
+  const TileView source_view = tile_view_semantics::GetEffectiveTileView(*source_type);
+  if (source_view.blayout != TileLayout::row_major || source_view.slayout != TileLayout::row_major ||
+      source_view.fractal != tile_view_semantics::kMXScaleFractal) {
+    return false;
+  }
+
+  auto unwrap_widening = [&](const ExprPtr& expr) -> std::pair<ExprPtr, bool> {
+    auto var = AsVarLike(expr);
+    if (!var) return {nullptr, false};
+    auto definition = definitions.find(var.get());
+    if (definition == definitions.end() || !IsOp(definition->second, "tile.set_validshape")) {
+      return {expr, false};
+    }
+    return {definition->second->args_[0], true};
+  };
+
+  ExprPtr logical_expr;
+  bool widened_valid_shape = false;
+  if (consumer_view.blayout == TileLayout::row_major) {
+    std::tie(logical_expr, widened_valid_shape) = unwrap_widening(source);
+  } else {
+    auto carrier_var = AsVarLike(source);
+    if (!carrier_var) return false;
+    auto carrier_def = definitions.find(carrier_var.get());
+    if (carrier_def == definitions.end() || !IsOp(carrier_def->second, "tile.transpose_view") ||
+        carrier_def->second->args_.size() != 1) {
+      return false;
+    }
+    std::tie(logical_expr, widened_valid_shape) = unwrap_widening(carrier_def->second->args_[0]);
+  }
+  if (!logical_expr) return false;
+  auto logical_type = As<TileType>(logical_expr->GetType());
+  return logical_type && SameMxTypeContract(*logical_type, consumer) &&
+         logical_type->memory_space_ == MemorySpace::Vec && (IsFullValid(consumer) || widened_valid_shape);
+}
+
+void ValidateMxCarrierSize(const TileType& carrier_type, const MxV2CContract& contract, const Span& span) {
+  const auto carrier_bytes =
+      cross_core_pipe::TryGetTileSlotSizeBytes(std::make_shared<TileType>(carrier_type));
+  CHECK_SPAN(carrier_bytes.has_value(), span)
+      << "MX V2C pipe id " << contract.pipe_id << " requires a static carrier shape";
+  CHECK_SPAN(*carrier_bytes > 0 && *carrier_bytes % 32 == 0, span)
+      << "MX V2C pipe id " << contract.pipe_id << " carrier size " << *carrier_bytes
+      << " bytes is not a positive 32-byte multiple";
+  CHECK_SPAN(*carrier_bytes <= contract.slot_size, span)
+      << "MX V2C pipe id " << contract.pipe_id << " carrier needs " << *carrier_bytes
+      << " bytes but slot_size is " << contract.slot_size;
+}
+
+StmtPtr AdaptMxV2CPush(const EvalStmtPtr& stmt, const CallPtr& push, const MxV2CContract& contract,
+                       const TileDefMap& definitions) {
+  const ExprPtr& source = push->args_[0];
+  auto source_type = As<TileType>(source->GetType());
+  const auto& consumer_type = contract.consumer_type;
+  INTERNAL_CHECK_SPAN(source_type && consumer_type, stmt->span_) << "MX V2C contract requires tile types";
+
+  CHECK_SPAN(IsMxScaleView(*source_type) && IsMxScaleView(*consumer_type), stmt->span_)
+      << "MX V2C pipe id " << contract.pipe_id << " requires FP8E8M0 fractal-32 scale views";
+  CHECK_SPAN(source_type->shape_.size() == 2 && consumer_type->shape_.size() == 2, stmt->span_)
+      << "MX V2C pipe id " << contract.pipe_id << " requires rank-2 scale views";
+  CHECK_SPAN(
+      source_type->memory_space_ == MemorySpace::Vec && consumer_type->memory_space_ == MemorySpace::Mat,
+      stmt->span_)
+      << "MX V2C pipe id " << contract.pipe_id << " requires a Vec producer and Mat consumer";
+  if (IsCanonicalMxCarrier(source, *consumer_type, definitions)) {
+    ValidateMxCarrierSize(*source_type, contract, stmt->span_);
+    return stmt;
+  }
+  CHECK_SPAN(SameMxLogicalTile(*source_type, *consumer_type), stmt->span_)
+      << "MX V2C pipe id " << contract.pipe_id
+      << " requires producer and consumer to have identical logical shape and valid_shape";
+
+  const TileView consumer_view = tile_view_semantics::GetEffectiveTileView(*consumer_type);
+  TileView target_view = consumer_view;
+  auto logical_target = std::make_shared<TileType>(source_type->shape_, source_type->dtype_, std::nullopt,
+                                                   target_view, MemorySpace::Vec);
+  ExprPtr carrier = source;
+  std::vector<StmtPtr> output;
+  auto current_type = source_type;
+  std::string source_name = "scale";
+  if (auto source_var = AsVarLike(source)) source_name = source_var->name_hint_;
+
+  const bool needs_private_carrier = !IsFullValid(*current_type);
+  if (tile_view_semantics::GetEffectiveTileView(*current_type) != target_view || needs_private_carrier) {
+    // set_validshape mutates an alloc-backed PTO tile handle and cannot operate
+    // on a slice/reshape view. Materialize a private carrier before widening so
+    // partial source views remain legal and the full transport extent cannot
+    // leak through an alias into later logical uses of the source tile.
+    auto move = OpRegistry::GetInstance().Create("tile.move", {carrier},
+                                                 {{"target_memory", std::any(MemorySpace::Vec)},
+                                                  {"blayout", std::any(target_view.blayout)},
+                                                  {"slayout", std::any(target_view.slayout)}},
+                                                 stmt->span_);
+    current_type = RequireMxCallType(move, *logical_target, stmt->span_, "tile.move");
+    auto moved = std::make_shared<Var>(source_name + "_mx_layout", current_type, stmt->span_);
+    output.push_back(std::make_shared<AssignStmt>(moved, move, stmt->span_));
+    carrier = moved;
+  }
+
+  if (!IsFullValid(*current_type)) {
+    auto full = OpRegistry::GetInstance().Create(
+        "tile.set_validshape", {carrier, current_type->shape_[0], current_type->shape_[1]}, {}, stmt->span_);
+    auto full_type = As<TileType>(full->GetType());
+    CHECK_SPAN(full_type && IsFullValid(*full_type), stmt->span_)
+        << "tile.set_validshape could not construct a full-box MX V2C carrier";
+    auto full_var = std::make_shared<Var>(source_name + "_mx_full", full_type, stmt->span_);
+    output.push_back(std::make_shared<AssignStmt>(full_var, full, stmt->span_));
+    carrier = full_var;
+    current_type = full_type;
+  }
+
+  if (consumer_view.blayout == TileLayout::col_major) {
+    auto transpose = OpRegistry::GetInstance().Create("tile.transpose_view", {carrier}, {}, stmt->span_);
+    auto transpose_type = As<TileType>(transpose->GetType());
+    CHECK_SPAN(transpose_type, stmt->span_) << "tile.transpose_view must produce an MX tile";
+    const TileView transpose_view = tile_view_semantics::GetEffectiveTileView(*transpose_type);
+    CHECK_SPAN(transpose_type->shape_.size() == 2 && transpose_view.blayout == TileLayout::row_major &&
+                   transpose_view.slayout == TileLayout::row_major && IsMxScaleView(*transpose_type),
+               stmt->span_)
+        << "tile.transpose_view could not construct the row/row MX V2C carrier";
+    auto transposed = std::make_shared<Var>(source_name + "_mx_nd", transpose_type, stmt->span_);
+    output.push_back(std::make_shared<AssignStmt>(transposed, transpose, stmt->span_));
+    carrier = transposed;
+    current_type = transpose_type;
+  }
+
+  ValidateMxCarrierSize(*current_type, contract, stmt->span_);
+
+  auto adapted_push = std::make_shared<Call>(push->op_, std::vector<ExprPtr>{carrier}, push->kwargs_,
+                                             push->attrs_, push->GetType(), push->span_);
+  output.push_back(std::make_shared<EvalStmt>(adapted_push, stmt->span_));
+  return SeqStmts::Flatten(std::move(output), stmt->span_);
+}
 
 /// Give a hand-written `pl.tpush_to_aic` the same fractal adapter the compiler
 /// inserts for the pipes it builds itself.
@@ -647,12 +1181,11 @@ MemorySpace GetBoundaryTpopMemory(CoreSide side) {
 /// Ascend910B (which needs no adapter: push/pop goes ub -> gm -> mat and takes
 /// ND directly).
 ///
-/// The target view does not depend on where the consumer pops to -- the handler
-/// maps Mat, Left and Right alike onto one fractal view -- so keying off Mat,
-/// the cube-side transfer memory the op-driven branch below already uses, is
-/// exact rather than a guess, and needs no cross-function analysis to find the
-/// matching tpop.
 class AdaptManualVtoCPush : public IRMutator {
+ public:
+  AdaptManualVtoCPush(const MxV2CContracts& mx_contracts, TileDefMap definitions)
+      : mx_contracts_(mx_contracts), definitions_(std::move(definitions)) {}
+
  protected:
   StmtPtr VisitStmt_(const EvalStmtPtr& op) override {
     auto call = As<Call>(op->expr_);
@@ -667,7 +1200,17 @@ class AdaptManualVtoCPush : public IRMutator {
     // hand-written push must not require a configured backend to walk this phase.
     const auto* handler = PassContext::Current()->GetBackendHandler();
     if (!handler->RequiresVtoCFractalAdapt()) {
+      CHECK_SPAN(src_type->dtype_ != DataType::FP8E8M0, op->span_)
+          << "Hand-written tile.tpush_to_aic does not support FP8E8M0 MX-scale tiles on this backend";
       return IRMutator::VisitStmt_(op);
+    }
+    CHECK_SPAN(src_type->dtype_ != DataType::FP8E8M0 || IsMxScaleView(*src_type), op->span_)
+        << "FP8E8M0 V2C transport requires a rank-2 row/row or col/col fractal-32 MX scale view";
+    if (IsMxScaleView(*src_type)) {
+      auto contract = mx_contracts_.find(call.get());
+      CHECK_SPAN(contract != mx_contracts_.end(), op->span_)
+          << "MX V2C tpush has no unique direction/id consumer contract";
+      return AdaptMxV2CPush(op, call, contract->second, definitions_);
     }
     const TileView src_view = tile_view_semantics::GetEffectiveTileView(*src_type);
     const TileView fractal_view =
@@ -700,6 +1243,10 @@ class AdaptManualVtoCPush : public IRMutator {
                              std::make_shared<EvalStmt>(adapted_push, op->span_)};
     return SeqStmts::Flatten(std::move(out), op->span_);
   }
+
+ private:
+  const MxV2CContracts& mx_contracts_;
+  TileDefMap definitions_;
 };
 
 // ============================================================================
@@ -1020,6 +1567,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
     // MIXED here, but we handle it specially before the generic MIXED arm below.
     auto bm_it = boundary_moves.find(stmt.get());
     if (bm_it != boundary_moves.end()) {
+      const size_t first_emitted = result.size();
       {
         const auto& bm = bm_it->second;
         // The cross-core transfer memory FOR THIS SIDE: AIC drains into Mat,
@@ -1040,6 +1588,10 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
         // transport carries the stride.
         const int op_lane_stride =
             (bm.op_driven && bm.direction == CVDirection::CUBE_TO_VECTOR) ? bm.lane_stride : 0;
+        const bool has_mx_scale_boundary = IsMxScaleBoundary(bm);
+        CHECK_SPAN(!has_mx_scale_boundary || handler->RequiresVtoCFractalAdapt(), stmt->span_)
+            << "Automatic quant_mx-to-matmul_mx scale transport requires an A5 backend";
+        const bool is_mx_scale_boundary = has_mx_scale_boundary && handler->RequiresVtoCFractalAdapt();
         if (bm.direction == push_direction) {
           ExprPtr push_source = bm.source_tile;
           // AIV V->C push: insert tile.move (tmov) to adapt the source into
@@ -1050,7 +1602,7 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           // Mat -> Right tile.move, one step past this boundary.
           // On Ascend910B: don't need to adapt layout! push/pop will be ub -> gm -> mat, ub -> gm can
           // directly use nd
-          if (side == CoreSide::AIV && handler->RequiresVtoCFractalAdapt()) {
+          if (side == CoreSide::AIV && handler->RequiresVtoCFractalAdapt() && !is_mx_scale_boundary) {
             auto src_type = std::dynamic_pointer_cast<const TileType>(bm.source_tile->GetType());
             INTERNAL_CHECK_SPAN(src_type, stmt->span_) << "V->C tpush source must have TileType";
             // For op-driven boundaries the cube-side transfer memory is Mat
@@ -1103,7 +1655,8 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
             INTERNAL_CHECK_SPAN(shape_tt->memory_space_.has_value(), stmt->span_)
                 << "Boundary move destination must have TileType and MemSpace";
             view_ms = shape_tt->memory_space_.value();  // NOLINT(bugprone-unchecked-optional-access)
-            needs_post_move = NeedsPostTpopMove(side, *shape_tt);
+            // The MX scale tpop already uses the consumer's final Mat view.
+            needs_post_move = !is_mx_scale_boundary && NeedsPostTpopMove(side, *shape_tt);
           }
           auto tpop_type = BuildBoundaryTpopType(side, shape_source);
           // Consumer-side transfer view. For op-driven boundaries the cross-core
@@ -1122,7 +1675,9 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
           } else {
             boundary_view = tile_view_semantics::GetEffectiveTileView(*shape_tt);
           }
-          auto fractal_view = BuildCrossCoreTransferView(view_ms, boundary_view);
+          // Preserve the logical MX scale view; ordinary boundaries use the transfer view.
+          auto fractal_view = is_mx_scale_boundary ? tile_view_semantics::GetEffectiveTileView(*shape_tt)
+                                                   : BuildCrossCoreTransferView(view_ms, boundary_view);
           std::string tpop_name = needs_post_move ? BuildBoundaryTpopName(side, bm.dest_var->name_hint_)
                                                   : bm.dest_var->name_hint_;
           auto tt = std::dynamic_pointer_cast<const TileType>(tpop_type);
@@ -1155,6 +1710,10 @@ std::vector<StmtPtr> BuildCoreBody(CoreSide side, const std::vector<StmtPtr>& st
                 bm.dest_var, CreateMove(tpop_var, *target_memory, bm.dest_var->GetType(), stmt->span_),
                 stmt->span_));
           }
+        }
+        if (!stmt->leading_comments_.empty() && result.size() > first_emitted) {
+          result[first_emitted] =
+              StatementCommentPrepender(stmt->leading_comments_).VisitStmt(result[first_emitted]);
         }
         continue;
       }
@@ -1413,19 +1972,20 @@ struct ExpandedKernel {
   std::optional<FunctionPtr> group_func;  // nullopt when existing Group caller will be rewritten
 };
 
-ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = true) {
+ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group, const AivPlacement& placement,
+                                   bool had_regions) {
   // A tile.transpose that swaps the split axis cannot be split correctly:
   // SplitVectorKernel halves the original split axis, but the transpose moves
   // that data to the other dimension, mis-typing the result. Reject the split
   // request with an actionable error rather than silently miscompiling — the
   // user controls this perf decision (drop the split, or remove the transpose).
   //
-  // Explicit ``pl.split_aiv`` regions are validated per-region by
-  // LowerAutoVectorSplit (pass 23), where each region's mode is unambiguous; skip
+  // SplitRegionConsumer already validated each lexical region using its own
+  // mode; skip
   // the single-func-mode check for them. A multi-mode function carries no single
   // ``func->GetSplitMode()`` and this whole-function check would mis-check the
-  // other region's axis (critique #2).
-  if (!func->HasAttr(kAttrSplitAivRegionValidated)) {
+  // other region's axis.
+  if (!had_regions) {
     if (auto mode = func->GetSplitMode(); mode.has_value() && *mode != SplitMode::None) {
       int split_dim = (*mode == SplitMode::UpDown) ? 0 : 1;
       auto hazard = split_axis::FindTransposeSplitHazard(func->body_, split_dim);
@@ -1460,7 +2020,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // Recursive affinity analysis (descends into ForStmt/IfStmt/WhileStmt)
   std::unordered_map<const Stmt*, CoreAffinity> stmt_map;
   std::unordered_map<const Var*, CoreAffinity> var_affinity;
-  AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs);
+  AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs, placement);
 
   std::map<const Stmt*, CVBoundaryMove> boundary_moves;
   CollectCVBoundaryMoves(stmts, boundary_moves, tpop_defs);
@@ -1479,7 +2039,7 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
   // produced, or the pushing lane's body would reference a value it never
   // defines. Checked before either body is built, so the failure names the
   // user's boundary op instead of surfacing in codegen.
-  CheckOpDrivenBoundaryOperands(stmts, boundary_moves, var_affinity, original_def_map);
+  CheckOpDrivenBoundaryOperands(stmts, boundary_moves, var_affinity, original_def_map, placement);
 
   // Boundary-generated tpops never reuse the source-tpop Var (CollectCVBoundaryMoves
   // skips moves whose source comes from a tpop), so no original-tpop statements need
@@ -1512,17 +2072,20 @@ ExpandedKernel ExpandMixedFunction(const FunctionPtr& func, bool create_group = 
     for (const auto& kv : m) keys.insert(kv.first);
     return keys;
   };
+  // `func->params_`: both split bodies still reference the original function's
+  // Var pointers at this point (DeepClone has not run yet), so the source
+  // signature is what makes a yield of a parameter resolvable on either lane.
   auto aic_final = FinalizeTpopTfrees(
-      FinalizeSplitCoreBody(aic_stmts_no_return, original_def_map, remap_keys(aic_tpop_remap)), CoreSide::AIC,
-      aic_tpop_remap);
+      FinalizeSplitCoreBody(aic_stmts_no_return, original_def_map, remap_keys(aic_tpop_remap), func->params_),
+      CoreSide::AIC, aic_tpop_remap);
 
   // Build AIV body (recursive — handles MIXED compound stmts)
   std::unordered_map<const Var*, VarPtr> aiv_tpop_remap;
   auto aiv_stmts = BuildCoreBody(CoreSide::AIV, stmts, stmt_map, boundary_moves, aiv_tpop_remap,
                                  superseded_tpop_vars, gm_sync_pushes, gm_sync_pops);
-  auto aiv_final =
-      FinalizeTpopTfrees(FinalizeSplitCoreBody(aiv_stmts, original_def_map, remap_keys(aiv_tpop_remap)),
-                         CoreSide::AIV, aiv_tpop_remap);
+  auto aiv_final = FinalizeTpopTfrees(
+      FinalizeSplitCoreBody(aiv_stmts, original_def_map, remap_keys(aiv_tpop_remap), func->params_),
+      CoreSide::AIV, aiv_tpop_remap);
 
   // Every explicit split-reshape op must have been folded into a cross-core
   // tpush/tpop boundary on both lanes. A survivor means the boundary machinery
@@ -2173,32 +2736,6 @@ NormalizedGroups NormalizeHandWrittenGroupAbis(const ProgramPtr& program,
   return {std::move(result)};
 }
 
-// Removes the pl.split_aiv region placement stamp LowerAutoVectorSplit left on
-// each region call once this pass has consumed it (see the Phase 5 comment in
-// ExpandMixedKernel, and kCorePlacementAttr in attrs.h for the full lifecycle).
-//
-// Returns the input Call unchanged when the attr is absent, so a program with
-// no regions in it walks through at the cost of the traversal alone.
-class CorePlacementStripper : public IRMutator {
- protected:
-  ExprPtr VisitExpr_(const CallPtr& op) override {
-    auto mutated = IRMutator::VisitExpr_(op);
-    auto call = As<Call>(mutated);
-    if (!call || !call->HasAttr(kCorePlacementAttr)) return mutated;
-    return std::make_shared<Call>(call->op_, call->args_, call->kwargs_,
-                                  StripAttr(call->attrs_, kCorePlacementAttr), call->GetType(), call->span_);
-  }
-};
-
-FunctionPtr StripCorePlacement(const FunctionPtr& func) {
-  if (!func || !func->body_) return func;
-  auto new_body = CorePlacementStripper().VisitStmt(func->body_);
-  if (new_body.get() == func->body_.get()) return func;
-  auto stripped = MutableCopy(func);
-  stripped->body_ = new_body;
-  return stripped;
-}
-
 }  // namespace
 
 namespace pass {
@@ -2280,18 +2817,30 @@ Pass ExpandMixedKernel() {
     std::unordered_map<std::string, RewriteInfo> rewrite_map;
     std::vector<FunctionPtr> new_functions;
 
-    for (const auto& [gvar, func] : program->functions_) {
+    for (const auto& [gvar, original_func] : program->functions_) {
+      auto func = original_func;
       if (func->func_type_ != FunctionType::InCore) {
         new_functions.push_back(func);
         continue;
       }
+
+      SplitRegionConsumer consumer;
+      SplitRegionFinder finder;
+      finder.VisitStmt(func->body_);
+      if (finder.found) {
+        auto body = consumer.VisitStmt(func->body_);
+        auto consumed = MutableCopy(func);
+        consumed->body_ = std::move(body);
+        func = consumed;
+      }
+      const auto& placement = consumer.aiv_only_calls;
 
       // Check if function is mixed (recursive analysis detects ops inside loops/conditionals)
       auto stmts = FlattenBody(func->body_);
       auto tpop_defs = CollectTpopDefs(stmts);
       std::unordered_map<const Stmt*, CoreAffinity> stmt_map;
       std::unordered_map<const Var*, CoreAffinity> var_affinity;
-      auto combined = AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs);
+      auto combined = AnalyzeStmtsAffinity(stmts, stmt_map, var_affinity, tpop_defs, placement);
 
       const bool is_deferred_waiter = deferred_waiter_names.count(func->name_) != 0;
 
@@ -2328,7 +2877,8 @@ Pass ExpandMixedKernel() {
       // original function name to resolve to a callable wrapper.
       bool has_group_caller = incore_with_group_caller.count(func->name_) > 0;
       bool needs_preserved_name = incore_with_preserved_name_caller.count(func->name_) > 0;
-      auto expanded = ExpandMixedFunction(func, /*create_group=*/needs_preserved_name || !has_group_caller);
+      auto expanded = ExpandMixedFunction(func, /*create_group=*/needs_preserved_name || !has_group_caller,
+                                          placement, consumer.had_regions);
 
       new_functions.push_back(expanded.aic_func);
       new_functions.push_back(expanded.aiv_func);
@@ -2357,26 +2907,10 @@ Pass ExpandMixedKernel() {
     auto rewritten_program = std::make_shared<Program>(new_functions, program->name_, program->span_);
     new_functions = NormalizeHandWrittenGroupAbis(rewritten_program, new_functions).functions;
 
-    // Phase 5: the region placement stamp is consumed — drop it.
-    //
-    // ``core_placement`` exists solely to carry pl.split_aiv region membership
-    // across the wrapper erasure in LowerAutoVectorSplit, and every reader of
-    // it (ClassifyCallAffinity, via the affinity roll-up above) has now run. It
-    // is stripped rather than left in place because Call::attrs_ is a
-    // reflection UsualField and the python printer serialises attrs open-world:
-    // an un-stripped stamp would show up in every downstream pass dump, in the
-    // print -> parse round-trip, and in every ir.assert_structural_equal a
-    // later pass's tests make — noise that describes a region that no longer
-    // exists. Same lifecycle as ``pipeline_stages`` (set by LowerPipelineLoops,
-    // stripped by CanonicalizeIOOrder).
-    //
-    // The sweep covers EVERY emitted function, not just the split pair: a
-    // region in a function that turned out not to be mixed (converted straight
-    // to AIV, or left alone because it was not InCore) carries the same stamp
-    // and must not keep it either.
-    for (auto& func : new_functions) func = StripCorePlacement(func);
-
-    // Phase 6: give every hand-written V->C push the boundary's fractal layout.
+    // Phase 6: pair MX V->C endpoints by direction and pipe id, then give every
+    // hand-written V->C push its backend boundary layout. Automatic MX pushes
+    // deliberately reach this phase in their logical form so the same paired,
+    // byte-safe carrier planner serves both automatic and hand-written pipes.
     //
     // The sweep covers EVERY emitted AIV function rather than only the ones
     // that were already typed AIV on entry. `tile.tpush_to_aic` declares
@@ -2393,9 +2927,10 @@ Pass ExpandMixedKernel() {
     // meets, rather than as a guard around this loop: a program with no
     // hand-written push must not require a configured backend just to walk past
     // this phase.
+    const MxV2CContracts mx_contracts = BuildMxV2CContracts(new_functions);
     for (auto& func : new_functions) {
       if (func->func_type_ != FunctionType::AIV) continue;
-      AdaptManualVtoCPush adapter;
+      AdaptManualVtoCPush adapter(mx_contracts, BuildTileDefMap(func->body_));
       auto adapted_body = adapter.VisitStmt(func->body_);
       if (adapted_body == func->body_) continue;
       auto adapted = std::make_shared<Function>(*func);

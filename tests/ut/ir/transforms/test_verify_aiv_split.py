@@ -1684,5 +1684,99 @@ def test_dsl_up_down_and_left_right_regions_pass():
     assert _errors(Prog) == []
 
 
+@pytest.mark.parametrize("in_region", [False, True])
+def test_lowered_boundary_accepts_shared_parameter_memory(in_region):
+    """Lowered parameter availability is independent of source memory authoring."""
+    span = ir.Span.unknown()
+    source = ir.Var("source", _tile([32, 128], MS.Vec), span)
+    shard = T.aiv_shard(source, split=1, span=span)
+    half = ir.Var("half", shard.type, span)
+    body = ir.AssignStmt(half, shard, span)
+    if in_region:
+        body = _region(ir.SplitMode.UP_DOWN, [body])
+    func = ir.Function(
+        "kernel", [(source, _IN)], [], body, span, ir.FunctionType.InCore, attrs={"split_aiv": True}
+    )
+    program = ir.Program([func], "lowered_boundary", span)
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AivSplitLoweredValid)
+    assert passes.PropertyVerifierRegistry.verify(props, program) == []
+    assert _errors(program)  # Source boundary scope / operand contract remains strict.
+
+
+def test_lowered_boundary_still_checks_consuming_memory():
+    span = ir.Span.unknown()
+    source = ir.Var("source", _tile([32, 128], MS.Acc), span)
+    shard = ir.Call(ir.get_op("tile.aiv_shard"), [source], {"split": 1}, _tile([16, 128], MS.Acc), span)
+    body = ir.AssignStmt(ir.Var("half", shard.type, span), shard, span)
+    program = _program(body, ir.FunctionType.InCore)
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AivSplitLoweredValid)
+    diagnostics = passes.PropertyVerifierRegistry.verify(props, program)
+    assert any("result is in Acc" in d.message for d in diagnostics)
+    assert all(d.rule_name == "AivSplitLoweredValid" for d in diagnostics)
+
+
+@pytest.mark.parametrize("op_name", ["tile.aiv_shard", "tile.aic_gather"])
+def test_lowered_flat_boundary_requires_explicit_split(op_name):
+    """Missing split metadata must not silently turn into no-split transport."""
+    span = ir.Span.unknown()
+    source_space, result_space = (MS.Acc, MS.Vec) if op_name == "tile.aiv_shard" else (MS.Vec, MS.Mat)
+    source = ir.Var("source", _tile([32, 128], source_space), span)
+    call = ir.Call(ir.get_op(op_name), [source], {}, _tile([32, 128], result_space), span)
+    body = ir.AssignStmt(ir.Var("result", call.type, span), call, span)
+    program = _program(body, ir.FunctionType.InCore)
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AivSplitLoweredValid)
+    diagnostics = passes.PropertyVerifierRegistry.verify(props, program)
+    assert any("requires an explicit split" in d.message for d in diagnostics)
+
+
+@pytest.mark.parametrize("in_region", [False, True])
+@pytest.mark.parametrize("binding", ["assign", "inline", "loop_arg", "loop_result", "if_result"])
+def test_lowered_boundary_checks_locally_defined_operands(in_region, binding):
+    """Only external values bypass the lowered boundary's operand-memory check."""
+    span = ir.Span.unknown()
+    source = ir.Var("source", _tile([32, 128], MS.Vec), span)
+    local = ir.Var("local", source.type, span)
+    stmts = []
+    if binding == "assign":
+        stmts.append(ir.AssignStmt(local, source, span))
+    elif binding == "inline":
+        local = T.add(source, source, span=span)
+    elif binding == "if_result":
+        stmts.append(
+            ir.IfStmt(
+                ir.ConstInt(1, DataType.BOOL, span),
+                ir.YieldStmt([source], span),
+                ir.YieldStmt([source], span),
+                [local],
+                span,
+            )
+        )
+    else:
+        carry = ir.IterArg("carry", source.type, source, span)
+        loop_body: list[ir.Stmt] = [ir.YieldStmt([carry], span)]
+        if binding == "loop_arg":
+            call = T.aiv_shard(carry, split=1, span=span)
+            loop_body.insert(0, ir.AssignStmt(ir.Var("inside", call.type, span), call, span))
+        stmts.append(
+            ir.WhileStmt(
+                ir.ConstInt(1, DataType.BOOL, span), [carry], ir.SeqStmts(loop_body, span), [local], span
+            )
+        )
+    if binding != "loop_arg":
+        call = T.aiv_shard(local, split=1, span=span)
+        stmts.append(ir.AssignStmt(ir.Var("half", call.type, span), call, span))
+    body = _region(ir.SplitMode.UP_DOWN, stmts) if in_region else ir.SeqStmts(stmts, span)
+    func = ir.Function(
+        "kernel", [(source, _IN)], [], body, span, ir.FunctionType.InCore, attrs={"split_aiv": True}
+    )
+    props = passes.IRPropertySet()
+    props.insert(passes.IRProperty.AivSplitLoweredValid)
+    diagnostics = passes.PropertyVerifierRegistry.verify(props, ir.Program([func], "local_operand", span))
+    assert any("operand is in Vec" in d.message for d in diagnostics)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

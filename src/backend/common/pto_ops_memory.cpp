@@ -39,7 +39,6 @@
 #include "pypto/ir/scalar_expr.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/tile_view_semantics.h"
-#include "pypto/ir/transforms/utils/auto_name_utils.h"
 #include "pypto/ir/transforms/utils/tensor_view_semantics.h"
 #include "pypto/ir/type.h"
 #include "src/backend/common/pto_ops_internal.h"
@@ -110,20 +109,12 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   INTERNAL_CHECK_SPAN(!shapes_tuple->elements_.empty(), op->span_)
       << "tile.load shapes tuple must have at least one element";
 
-  // TEMPORARY (pypto #2534): PTOAS has no L2-bypass path yet
-  // (https://github.com/hw-native-sys/PTOAS/issues/1356), so a BYPASS request is
-  // carried through the IR but compiles as an ordinary cached access. When that
-  // issue closes, this warn is REPLACED in place by
-  // `GetOrCreateTensorView(tensor, policy)` against an addptr-rooted view — the
-  // declaration already reaches here, so nothing upstream changes.
+  // The declared GM cache-access policy (pypto #2680). PTOAS >= v0.61 carries a
+  // streaming read as a `cache_policy` attribute on `pto.tload`, which lowers to
+  // pto-isa's own L2 hint (`TLOAD<pto::TLoadL2Hint::NotAllocKeep>`), so there is
+  // no architecture-specific address alias to build here. It is attached below,
+  // alongside the MX layout attribute when both apply.
   const auto policy = static_cast<ir::CachePolicy>(op->GetKwarg<int>("cache", 0));
-  if (policy == ir::CachePolicy::kBypass && codegen.NoteCacheBypassWarned(tensor.get())) {
-    LOG_WARN << "[warning] [CacheBypassUnsupported] tensor '"
-             << ir::auto_name::GetBaseName(tensor->name_hint_)
-             << "' requests CachePolicy.BYPASS, but PTOAS has no L2-bypass path yet "
-             << "(https://github.com/hw-native-sys/PTOAS/issues/1356); compiling as an "
-             << "ordinary cached access" << (op->span_.is_valid() ? " at " + op->span_.to_string() : "");
-  }
 
   std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
   std::string tile_buf = codegen.GetCurrentResultTarget();
@@ -169,8 +160,25 @@ static std::string MakeTileLoadCodegenPTO(const CallPtr& op, codegen::CodegenBas
   std::ostringstream tload_line;
   tload_line << "pto.tload ins(" << partition_view << " : " << partition_type << ") outs(";
   tload_line << tile_buf << " : " << tile_buf_type << ")";
+
+  std::vector<std::string> attrs;
   if (is_mx_load) {
-    tload_line << " {layout = #pto.layout<" << pto_layout << ">}";
+    attrs.push_back("layout = #pto.layout<" + pto_layout + ">");
+  }
+  if (policy == ir::CachePolicy::kBypass) {
+    attrs.emplace_back("cache_policy = #pto.load_cache_policy<l2_bypass>");
+  }
+
+  // Default-valued attributes are omitted so an undeclared load keeps its
+  // byte-identical PTO form. PTOAS expects all present attributes in one dict
+  // (same contract as tile.store below).
+  if (!attrs.empty()) {
+    tload_line << " {";
+    for (size_t i = 0; i < attrs.size(); ++i) {
+      if (i != 0) tload_line << ", ";
+      tload_line << attrs[i];
+    }
+    tload_line << "}";
   }
   codegen.Emit(tload_line.str());
 
@@ -235,6 +243,28 @@ static std::string MakeTileStoreCodegenPTO(const CallPtr& op, codegen::CodegenBa
     partition_view = EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type,
                                           partition_type, GetIndexOffsetCodes(offset_elems, codegen),
                                           GetSizeCodes(shape_elems, codegen), codegen);
+  } else if (tensor_type->tensor_view_.has_value() &&
+             ir::IsMxTensorLayout(tensor_type->tensor_view_->layout)) {
+    // MX scale tiles are logically [M,G] / [G,N], while their GM destination
+    // is the rank-5 SFractal view made explicit by BlockMxScaleTensorViews.
+    // A DMA store addresses that physical box directly. Each source scale
+    // tile must cover complete 16x2 boxes, so its logical valid extents map
+    // one-to-one onto a rank-5 partition with the same byte count.
+    auto height = As<ir::ConstInt>(valid_shape[0]);
+    auto width = As<ir::ConstInt>(valid_shape[1]);
+    INTERNAL_CHECK_SPAN(height && width && height->value_ > 0 && width->value_ > 0, op->span_)
+        << "MX tile.store requires static positive scale-tile valid dimensions";
+    const bool is_a = tensor_type->tensor_view_->layout == ir::TensorLayout::MX_A_ZZ;
+    const int64_t row_extent = is_a ? height->value_ : width->value_;
+    const int64_t group_extent = is_a ? width->value_ : height->value_;
+    INTERNAL_CHECK_SPAN(row_extent % 16 == 0 && group_extent % 2 == 0, op->span_)
+        << "MX tile.store requires complete 16x2 scale boxes";
+    const std::vector<std::string> physical_shape = {"1", std::to_string(row_extent / 16),
+                                                     std::to_string(group_extent / 2), "16", "2"};
+    partition_type = MakePartitionTensorViewType(physical_shape, dtype_str);
+    partition_view =
+        EmitPartitionViewPTO(output_tensor->name_hint_, tensor_view, tensor_view_type, partition_type,
+                             GetIndexOffsetCodes(offsets_tuple->elements_, codegen), physical_shape, codegen);
   } else {
     // Standard 1D/2D path
     std::string height_dim = "?", width_dim = "?";

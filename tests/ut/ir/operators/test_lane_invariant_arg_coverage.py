@@ -113,27 +113,25 @@ EXPECTED_BLIND_ARGS = {
     ("tile.gather", 0),
     ("tile.gatherb", 0),
     # --- undeclared: per-lane data, so the pass requires it to be sharded ---
-    # (tile.col_argmax / col_argmin arg 1 used to sit here; gh#2615 gave their
-    # deducer the row forms' exact-shape check, so type consistency decides them
-    # now and no declaration is reachable for either.)
-    ("tile.col_expand", 1),
-    ("tile.col_expand_add", 1),
-    ("tile.col_expand_div", 1),
-    ("tile.col_expand_expdif", 1),
-    ("tile.col_expand_max", 1),
-    ("tile.col_expand_min", 1),
-    ("tile.col_expand_mul", 1),
-    ("tile.col_expand_sub", 1),
+    # Positions leave this set as their operator's own deducer learns to read them,
+    # which is the intended direction of travel (gh#2612): every one removed is a
+    # position the type-consistency gate decides instead of a heuristic.
+    #   tile.col_argmax / col_argmin arg 1  -- gh#2615, the row forms' exact-shape tmp check
+    #   tile.col_expand* arg 1              -- gh#2612, the documented [1, cols] contract
+    #   tile.sort32 arg 1                   -- gh#2612, idx is shaped like src
+    #   tile.scatter_update args 1-2        -- gh#2612, the documented index/src relation
+    #
+    # What is left is not a backlog. `sel` / `sels` masks have a target-defined layout no
+    # shape rule can express; `gather_compare`'s src cols do not reach its result at all;
+    # and `mrgsort_format2`'s sources are real per-lane sorted runs whose only relation is
+    # to the workspace the deducer already reads.
     ("tile.gather_compare", 0),
     ("tile.mrgsort_format2", 0),
     ("tile.mrgsort_format2", 1),
     ("tile.mrgsort_format2", 2),
     ("tile.mrgsort_format2", 3),
-    ("tile.scatter_update", 1),
-    ("tile.scatter_update", 2),
     ("tile.sel", 0),
     ("tile.sels", 0),
-    ("tile.sort32", 1),
 }
 
 

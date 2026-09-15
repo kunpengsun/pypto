@@ -27,7 +27,7 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 12 | `12-optimize_orch_tensors.md` | 12th pass |
 | 13 | `13-lower_composite_ops.md` | 13th pass (first tile_pto pass) |
 | 14 | `14-flatten_tile_nd_to_2d.md` | 14th pass |
-| 15 | `15-block_nz_tensor_views.md` | Rewrites a logical `pl.NZ` tensor into pto-isa's blocked rank-(r+2) shape `[..., C/c0, R/16, 16, c0]` and retargets its `tile.load` coordinates, keeping the destination tile logical 2D. Runs immediately after `FlattenTileNdTo2D` (which skips its ND2NZ window collapse for NZ sources) and before `MaterializeTensorStrides`, whose plain row-major rule then yields pto-isa's NZ strides |
+| 15 | `15-block_nz_tensor_views.md` | Rewrites a logical `pl.NZ` tensor into pto-isa's blocked rank-5 shape `[B, C/c0, R/16, 16, c0]` (batch materialised as 1 for a logical rank-2 tensor; logical rank 4+ rejected) and retargets its `tile.load` coordinates, keeping the destination tile logical 2D. Runs immediately after `FlattenTileNdTo2D` (which skips its ND2NZ window collapse for NZ sources) and before `MaterializeTensorStrides`, whose plain row-major rule then yields pto-isa's NZ strides |
 | 16 | `16-block_mx_scale_tensor_views.md` | Physicalizes logical MX scale tensor views into A5's packed rank-5 SFractal form and retargets their `tile.load` coordinates; runs independently after `BlockNzTensorViews` and before `LegalizeTileCast` |
 | 17 | `17-legalize_tile_cast.md` | Expands `tile.cast` pairs the target ISA cannot emit as one `pto.tcvt` into the shortest chain of native casts (A5 `INT32->FP16` becomes `INT32->FP32->FP16`); runs between `BlockMxScaleTensorViews` and `AutoTileMatmulL0` |
 | 18 | `18-auto_tile_matmul_l0.md` | 18th pass |
@@ -35,8 +35,8 @@ Developers read pass docs sequentially to understand the compilation pipeline. I
 | 20 | `20-infer_tile_memory_space.md` | 20th pass |
 | 21 | `21-insert_mx_scale_addr.md` | Inserts `tile.tget_scale_addr` before MX matmul consumers after InferTileMemorySpace resolves their memory spaces |
 | 22 | `22-resolve_backend_op_layouts.md` | 22nd pass |
-| 23 | `23-lower_auto_vector_split.md` | Live auto-split lowering path; converts AUTO `pl.split` mixed InCore functions into the explicit `split_aiv` form (aiv_shard/aic_gather + halved vector sub-region). ALSO the sole consumer of the first-class `SplitAivScopeStmt` region node (`pl.split_aiv`, nestable/multi-mode): lowers each region in place (region-scoped halving; explicit-boundary bodies passed through unchanged) and erases the scope wrapper. Runs immediately before `ExpandMixedKernel` |
-| 24 | `24-expand_mixed_kernel.md` | 24th pass (no `SplitAivScopeStmt` survives to here; its single-func-mode transpose check is skipped for functions stamped `split_aiv_region_validated` by pass 23) |
+| 23 | `23-lower_auto_vector_split.md` | Lowers each `SplitAivScopeStmt` body and retains its wrapper; synthesizes regions for eligible AUTO phases and produces `AivSplitLoweredValid` |
+| 24 | `24-expand_mixed_kernel.md` | Consumes the retained/synthesized region wrappers, validates transpose hazards per region mode, and uses pass-local placement for lane assignment |
 | 25 | `25-inject_gm_pipe_buffer.md` | Runs immediately after `ExpandMixedKernel` (backend-gated, Ascend910B) |
 | 26 | `26-split_vector_kernel.md` | 26th pass (after the convergence refactor: only stamps attrs for split_aiv functions + handles the no-split dual-AIV path; the per-op halving driver was deleted — moved to LowerAutoVectorSplit + split_axis_utils. Single-func-mode assertion relaxed for multi-mode `split_aiv` functions: stamps the mode-agnostic `dual_aiv_dispatch` and trusts the per-op `split` ints from pass 23) |
 | 27 | `27-stamp_tfree_split.md` | 27th pass (copies each cross-core tpop's split/pipe-id onto its matching tfree op; runs right after SplitVectorKernel finalizes split, before SkewCrossCorePipeline clones tpop/tfree pairs) |

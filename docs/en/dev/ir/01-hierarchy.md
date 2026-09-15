@@ -208,7 +208,7 @@ field from the `Stmt` base class. See [Leading comments on statements](#leading-
 | **ClusterScopeStmt** | `name_hint_`, `body_` | Cluster region; outlined to `Function(Group)` |
 | **HierarchyScopeStmt** | `name_hint_`, `body_`, `level_`, `role_` (optional) | Pipeline-stage region for a given Level/Role |
 | **SpmdScopeStmt** | `name_hint_`, `body_`, `core_num_` (integer-typed `Expr`), `sync_start_` | SPMD launch region; outlined to `Function(Spmd)` |
-| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; consumed and erased by `LowerAutoVectorSplit` (pass 23) |
+| **SplitAivScopeStmt** | `name_hint_`, `body_`, `split_` (`SplitMode`, never `None`), `count_` (= 2) | Explicit AIV-split region (`pl.split_aiv`); nestable; lowered by `LowerAutoVectorSplit`, consumed by `ExpandMixedKernel` |
 | **GraphScopeStmt** | `name_hint_`, `body_` | Recordable orchestration region (`pl.graph`); `name_hint_` is required — it names the function `OutlineGraphScopes` outlines it into, and hence the runtime's graph key |
 | **RuntimeScopeStmt** | `name_hint_`, `body_`, `manual_` | Orchestrator runtime region (`SIMPLER_SCOPE`); `manual_=true` selects manual dependency mode |
 | **YieldStmt** | `values_` | Yield values in loop iteration |
@@ -376,8 +376,9 @@ runtime = ir.RuntimeScopeStmt(manual=True, name_hint="", body=body, span=span)
     scope form and `@pl.jit.graph` converge before any later pass sees them
   - `SplitAivScopeStmt` is **non-outlined**: it is transparent to SSA and to the
     outliners (it survives inside an outlined `Function(InCore)` body), then is
-    consumed and **erased** by `LowerAutoVectorSplit` (pass 23). It never reaches
-    `ExpandMixedKernel` (pass 24) or codegen — those see only the per-op
+    lowered in place by `LowerAutoVectorSplit` (pass 23), which retains the
+    wrapper. `ExpandMixedKernel` (pass 24) consumes and **erases** it; subsequent
+    passes and codegen see only the per-op
     `aiv_shard` / `aic_gather` / `tpush` / `tpop` markers. A PTO codegen guard
     fails loudly if a `SplitAivScopeStmt` ever survives that far.
   - `SplitAivScopeStmt` is **nestable**: built via the generic
