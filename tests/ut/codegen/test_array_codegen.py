@@ -15,12 +15,16 @@ update_element correctly aliases the LHS to the input array so in-place
 mutations land on the same backing storage.
 """
 
+import re
+
 import pypto.language as pl
 import pytest
 from _orchestration_codegen_common import _finalize_handbuilt_for_codegen
 from _pto_loc_common import strip_loc
 from pypto import codegen, passes
+from pypto.jit.decorator import jit
 from pypto.pypto_core import DataType, ir
+from pypto.runtime import RunConfig
 
 
 def _generate_orch(src: str) -> str:
@@ -912,6 +916,287 @@ def test_orch_task_id_array_store_under_runtime_predicate():
     assert "tids[g] = " in code, code
     # ...and the consumer's dependency reads a slot of that same array.
     assert "tids[g2]" in code, code
+
+
+def _assert_same_cpp_block(code: str, decl_line: str, use_line: str) -> None:
+    """Assert ``use_line`` is still inside the C++ block that ``decl_line`` opens in.
+
+    A ``SIMPLER_SCOPE`` expands to a real braced block, so a local declared
+    inside one is out of scope after its closing brace. Walk the brace depth
+    between the two lines: it must never drop below the declaration's level.
+    """
+    lines = code.splitlines()
+    decl_idx = next((i for i, ln in enumerate(lines) if decl_line in ln), None)
+    use_idx = next((i for i, ln in enumerate(lines) if use_line in ln), None)
+    assert decl_idx is not None, f"declaration {decl_line!r} not emitted:\n{code}"
+    assert use_idx is not None, f"use {use_line!r} not emitted:\n{code}"
+    assert decl_idx < use_idx, f"{use_line!r} precedes its declaration:\n{code}"
+
+    depth = 0
+    for ln in lines[decl_idx + 1 : use_idx + 1]:
+        depth += ln.count("{") - ln.count("}")
+        assert depth >= 0, f"{use_line!r} is emitted after the block declaring {decl_line!r} closed:\n{code}"
+
+
+def test_orch_task_id_array_store_from_nested_scope():
+    """A TaskId published from a nested ``pl.scope()`` reaches the outer array.
+
+    The producer sits one runtime scope below the ``pl.array.create`` — the
+    shape a kernel gets when it opens a ``pl.scope()`` to bound a scratch
+    tensor's lifetime. The slot write is emitted where the TaskId is live, and
+    the enclosing loop's array carry must survive the scope's closing brace so
+    the yield still recognises it as an array (previously it fell through to
+    the scalar-yield path and aborted with "scalar yield to array carry must
+    resolve to a TaskId variable registered in manual_task_id_map_").
+    """
+
+    rows, cols, tile_r = 64, 16, 16
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self,
+            x: pl.Tensor[[rows, cols], pl.FP32],
+            out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+        ) -> pl.Tensor[[rows, cols], pl.FP32]:
+            with pl.scope():
+                tids = pl.array.create(4, pl.TASK_ID)
+                for g in pl.parallel(4):
+                    row: pl.Scalar[pl.INDEX] = g * tile_r
+                    with pl.scope():
+                        scratch: pl.Tensor[[tile_r, cols], pl.FP32] = pl.create_tensor(
+                            [tile_r, cols], dtype=pl.FP32
+                        )
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prod") as tid:
+                            t: pl.Tile[[tile_r, cols], pl.FP32] = pl.load(x, [row, 0], [tile_r, cols])
+                            scratch = pl.store(pl.add(t, t), [0, 0], scratch)
+                        tids[g] = tid
+                for g2 in pl.parallel(4):
+                    row2: pl.Scalar[pl.INDEX] = g2 * tile_r
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cons", deps=[tids[g2]]):
+                        t2: pl.Tile[[tile_r, cols], pl.FP32] = pl.load(x, [row2, 0], [tile_r, cols])
+                        out = pl.store(pl.add(t2, t2), [row2, 0], out)
+            return out
+
+    code = _compile_orch(Prog)
+
+    decls = [ln for ln in code.splitlines() if "TaskId tids[4]" in ln]
+    assert len(decls) == 1, code
+    # The publish is emitted inside the nested scope, where the producer TaskId
+    # local is still declared — not after its closing brace.
+    producer = re.search(r"TaskId\s+(\w+)\s*=\s*task_\d+_outs\.task_id\(\);", code)
+    assert producer, code
+    _assert_same_cpp_block(code, f"TaskId {producer.group(1)} =", f"tids[g] = {producer.group(1)};")
+    # The consumer still reads a slot of the same backing array.
+    assert "tids[g2]" in code, code
+
+
+def test_orch_task_id_array_store_after_nested_scope_closed_is_rejected():
+    """Publishing a TaskId after its ``pl.scope()`` closed is a user error.
+
+    The slot write would name a C++ local that died at the scope's closing
+    brace. Codegen used to accept it and emit orchestration the host compiler
+    rejects with ``'<tid>' was not declared in this scope`` — a failure
+    ``--compile-only`` never reaches. Diagnose it here instead, pointing at the
+    fix (see ``test_orch_task_id_array_store_from_nested_scope``).
+    """
+
+    rows, cols, tile_r = 64, 16, 16
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+        def main(
+            self,
+            x: pl.Tensor[[rows, cols], pl.FP32],
+            out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+        ) -> pl.Tensor[[rows, cols], pl.FP32]:
+            with pl.scope():
+                tids = pl.array.create(4, pl.TASK_ID)
+                for g in pl.parallel(4):
+                    row: pl.Scalar[pl.INDEX] = g * tile_r
+                    with pl.scope():
+                        scratch: pl.Tensor[[tile_r, cols], pl.FP32] = pl.create_tensor(
+                            [tile_r, cols], dtype=pl.FP32
+                        )
+                        with pl.at(level=pl.Level.CORE_GROUP, name_hint="prod") as tid:
+                            t: pl.Tile[[tile_r, cols], pl.FP32] = pl.load(x, [row, 0], [tile_r, cols])
+                            scratch = pl.store(pl.add(t, t), [0, 0], scratch)
+                    tids[g] = tid
+                for g2 in pl.parallel(4):
+                    row2: pl.Scalar[pl.INDEX] = g2 * tile_r
+                    with pl.at(level=pl.Level.CORE_GROUP, name_hint="cons", deps=[tids[g2]]):
+                        t2: pl.Tile[[tile_r, cols], pl.FP32] = pl.load(x, [row2, 0], [tile_r, cols])
+                        out = pl.store(pl.add(t2, t2), [row2, 0], out)
+            return out
+
+    with pytest.raises(ValueError) as excinfo:
+        _compile_orch(Prog)
+
+    msg = str(excinfo.value)
+    assert "tid" in msg, msg
+    assert "after the `pl.scope()` that produced it has closed" in msg, msg
+    assert "Move the store inside that `pl.scope()`" in msg, msg
+
+
+def test_orch_task_id_phi_from_if_is_publishable_to_array():
+    """A TaskId merged by an ``if`` stays live after the branches close.
+
+    The phi is declared *outside* the branches and each arm's yield assigns
+    into it, so publishing it into a ``pl.array`` afterwards names a live C++
+    local — unlike a producer id left behind in a closed scope. Codegen must
+    seed the phi with the sentinel and register it, so the publish resolves
+    instead of tripping the closed-scope diagnostic.
+    """
+
+    rows, cols, tile_r = 128, 16, 16
+
+    @pl.program
+    class Prog:
+        @pl.function(type=pl.FunctionType.InCore)
+        def stripe(
+            self,
+            data: pl.Tensor[[rows, cols], pl.FP32],
+            row_offset: pl.Scalar[pl.INDEX],
+            out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+        ) -> pl.Tensor[[rows, cols], pl.FP32]:
+            t: pl.Tile[[tile_r, cols], pl.FP32] = pl.load(data, [row_offset, 0], [tile_r, cols])
+            return pl.store(pl.add(t, 1.0), [row_offset, 0], out)
+
+        @pl.function(type=pl.FunctionType.Orchestration)
+        def main(
+            self,
+            data: pl.Tensor[[rows, cols], pl.FP32],
+            out: pl.Out[pl.Tensor[[rows, cols], pl.FP32]],
+        ) -> pl.Tensor[[rows, cols], pl.FP32]:
+            with pl.manual_scope():
+                tids = pl.array.create(4, pl.TASK_ID)
+                for branch in pl.parallel(4):
+                    row: pl.Scalar[pl.INDEX] = branch * tile_r
+                    if branch >= 2:
+                        out, tid = pl.submit(self.stripe, data, row, out)
+                    else:
+                        out, tid = pl.submit(self.stripe, data, row, out, deps=[tids])
+                    tids[branch] = tid
+            return out
+
+    code = _compile_orch(Prog)
+
+    # The phi is seeded with the sentinel at the enclosing level, so an arm that
+    # leaves it unassigned yields an invalid id rather than reading garbage.
+    phi = re.search(r"TaskId\s+(\w*tid\w*)\s*=\s*TaskId::invalid\(\);", code)
+    assert phi, code
+    # ...and the publish after the branches close resolves to that same local.
+    assert f"tids[branch] = {phi.group(1)};" in code or f"tids[branch] = {phi.group(1)}" in code, code
+
+
+@pytest.mark.parametrize(
+    "control_flow",
+    ["for i in pl.range(2)", "for i in pl.parallel(2)", "if flag > 0"],
+    ids=["sequential", "parallel", "if_phi"],
+)
+def test_orch_task_id_yield_after_nested_scope_closed_is_rejected(control_flow):
+    """A live carry cannot be assigned a producer local from a closed scope."""
+    prog = pl.parse_program(f"""
+@pl.program
+class P:
+    @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+    def main(
+        self, x: pl.Tensor[[64], pl.FP32], flag: pl.Scalar[pl.INT64]
+    ) -> pl.Tensor[[64], pl.FP32]:
+        tids = pl.array.create(1, pl.TASK_ID)
+        dep = pl.system.task_invalid()
+        {control_flow}:
+            with pl.scope():
+                dep = pl.system.task_dummy(deps=[])
+            # Keep the implicit yield outside the producer's scope.
+            _fence = pl.system.task_dummy(deps=[])
+        tids[0] = dep
+        return x
+""")
+
+    with pytest.raises(ValueError, match="is yielded after") as excinfo:
+        _compile_orch(prog)
+
+    msg = str(excinfo.value)
+    assert "dep" in msg, msg
+    assert "after the `pl.scope()` that produced it has closed" in msg, msg
+    assert "array declared outside" in msg, msg
+    assert "Internal error" not in msg, msg
+
+
+def test_orch_branch_yield_of_task_id_parameter_is_accepted():
+    """A ``pl.Scalar[TASK_ID]`` function parameter stays live across branch yields.
+
+    Parameters are seeded into ``emit_name_map_`` at codegen construction but are
+    not producer locals of a nested ``pl.scope()``. Yielding one into an ``if``
+    phi must not trip ``FindClosedScopeTaskId`` — the parameter is valid for the
+    whole function body.
+    """
+    prog = pl.parse_program("""
+@pl.program
+class P:
+    @pl.function(type=pl.FunctionType.Orchestration, auto_scope=False)
+    def main(
+        self,
+        x: pl.Tensor[[64], pl.FP32],
+        seed: pl.Scalar[pl.TASK_ID],
+        flag: pl.Scalar[pl.INT64],
+    ) -> pl.Tensor[[64], pl.FP32]:
+        dep = seed
+        if flag > 0:
+            dep = seed
+        else:
+            dep = seed
+        _ = pl.system.task_dummy(deps=[dep])
+        return x
+""")
+
+    code = _compile_orch(prog)
+    # Both arms yield the parameter into the phi; the dep edge must name that
+    # live id (parameter or phi), never raise the closed-scope diagnostic.
+    assert "TaskId::invalid()" in code, code
+    assert "task_dummy" in code or "set_dependencies" in code, code
+
+
+def test_orch_loop_carried_task_id_republished_via_inline_callee():
+    """Loop-carried TaskId returned from an inlined callee may re-enter a slot.
+
+    Regression for issue #2677: a TaskId produced inside a nested ``pl.scope()``,
+    returned from ``@pl.jit.inline``, and carried across a caller ``pl.range``
+    must stay nameable when the next iteration stores it into a ``pl.array`` at
+    the callee entry. The closed-scope diagnostic must not false-positive on
+    that legal carry — two iterations are the minimum that crosses a closed
+    scope.
+    """
+    torch = pytest.importorskip("torch")
+
+    rows, cols = 16, 128
+
+    @jit.inline(auto_scope=False)
+    def stage(out: pl.Tensor[[rows, cols], pl.FP32], incoming: pl.Scalar[pl.TASK_ID]):
+        carry = pl.array.create(1, pl.TASK_ID)
+        carry[0] = incoming
+        with pl.scope():
+            with pl.spmd(rows, name_hint="stage_body", deps=[carry[0]]) as body_tid:
+                row = pl.tile.get_block_idx()
+                out[row : row + 1, 0:cols] = pl.full([1, cols], dtype=pl.FP32, value=1.0)
+            carry[0] = body_tid
+        return carry[0]
+
+    # Entry must also be auto_scope=False: after InlineFunctions splices the
+    # callee, the hand-placed ``pl.scope()`` lives in the orchestration body.
+    @jit(auto_scope=False)
+    def prog(out: pl.Tensor[[rows, cols], pl.FP32]):
+        dep = pl.system.task_dummy(deps=[])
+        for _ in pl.range(2):
+            dep = stage(out, dep)
+        return out
+
+    # Compile-only: the bug fires in orchestration codegen before any runtime.
+    out = torch.empty(rows, cols, dtype=torch.float32)
+    prog.compile(out, config=RunConfig(platform="a2a3sim"))
 
 
 if __name__ == "__main__":

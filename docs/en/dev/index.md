@@ -38,4 +38,4 @@ PyPTO programs, start with the [User Manual](../user/index.md).
 ## See Also
 
 - [PTO ISA reference](../reference/index.md) — the hardware model the backend targets.
-- [Runtime documentation](https://hw-native-sys.github.io/simpler/) — the scheduler that executes compiled programs.
+- [Runtime documentation](https://www.pypto.ai/simpler/) — the scheduler that executes compiled programs.

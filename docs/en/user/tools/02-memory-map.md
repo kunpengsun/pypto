@@ -32,7 +32,7 @@ print(compiled.output_dir)
 Then point the tool at that directory:
 
 ```bash
-OUT=build_output/<program>_<timestamp>          # what the line above printed
+OUT=build_output/<program>_<unique>             # what the line above printed
 python -m pypto.tools.memory_map "$OUT/passes_dump/NN_after_SomePass.py" -o map.html
 ```
 
@@ -86,4 +86,4 @@ instead, and see [Memory](../performance/05-memory.md).
 - [Memory](../performance/05-memory.md) — the runtime-side rings, and the on-chip budget this tool draws.
 - [Tuning the InCore function](../performance/04-incore.md) — what consumes that budget.
 - [Debugging](00-debugging.md) — the other reader of pass dumps.
-- [AllocateMemoryAddr](../../dev/passes/35-allocate_memory_addr.md) — the pass whose output this is.
+- [AllocateMemoryAddr](../../dev/passes/37-allocate_memory_addr.md) — the pass whose output this is.

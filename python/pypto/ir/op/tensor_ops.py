@@ -30,9 +30,11 @@ from ..utils import (
     _get_span_or_capture,
     _normalize_expr,
     _normalize_scalar_operand,
+    _normalize_signless_same_width_scalar_operand,
     _to_int32_scalar,
     _to_make_tuple,
     resolve_cast_mode,
+    resolve_saturation_deviation,
 )
 from ._pad_value import normalize_pad_value
 from .tile_ops import resolve_gather_compare_cmp_mode
@@ -487,6 +489,71 @@ def matmul(
     return _ir_core.create_op_call("tensor.matmul", args, kwargs, actual_span)
 
 
+def quant_mx(
+    src: Expr,
+    *,
+    group_axis: int,
+    dtype: DataType = DataType.FP8E4M3FN,
+    span: Span | None = None,
+) -> Call:
+    """Quantize a 2D GM tensor into MXFP8 data and an MX scale tensor.
+
+    Args:
+        src: Source tensor expression. Must be a static-rank 2D FP16, BF16, or
+            FP32 tensor.
+        group_axis: Quantization group axis. ``1`` produces A-oriented data
+            and an ``MX_A_ZZ`` scale tensor; ``0`` produces B-oriented data
+            and an ``MX_B_NN`` scale tensor.
+        dtype: Quantized data dtype. Defaults to ``FP8E4M3FN``.
+        span: Optional source span for debugging (auto-captured if not provided).
+
+    Returns:
+        Call expression whose result is ``(quantized_data, scale)``.
+
+    Raises:
+        ValueError: If ``src`` is not a supported 2D floating tensor, K is not
+            statically divisible by 64, M is not divisible by 16 for
+            ``group_axis=1``, N is not divisible by 32 for ``group_axis=0``,
+            ``group_axis`` is not supported, or ``dtype`` is not a supported MX
+            data dtype.
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call(
+        "tensor.quant_mx", [src], {"group_axis": group_axis, "dtype": dtype}, actual_span
+    )
+
+
+def matmul_mx(
+    lhs: Expr,
+    lhs_scale: Expr,
+    rhs: Expr,
+    rhs_scale: Expr,
+    span: Span | None = None,
+) -> Call:
+    """MXFP8 matrix multiplication of oriented GM data and scale tensors.
+
+    Args:
+        lhs: A-side quantized data tensor with shape ``[M, K]``.
+        lhs_scale: A-side ``MX_A_ZZ`` FP8E8M0 scale tensor with shape
+            ``[M, K/32]``.
+        rhs: B-side quantized data tensor with shape ``[K, N]``.
+        rhs_scale: B-side ``MX_B_NN`` FP8E8M0 scale tensor with shape
+            ``[K/32, N]``.
+        span: Optional source span for debugging (auto-captured if not provided).
+
+    Returns:
+        Call expression for the FP32 ``[M, N]`` result tensor.
+
+    Raises:
+        ValueError: If data tensors are not static 2D MX data tensors, the inner
+            dimensions do not agree, M is not divisible by 16, N is not
+            divisible by 32, K is not divisible by 64, or either scale tensor
+            has the wrong dtype, shape, or MX layout.
+    """
+    actual_span = _get_span_or_capture(span)
+    return _ir_core.create_op_call("tensor.matmul_mx", [lhs, lhs_scale, rhs, rhs_scale], {}, actual_span)
+
+
 def matmul_acc(
     acc: Expr,
     lhs: Expr,
@@ -820,7 +887,10 @@ def _bitwise_dispatch(
         Call expression for the selected operator
     """
     actual_span = _get_span_or_capture(span)
-    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    if scalar_op in {"tensor.ands", "tensor.ors", "tensor.xors"}:
+        rhs_expr = _normalize_signless_same_width_scalar_operand(lhs, rhs, actual_span)
+    else:
+        rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     chosen = scalar_op if isinstance(rhs_expr.type, ScalarType) else tensor_op
     return _ir_core.create_op_call(chosen, [lhs, rhs_expr], {}, actual_span)
 
@@ -828,7 +898,10 @@ def _bitwise_dispatch(
 def _bitwise_scalar(op_name: str, lhs: Expr, rhs: int | Expr, span: Span | None) -> Call:
     """Build a tensor-scalar bitwise/shift call (the explicit ``*s`` entry points)."""
     actual_span = _get_span_or_capture(span)
-    rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
+    if op_name in {"tensor.ands", "tensor.ors", "tensor.xors"}:
+        rhs_expr = _normalize_signless_same_width_scalar_operand(lhs, rhs, actual_span)
+    else:
+        rhs_expr = _normalize_scalar_operand(lhs, rhs, actual_span)
     return _ir_core.create_op_call(op_name, [lhs, rhs_expr], {}, actual_span)
 
 
@@ -854,7 +927,7 @@ def ands(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
 
     Args:
         lhs: Left-hand side tensor (integer dtype)
-        rhs: Right-hand side integer scalar (int/Expr with integer ScalarType)
+        rhs: Same-width signless integer scalar (int/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -885,7 +958,7 @@ def ors(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
 
     Args:
         lhs: Left-hand side tensor (integer dtype)
-        rhs: Right-hand side integer scalar (int/Expr with integer ScalarType)
+        rhs: Same-width signless integer scalar (int/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -919,7 +992,7 @@ def xors(lhs: Expr, rhs: int | Expr, span: Span | None = None) -> Call:
 
     Args:
         lhs: Left-hand side tensor (integer dtype)
-        rhs: Right-hand side integer scalar (int/Expr with integer ScalarType)
+        rhs: Same-width signless integer scalar (int/Expr)
         span: Optional source span for debugging (auto-captured if not provided)
 
     Returns:
@@ -1712,6 +1785,8 @@ def cast(
     target_type: int | DataType,
     mode: str | int = "round",
     span: Span | None = None,
+    *,
+    saturation_mode: str | int | None = None,
 ) -> Call:
     """Type casting operation.
 
@@ -1721,6 +1796,12 @@ def cast(
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
         span: Optional source span for debugging (auto-captured if not provided)
+        saturation_mode: Destination saturation — "on" (1) clamps out-of-range
+              results to the destination range, "off" (0) selects the target's
+              non-saturating conversion. ``None`` takes the destination's
+              own default — ``DEFAULT_SATURATION_MODE`` ("on") for an integer
+              destination, the target's own behavior for a float one. Only a
+              deviation from that default is recorded on the call.
 
     Returns:
         Call expression for type casting
@@ -1734,6 +1815,9 @@ def cast(
         "target_type": target_type,
         "mode": mode_val,
     }
+    deviation = resolve_saturation_deviation(saturation_mode, target_type)
+    if deviation is not None:
+        kwargs["saturation_mode"] = deviation
 
     return _ir_core.create_op_call("tensor.cast", args, kwargs, actual_span)
 
@@ -2176,7 +2260,7 @@ def mrgsort_format2(*args: Expr, exhausted: bool = False, span: Span | None = No
 
 def gather(  # noqa: PLR0913
     input: Expr,
-    dim: int | None = None,
+    dim: int | Expr | None = None,
     index: Expr | None = None,
     *,
     mask_pattern: int | None = None,
@@ -2188,19 +2272,37 @@ def gather(  # noqa: PLR0913
     count_dtype: int | DataType | None = None,
     span: Span | None = None,
 ) -> Call:
-    """Gather elements of ``input`` (tensor-level) — index / mask / compare form.
+    """Gather elements of ``input`` — flat / axis / mask / compare form.
 
     The tensor layer keeps a single unified ``gather`` entry point. Based on
     the arguments, it lowers to one of three C++ ops:
 
-    Index form (``dim`` + ``index``) → ``tensor.gather``::
+    Flat form (``index``, no ``dim``) → ``tensor.gather``::
+
+        output = input.reshape(-1)[index]
+
+        Also accepts ``gather(input, index)``. Runtime indices are 2D INT32;
+        shape and valid shape follow ``index``, dtype follows ``input``
+        (FP16/FP32/INT16/INT32). Indices must address valid source elements;
+        negative indexing and bounds checking are unsupported.
+        Contiguous ND GM sources use ``tile.mgather``; static 2D unboxed
+        row-major Vec sources use ``tile.gather`` with managed packing/scratch.
+        On-chip source rows must be 32-byte aligned unless there is only one row.
+        GM operands accept local distributed windows; tile indices must be
+        unboxed row-major Vec. Physical index columns must be positive static
+        multiples of 16 for FP16/INT16, or 8 for FP32/INT32, including single-row
+        tiles. Pad physical storage and use ``set_validshape`` for narrower
+        valid regions, which need not be aligned.
+
+    Axis form (``dim`` + ``index``) → ``tensor.gather``, for example ``dim=1``::
 
         output[b, k] = input[b, index[b, k]]
 
-        MVP limitation: only rank-2 inputs with ``dim == -1`` (or ``rank - 1``).
+        Lowering supports rank-2/rank-3 inputs and any axis, including negative axes.
         ``index`` must be an INT32 tensor, or INT16 when ``input`` is a 16-bit
-        dtype (FP16/INT16); its shape matches ``input`` on every axis except
-        ``dim``. output shape == ``index.shape``, dtype == ``input.dtype``.
+        dtype (FP16/INT16; INT16 indices require A5). Its rank matches ``input``;
+        non-gather extents cannot exceed the source. Output shape == ``index.shape``,
+        dtype == ``input.dtype``.
 
     Mask form (``mask_pattern=<int>``) → ``tensor.gather_mask``: selects columns
         of each row by a fixed hardware mask. Last-dim shrinks by 2 (P0101/P1010)
@@ -2214,9 +2316,11 @@ def gather(  # noqa: PLR0913
         count_dtype`` (per-row match count).
 
     Args:
-        input: Source tensor (TensorType).
-        dim: (index form) Axis along which to gather. Only ``-1`` / ``rank - 1`` accepted in MVP.
-        index: (index form) Index tensor (TensorType, INT32) with the same rank as ``input``.
+        input: Source tensor; flat form also accepts an on-chip Tile.
+        dim: Axis along which to gather; omit for flat indexing. A tensor/tile
+            in this positional slot is interpreted as the flat index.
+        index: Flat form: 2D INT32 tensor/tile. Axis form: tensor with the same
+            rank as ``input`` and the index dtype constraints above.
         mask_pattern: (mask form, keyword-only) Mask pattern selector in [1, 7].
             1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111
         output_dtype: (mask form, keyword-only) Optional output dtype with the same
@@ -2235,6 +2339,10 @@ def gather(  # noqa: PLR0913
         Compare form returns a TupleType-result Call.
     """
     actual_span = _get_span_or_capture(span)
+    if isinstance(dim, Expr) and isinstance(dim.type, (_ir_core.TensorType, _ir_core.TileType)):
+        if index is not None:
+            raise ValueError("gather() received indices both positionally and through index")
+        index, dim = dim, None
     is_index = dim is not None or index is not None
     is_mask = mask_pattern is not None
     is_compare = kvalue is not None or cmp_mode is not None or out_cols is not None
@@ -2267,21 +2375,18 @@ def gather(  # noqa: PLR0913
         if count_dtype is not None:
             cmp_kwargs["count_dtype"] = count_dtype
         return _ir_core.create_op_call("tensor.gather_compare", [input, kvalue], cmp_kwargs, actual_span)
-    if not is_index:
+    if index is None:
         raise ValueError(
-            "gather() requires (dim, index) for index form, mask_pattern=<int> for mask form, "
+            "gather() requires index (optionally dim), mask_pattern=<int> for mask form, "
             "or (kvalue=..., cmp_mode=..., out_cols=...) for compare form"
         )
-    if dim is None or index is None:
-        raise ValueError("gather() index form requires both dim and index")
     if output_dtype is not None:
         raise ValueError("gather() output_dtype is only valid for the mask form; use mask_pattern=<int>")
-    if isinstance(dim, _ir_core.ConstInt):
-        dim_val = int(dim.value)
-    elif isinstance(dim, int):
-        dim_val = dim
-    else:
+    if dim is None:
+        return _ir_core.create_op_call("tensor.gather", [input, index], {}, actual_span)
+    if not isinstance(dim, (int, _ir_core.ConstInt)):
         raise TypeError(f"dim must be int or ConstInt, got {type(dim)}")
+    dim_val = int(dim.value) if isinstance(dim, _ir_core.ConstInt) else dim
     return _ir_core.create_op_call("tensor.gather", [input, index], {"dim": dim_val}, actual_span)
 
 

@@ -7,12 +7,13 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""End-to-end tests for ``pl.tensor.gather`` — all three forms.
+"""End-to-end tests for ``pl.gather`` — flat / axis / mask / compare forms.
 
 The tensor layer exposes a single unified ``pl.tensor.gather`` that dispatches
-to one of three tile-level ops based on the kwargs passed:
+to tile-level ops based on the kwargs and source residency:
 
-Index form  (``dim`` + ``index``)                       → ``tile.gather``
+Flat form   (``index``, no ``dim``)                     → ``tile.mgather`` / ``tile.gather``
+Axis form   (``dim`` + ``index``)                       → ``tile.gather``
 Mask form   (``mask_pattern=<int>``)                    → ``tile.gather_mask``
 Compare form (``kvalue`` + ``cmp_mode`` + ``out_cols``) → ``tile.gather_compare``
 
@@ -42,6 +43,7 @@ from typing import Any
 import pypto.language as pl
 import pytest
 import torch
+from harness import st
 from harness.core.harness import PLATFORMS, DataType, PTOTestCase, TensorSpec
 from pypto.ir.pass_manager import OptimizationStrategy
 
@@ -1057,6 +1059,194 @@ class TestGatherCompare:
     def test_gather_compare_gt_fp16(self, test_runner, platform):
         result = test_runner.run(GatherCompareGtFP16TestCase(platform=platform))
         assert result.passed, f"Test failed: {result.error}"
+
+
+@pl.jit
+def _flat_gather_gm(src: pl.Tensor, idx: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        indices = pl.add(idx, 1)
+        out = pl.assemble(out, pl.gather(src, indices), [0, 0])
+    return out
+
+
+@pl.jit
+def _flat_gather_local(src: pl.Tensor, idx: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        local = pl.add(src, 1)
+        out = pl.assemble(out, pl.gather(local, index=idx), [0, 0])
+    return out
+
+
+@pl.jit
+def _flat_gather_strided_local(src: pl.Tensor, idx: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        local = pl.add(src, 1)
+        window = pl.slice(local, [4, 32], [0, 16])
+        out = pl.assemble(out, pl.gather(window, index=idx), [0, 0])
+    return out
+
+
+@pl.jit
+def _flat_gather_strided_valid(src: pl.Tensor, idx: pl.Tensor, out: pl.Out[pl.Tensor]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        local = pl.add(src, 1)
+        # Keep both view bases 32-byte aligned even for 16-bit elements.
+        outer = pl.slice(local, [4, 48], [0, 16])
+        window = pl.slice(outer, [4, 32], [0, 0], valid_shape=[3, 32])
+        out = pl.assemble(out, pl.gather(window, index=idx), [0, 0])
+    return out
+
+
+def _flat_gather_case(mode, dtype):
+    generator = torch.Generator().manual_seed(2665)
+    # The GM table exceeds UB capacity even in FP16.
+    shape = (131072,) if mode == "gm" else (4, 64)
+    src = (
+        torch.randn(shape, generator=generator).to(dtype)
+        if dtype.is_floating_point
+        else torch.randint(-100, 100, shape, generator=generator, dtype=dtype)
+    )
+    limit = {"gm": 131071, "local": 256, "strided": 128, "strided_valid": 96}[mode]
+    idx = torch.randint(0, limit, (2, 32), generator=generator, dtype=torch.int32)
+    idx[0, :8] = torch.tensor([0, limit - 1, 31, 32, 63, 64, 0, limit - 1], dtype=torch.int32)
+    kernel = {
+        "gm": _flat_gather_gm,
+        "local": _flat_gather_local,
+        "strided": _flat_gather_strided_local,
+        "strided_valid": _flat_gather_strided_valid,
+    }[mode]
+
+    def golden(tensors):
+        values = tensors["src"]
+        indices = tensors["idx"].long()
+        if mode == "gm":
+            indices = indices + 1
+        else:
+            values = values + 1
+            if mode == "strided":
+                values = values[:, 16:48]
+            elif mode == "strided_valid":
+                values = values[:3, 16:48]
+        return torch.take(values, indices)
+
+    return st.case(
+        kernel,
+        src,
+        idx,
+        torch.zeros((2, 32), dtype=dtype),
+        name=f"flat_gather_{mode}_{str(dtype).removeprefix('torch.')}",
+        golden=golden,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.platforms("a2a3", "a2a3sim", reason="Tensor flat gather MGATHER/TGATHER lowering on A2/A3.")
+@st.cases(
+    *(
+        _flat_gather_case(mode, dtype)
+        for mode in ("gm", "local", "strided", "strided_valid")
+        for dtype in (torch.float16, torch.float32, torch.int16, torch.int32)
+    )
+)
+def test_flat_gather(case_run):
+    case_run.assert_passed()
+
+
+def _flat_gather_partial_case(local_source):
+    @pl.jit
+    def partial_gather(src: pl.Tensor, idx: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            if local_source:
+                values = pl.add(src, 1)
+            else:
+                values = src
+            indices = pl.set_validshape(idx, 1, 13)
+            out = pl.assemble(out, pl.gather(values, index=indices), [0, 0])
+        return out
+
+    src = torch.arange(256, dtype=torch.float32).reshape(4, 64)
+    idx = torch.arange(64, dtype=torch.int32).reshape(2, 32) * 3
+
+    def golden(tensors):
+        expected = torch.full_like(tensors["out"], -123)
+        values = tensors["src"] + 1 if local_source else tensors["src"]
+        expected[:1, :13] = torch.take(values, tensors["idx"][:1, :13].long())
+        return expected
+
+    return st.case(
+        partial_gather,
+        src,
+        idx,
+        torch.full((2, 32), -123, dtype=torch.float32),
+        name=f"flat_gather_partial_local{local_source}",
+        golden=golden,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.platforms("a2a3", "a2a3sim", reason="Flat gather preserves the index valid region.")
+@st.cases(*(_flat_gather_partial_case(local) for local in (False, True)))
+def test_flat_gather_partial(case_run):
+    case_run.assert_passed()
+
+
+def _flat_gather_narrow_case(valid_shape, dtype, computed_index):
+    valid_rows, valid_cols = valid_shape
+    alignment = 16 if dtype in (torch.float16, torch.int16) else 8
+    shape = (2, (valid_cols + alignment - 1) // alignment * alignment)
+    rows, cols = shape
+
+    @pl.jit
+    def narrow_gather(src: pl.Tensor, idx: pl.Tensor, out: pl.InOut[pl.Tensor]):
+        with pl.at(level=pl.Level.CORE_GROUP):
+            if computed_index:
+                indices = pl.add(idx, 1)
+            else:
+                indices = idx
+            valid_indices = pl.set_validshape(indices, valid_rows, valid_cols)
+            out = pl.assemble(out, pl.gather(src, index=valid_indices), [0, 0])
+        return out
+
+    src = torch.arange(256, dtype=torch.int32).to(dtype)
+    idx = torch.arange(rows * cols, dtype=torch.int32).reshape(shape) * 3
+    idx[0, 0] = 254
+    # Invalid lanes must neither read these out-of-bounds offsets nor overwrite output padding.
+    idx[valid_rows:, :] = -100000
+    idx[:, valid_cols:] = -100000
+
+    def golden(tensors):
+        expected = torch.full_like(tensors["out"], -123)
+        indices = tensors["idx"][:valid_rows, :valid_cols].long() + int(computed_index)
+        expected[:valid_rows, :valid_cols] = torch.take(tensors["src"], indices)
+        return expected
+
+    return st.case(
+        narrow_gather,
+        src,
+        idx,
+        torch.full(shape, -123, dtype=dtype),
+        name=f"flat_gather_narrow_{valid_rows}x{valid_cols}_{str(dtype).removeprefix('torch.')}_computed{computed_index}",
+        golden=golden,
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.platforms(
+    "a2a3", "a2a3sim", reason="Flat MGATHER accepts unaligned valid regions in aligned tiles."
+)
+@st.cases(
+    *(
+        _flat_gather_narrow_case(valid_shape, dtype, computed_index)
+        for valid_shape in ((1, 8), (2, 5), (2, 17), (1, 3))
+        for dtype in (torch.float16, torch.float32, torch.int16, torch.int32)
+        for computed_index in (False, True)
+    )
+)
+def test_flat_gather_narrow(case_run):
+    case_run.assert_passed()
 
 
 if __name__ == "__main__":

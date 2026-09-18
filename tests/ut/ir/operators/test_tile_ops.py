@@ -863,6 +863,94 @@ class TestTileReductionOps:
         assert isinstance(call.type, ir.TileType)
         assert call.type.dtype == DataType.INT32
 
+    @pytest.mark.parametrize("op", [tile.col_argmax, tile.col_argmin])
+    @pytest.mark.parametrize("tmp_shape", [[8, 256], [8, 640], [16, 512]])
+    def test_tile_col_arg_reduction_rejects_non_exact_tmp_shape(self, op, tmp_shape):
+        """Column arg reductions need the same exact scratch the row forms need.
+
+        pto-isa's TCOLARGMAX / TCOLARGMIN read the column count from the tmp/src
+        extent, so an oversized tmp walks past the valid columns and can return
+        the wrong index per column — a silent wrong answer with nothing
+        downstream to catch it.
+        """
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 512], DataType.FP32), span)
+        tmp_tile = ir.Var("tmp_tile", ir.TileType(tmp_shape, DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="requires tmp_tile shape to exactly match the input shape"):
+            op(input_tile, tmp_tile)
+
+    @pytest.mark.parametrize("op", [tile.col_argmax, tile.col_argmin])
+    def test_tile_col_arg_reduction_rejects_mismatched_tmp_rank(self, op):
+        """Rank is checked before the per-dimension extents, and reports as rank."""
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 512], DataType.FP32), span)
+        tmp_tile = ir.Var("tmp_tile", ir.TileType([8, 512, 1], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="requires tmp_tile to have the same rank as the input"):
+            op(input_tile, tmp_tile)
+
+    @pytest.mark.parametrize("op_name", ["tile.col_argmax", "tile.col_argmin"])
+    def test_tile_col_arg_reduction_rejects_no_arguments(self, op_name):
+        """An empty operand list must raise, not read past the end of the list.
+
+        The deducer reads ``args[0]`` to get the input type; guarding the count
+        only afterwards made ``create_op_call(op, [])`` index an empty vector,
+        which segfaulted the interpreter instead of raising.
+        """
+        with pytest.raises(ValueError, match="requires at least 1 argument"):
+            ir.create_op_call(op_name, [], {}, ir.Span.unknown())
+
+    @pytest.mark.parametrize("op", [tile.col_argmax, tile.col_argmin])
+    def test_tile_col_arg_reduction_rejects_mismatched_tmp_dtype(self, op):
+        """Column arg reductions require scratch storage with the input element type."""
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 512], DataType.FP32), span)
+        tmp_tile = ir.Var("tmp_tile", ir.TileType([8, 512], DataType.FP16), span)
+
+        with pytest.raises(ValueError, match="requires tmp_tile dtype to match input dtype"):
+            op(input_tile, tmp_tile)
+
+    @pytest.mark.parametrize("op", [tile.col_argmax, tile.col_argmin])
+    def test_tile_col_arg_reduction_accepts_exact_tmp_shape(self, op):
+        """The exact form every in-tree caller already passes still lowers.
+
+        Both producers build the scratch from the input's own shape: the
+        tensor->tile conversion (``MakeArgReductionConv``) and the tile-level
+        DSL call sites.
+        """
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 512], DataType.FP32), span)
+        tmp_tile = ir.Var("tmp_tile", ir.TileType([8, 512], DataType.FP32), span)
+
+        call = op(input_tile, tmp_tile)
+
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.dtype == DataType.INT32
+        assert isinstance(call.type.shape[0], ir.ConstInt)
+        assert isinstance(call.type.shape[1], ir.ConstInt)
+        assert [call.type.shape[0].value, call.type.shape[1].value] == [1, 512]
+
+    def test_tile_col_sum_tmp_is_not_validated_by_the_arg_form_check(self):
+        """gh#2615's exact-shape check does not widen to col_sum.
+
+        This pins the SCOPE of that change, not a contract: col_sum's tmp drives a
+        binary-tree reduction rather than an arg scan, and its docstrings still ask
+        callers for the input's shape and dtype. Type deduction simply does not
+        enforce it, and this test exists so that staying unenforced is a decision
+        rather than an accident — flip it deliberately if col_sum is tightened too.
+        """
+        span = ir.Span.unknown()
+        input_tile = ir.Var("input_tile", ir.TileType([8, 512], DataType.FP32), span)
+        wider_tmp = ir.Var("tmp_tile", ir.TileType([8, 640], DataType.FP32), span)
+
+        call = tile.col_sum(input_tile, wider_tmp)
+
+        assert isinstance(call.type, ir.TileType)
+        assert isinstance(call.type.shape[0], ir.ConstInt)
+        assert isinstance(call.type.shape[1], ir.ConstInt)
+        assert [call.type.shape[0].value, call.type.shape[1].value] == [1, 512]
+
     @pytest.mark.parametrize("dtype", [DataType.INT16, DataType.INT32, DataType.FP16, DataType.FP32])
     def test_tile_row_min_accepts_exact_pto_contract(self, dtype):
         """tile.row_min accepts every PTO dtype and produces a DN column vector."""
@@ -1441,6 +1529,63 @@ class TestTileBroadcastOps:
 
         ir_str = str(Program)
         assert "tile.col_expand_add" in ir_str
+
+    def test_col_expand_vector_columns_must_match_target(self):
+        """`dst[i, j] = target[i, j] OP col[0, j]` needs the columns to line up."""
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        narrow_col = ir.Var("col", ir.TileType([1, 16], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="last dimension to match the target"):
+            tile.col_expand(target, narrow_col)
+
+    def test_col_expand_rejects_a_rank_one_vector(self):
+        """A bare ``[cols]`` is not the documented ``[1, cols]``.
+
+        Rank 1 has no row axis, so the "single row" check below is vacuous for it and
+        the operand would slip through on the last-dimension match alone. The
+        ``row_expand`` family already requires rank 2; this keeps the pair consistent.
+        """
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        rank1_col = ir.Var("col", ir.TileType([32], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="at least 2 dimensions"):
+            tile.col_expand(target, rank1_col)
+
+    def test_col_expand_vector_must_be_a_single_row(self):
+        """A full-height second operand is not a column vector, whatever its width."""
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        square_col = ir.Var("col", ir.TileType([32, 32], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match=r"single row \(\[1, cols\]\)"):
+            tile.col_expand_mul(target, square_col)
+
+    def test_col_expand_accepts_the_documented_contract(self):
+        span = ir.Span.unknown()
+        target = ir.Var("target", ir.TileType([32, 32], DataType.FP32), span)
+        col = ir.Var("col", ir.TileType([1, 32], DataType.FP32), span)
+
+        result_type = tile.col_expand_div(target, col).type
+        assert isinstance(result_type, ir.TileType)
+        assert result_type.shape == [32, 32]
+
+    def test_col_expand_symbolic_extent_is_not_rejected(self):
+        """An undecidable relation is left to the backend rather than refused here.
+
+        Two *distinct* symbols, so the analyzer can prove neither equality nor
+        inequality — the case that must stay accepted.
+        """
+        span = ir.Span.unknown()
+        one = ir.ConstInt(1, DataType.INDEX, span)
+        rows = ir.ConstInt(32, DataType.INDEX, span)
+        target_cols = ir.Var("target_cols", ir.ScalarType(DataType.INDEX), span)
+        col_cols = ir.Var("col_cols", ir.ScalarType(DataType.INDEX), span)
+        target = ir.Var("target", ir.TileType([rows, target_cols], DataType.FP32), span)
+        col = ir.Var("col", ir.TileType([one, col_cols], DataType.FP32), span)
+
+        assert isinstance(tile.col_expand_sub(target, col).type, ir.TileType)
 
     def test_tile_row_expand_add(self):
         """Test tile.row_expand_add operator - expand row and add to tile."""
@@ -3228,6 +3373,76 @@ class TestTileSliceReshapeOps:
 
         assert _valid_of(result_type) == [0, 0]
 
+    def test_tile_reshape_maps_a_region_that_is_not_a_flat_prefix(self):
+        """A non-prefix region still maps when the target shape cuts the buffer the same way.
+
+        Row-major [2, 2, 2] valid [2, 1, 2] occupies flat cells {0, 1, 4, 5} --
+        no prefix -- yet under [2, 4] those same cells are exactly the box
+        valid [2, 2]. The full outer axis and the half-full run of four survive
+        as their own target dimensions.
+        """
+        result_type = tile.reshape(_partial_tile([2, 2, 2], [2, 1, 2]), [2, 4]).type
+
+        assert _valid_of(result_type) == [2, 2]
+
+    def test_tile_reshape_maps_a_non_prefix_region_across_a_merged_axis(self):
+        """The run below the cut may still be repartitioned: 8 real cells of every 16."""
+        result_type = tile.reshape(_partial_tile([4, 2, 8], [4, 1, 8]), [4, 16]).type
+
+        assert _valid_of(result_type) == [4, 8]
+
+    def test_tile_reshape_maps_a_non_prefix_region_with_a_partial_outer_axis(self):
+        """Both cuts can be partial: 2 of 4 outer rows, 8 real cells of every 16."""
+        result_type = tile.reshape(_partial_tile([4, 2, 8], [2, 1, 8]), [4, 16]).type
+
+        assert _valid_of(result_type) == [2, 8]
+
+    def test_tile_reshape_maps_a_non_prefix_region_over_a_full_unit_axis(self):
+        """A provably full unit axis is erased first, so [2, 1, 4] reads as [2, 4]."""
+        result_type = tile.reshape(_partial_tile([2, 1, 4], [2, 1, 2]), [2, 4]).type
+
+        assert _valid_of(result_type) == [2, 2]
+
+    def test_tile_reshape_carries_a_symbolic_extent_through_a_multi_run_region(self):
+        """A run's free extent may be symbolic even when the region cuts into several runs.
+
+        What has to be static is the physical geometry the region is measured
+        against -- here the run volumes 4 and 16 and the target extents. The
+        symbolic valid extent lands on the target dimension whose step is
+        exactly its run's trailing volume, and carries over unchanged.
+        """
+        span = ir.Span.unknown()
+        vrow = ir.Var("vrow", ir.ScalarType(DataType.INDEX), span)
+        src = _partial_tile(
+            [4, 2, 8], [vrow, ir.ConstInt(1, DataType.INDEX, span), ir.ConstInt(8, DataType.INDEX, span)]
+        )
+
+        valid = _valid_of(tile.reshape(src, [4, 16]).type)
+
+        assert valid[0] is vrow  # the dynamic extent carries over unchanged
+        assert valid[1:] == [8]
+
+    def test_tile_reshape_rejects_a_symbolic_extent_no_target_row_size_matches(self):
+        """[2, 2, 16] splits the first run's 4 rows, so the runtime extent cannot follow."""
+        span = ir.Span.unknown()
+        vrow = ir.Var("vrow", ir.ScalarType(DataType.INDEX), span)
+        src = _partial_tile(
+            [4, 2, 8], [vrow, ir.ConstInt(1, DataType.INDEX, span), ir.ConstInt(8, DataType.INDEX, span)]
+        )
+
+        with pytest.raises(ValueError, match="has the matching row size"):
+            tile.reshape(src, [2, 2, 16])
+
+    def test_tile_reshape_rejects_a_non_prefix_region_the_target_cannot_cut(self):
+        """{0, 1, 4, 5} needs a dimension boundary every 4 elements, and [8] has none."""
+        with pytest.raises(ValueError, match="real data is scattered across the buffer"):
+            tile.reshape(_partial_tile([2, 2, 2], [2, 1, 2]), [8])
+
+    def test_tile_reshape_rejects_a_non_prefix_region_whose_run_does_not_regroup(self):
+        """[2, 3, 4] valid [2, 2, 4] runs 8 real of every 12; [6, 4] cuts every 4."""
+        with pytest.raises(ValueError, match="real data is scattered across the buffer"):
+            tile.reshape(_partial_tile([2, 3, 4], [2, 2, 4]), [6, 4])
+
     def test_tile_reshape_rejects_region_that_is_not_a_flat_prefix(self):
         """Valid columns leave gaps between real rows, so no target rectangle spans them."""
         with pytest.raises(ValueError, match="real data is scattered across the buffer"):
@@ -4373,6 +4588,198 @@ class TestTileBitwiseArithmeticOps:
 
         ir_str = str(Program)
         assert "tile.xors" in ir_str
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            DataType.INT8,
+            DataType.UINT8,
+            DataType.INT16,
+            DataType.UINT16,
+            DataType.INT32,
+            DataType.UINT32,
+        ],
+    )
+    @pytest.mark.parametrize("op", [tile.and_, tile.or_, tile.xor])
+    def test_bitwise_contract_binary_accepts_supported_widths_and_preserves_view(self, dtype, op):
+        """Tile-tile bitwise ops preserve src0 type and require one shared valid region."""
+        span = ir.Span.unknown()
+        view = ir.TileView(
+            valid_shape=[7, 13],
+            blayout=ir.TileLayout.row_major,
+            slayout=ir.TileLayout.none_box,
+        )
+        src0 = ir.Var("src0", ir.TileType([8, 16], dtype, tile_view=view), span)
+        src1 = ir.Var("src1", ir.TileType([8, 16], dtype, tile_view=view), span)
+        tmp = ir.Var("tmp", ir.TileType([8, 16], dtype, tile_view=view), span)
+
+        call = op(src0, src1, tmp) if op is tile.xor else op(src0, src1)
+
+        assert _tile_result_dtype(call) == dtype
+        assert isinstance(call.type, ir.TileType)
+        assert call.type.shape == [8, 16]
+        assert _valid_of(call.type) == [7, 13]
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            DataType.INT8,
+            DataType.UINT8,
+            DataType.INT16,
+            DataType.UINT16,
+            DataType.INT32,
+            DataType.UINT32,
+        ],
+    )
+    @pytest.mark.parametrize("op", [tile.ands, tile.ors, tile.xors])
+    def test_bitwise_contract_scalar_literal_matches_tile_dtype(self, dtype, op):
+        """Scalar literal sugar uses the exact tile dtype required by PTO-ISA."""
+        span = ir.Span.unknown()
+        value = ir.Var("value", ir.TileType([8, 16], dtype), span)
+        tmp = ir.Var("tmp", ir.TileType([8, 16], dtype), span)
+
+        call = op(value, 1, tmp) if op is tile.xors else op(value, 1)
+
+        expected_scalar_dtype = {
+            DataType.UINT8: DataType.INT8,
+            DataType.UINT16: DataType.INT16,
+            DataType.UINT32: DataType.INT32,
+        }.get(dtype, dtype)
+        assert _operand_dtype(call.args[1]) == expected_scalar_dtype
+        assert _tile_result_dtype(call) == dtype
+
+    @pytest.mark.parametrize("op", [tile.and_, tile.or_, tile.xor])
+    def test_bitwise_contract_binary_rejects_dtype_broadcast_and_tmp_mismatch(self, op):
+        """PTO-ISA does not promote or broadcast bitwise tile operands."""
+        span = ir.Span.unknown()
+        full = ir.Var("full", ir.TileType([8, 16], DataType.INT16), span)
+        mixed = ir.Var("mixed", ir.TileType([8, 16], DataType.UINT16), span)
+        physical_mismatch = ir.Var("physical_mismatch", ir.TileType([1, 16], DataType.INT16), span)
+        valid_mismatch = ir.Var(
+            "valid_mismatch",
+            ir.TileType([8, 16], DataType.INT16, tile_view=ir.TileView(valid_shape=[7, 16])),
+            span,
+        )
+
+        with pytest.raises(ValueError, match=r"same dtype"):
+            if op is tile.xor:
+                op(full, mixed, full)
+            else:
+                op(full, mixed)
+        with pytest.raises(ValueError, match=r"same physical shape"):
+            if op is tile.xor:
+                op(full, physical_mismatch, full)
+            else:
+                op(full, physical_mismatch)
+        with pytest.raises(ValueError, match=r"same valid_shape"):
+            if op is tile.xor:
+                op(full, valid_mismatch, full)
+            else:
+                op(full, valid_mismatch)
+        if op is tile.xor:
+            with pytest.raises(ValueError, match=r"same dtype"):
+                op(full, full, mixed)
+
+    @pytest.mark.parametrize("op", [tile.ands, tile.ors, tile.xors])
+    def test_bitwise_contract_scalar_rejects_explicit_dtype_and_tmp_mismatch(self, op):
+        """Typed scalar and XOR scratch operands must exactly match the source dtype."""
+        span = ir.Span.unknown()
+        value = ir.Var("value", ir.TileType([8, 16], DataType.INT16), span)
+        scalar = ir.ConstInt(1, DataType.INT32, span)
+        mixed_tmp = ir.Var("tmp", ir.TileType([8, 16], DataType.UINT16), span)
+
+        with pytest.raises(ValueError, match=r"same-width signless scalar"):
+            if op is tile.xors:
+                op(value, scalar, value)
+            else:
+                op(value, scalar)
+        if op is tile.xors:
+            with pytest.raises(ValueError, match=r"same dtype"):
+                op(value, 1, mixed_tmp)
+
+    def test_xor_scratch_must_be_distinct_from_sources(self):
+        span = ir.Span.unknown()
+        lhs = ir.Var("lhs", ir.TileType([8, 16], DataType.INT16), span)
+        rhs = ir.Var("rhs", ir.TileType([8, 16], DataType.INT16), span)
+
+        with pytest.raises(ValueError, match="tmp to be distinct"):
+            tile.xor(lhs, rhs, lhs)
+        with pytest.raises(ValueError, match="tmp to be distinct"):
+            tile.xor(lhs, rhs, rhs)
+        with pytest.raises(ValueError, match="tmp to be distinct"):
+            tile.xors(lhs, 1, lhs)
+
+        shared_memref = ir.MemRef(
+            ir.MemorySpace.Vec,
+            ir.ConstInt(0, DataType.INT64, span),
+            8 * 16 * 2,
+            2188,
+        )
+        aliased_src = ir.Var(
+            "aliased_src",
+            ir.TileType([8, 16], DataType.INT16, shared_memref, None, ir.MemorySpace.Vec),
+            span,
+        )
+        aliased_tmp = ir.Var(
+            "aliased_tmp",
+            ir.TileType([8, 16], DataType.INT16, shared_memref, None, ir.MemorySpace.Vec),
+            span,
+        )
+        with pytest.raises(ValueError, match="tmp to be distinct"):
+            tile.xor(aliased_src, rhs, aliased_tmp)
+        with pytest.raises(ValueError, match="tmp to be distinct"):
+            tile.xors(aliased_src, 1, aliased_tmp)
+
+    @pytest.mark.parametrize("dtype", [DataType.UINT8, DataType.UINT16, DataType.UINT32])
+    @pytest.mark.parametrize("op", [tile.ands, tile.ors, tile.xors])
+    def test_bitwise_contract_scalar_accepts_unsigned_tile_with_signless_scalar(self, dtype, op):
+        """Unsigned tiles pair with a same-width signed scalar that emits as PTOAS signless iN."""
+        span = ir.Span.unknown()
+        value = ir.Var("value", ir.TileType([8, 16], dtype), span)
+        tmp = ir.Var("tmp", ir.TileType([8, 16], dtype), span)
+        scalar_dtype = {
+            DataType.UINT8: DataType.INT8,
+            DataType.UINT16: DataType.INT16,
+            DataType.UINT32: DataType.INT32,
+        }[dtype]
+        all_ones = {
+            DataType.UINT8: 0xFF,
+            DataType.UINT16: 0xFFFF,
+            DataType.UINT32: 0xFFFFFFFF,
+        }[dtype]
+
+        literal_call = op(value, all_ones, tmp) if op is tile.xors else op(value, all_ones)
+        explicit_call = (
+            op(value, ir.ConstInt(0x55, scalar_dtype, span), tmp)
+            if op is tile.xors
+            else op(value, ir.ConstInt(0x55, scalar_dtype, span))
+        )
+        assert _operand_dtype(literal_call.args[1]) == scalar_dtype
+        assert isinstance(literal_call.args[1], ir.ConstInt)
+        assert literal_call.args[1].value == -1
+        assert _operand_dtype(explicit_call.args[1]) == scalar_dtype
+
+        with pytest.raises(ValueError, match=r"same-width signless scalar"):
+            if op is tile.xors:
+                op(value, ir.ConstInt(1, dtype, span), tmp)
+            else:
+                op(value, ir.ConstInt(1, dtype, span))
+
+    @pytest.mark.parametrize("op", [tile.and_, tile.or_, tile.xor, tile.ands, tile.ors, tile.xors])
+    def test_bitwise_contract_rejects_unsupported_integer_width(self, op):
+        """INT64 is not implemented by the current PTO-ISA bitwise templates."""
+        span = ir.Span.unknown()
+        value = ir.Var("value", ir.TileType([8, 16], DataType.INT64), span)
+
+        with pytest.raises(ValueError, match=r"INT8.*INT32"):
+            if op is tile.xor:
+                op(value, value, value)
+            elif op is tile.xors:
+                op(value, 1, value)
+            elif op in (tile.ands, tile.ors):
+                op(value, 1)
+            else:
+                op(value, value)
 
     def test_tile_shl(self):
         """Test tile.shl operator - element-wise bitwise left shift of two tiles."""
@@ -6284,6 +6691,149 @@ class TestTileScatterUpdateOps:
         assert isinstance(result_type, ir.TileType)
         assert result_type.tile_view is None
 
+    def test_tile_scatter_update_2d_src_rows_must_match_index_size(self):
+        """`index` names b*s rows and `src` supplies one payload each.
+
+        ``ConvertTensorToTileOps`` already enforces this on the way to ``pto.tscatter``,
+        but only as an INTERNAL_CHECK and only for the tensor path — so a directly
+        written `tile.scatter_update` carried the mismatch to codegen, and the operator's
+        own deduction stayed blind to both operands.
+        """
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 16, 64), DataType.FP16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)  # b*s = 8
+        bad_src = ir.TileType(_const_dims(span, 16, 64), DataType.FP16)  # 16 rows, not 8
+
+        with pytest.raises(ValueError, match=r"2D src must have b\*s rows"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", bad_src, span),
+            )
+
+    def test_tile_scatter_update_src_width_must_match_input(self):
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 16, 64), DataType.FP16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        narrow_src = ir.TileType(_const_dims(span, 8, 32), DataType.FP16)  # d=32, not 64
+
+        with pytest.raises(ValueError, match="last dimension must match input"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", narrow_src, span),
+            )
+
+    def test_tile_scatter_update_4d_src_leading_dims_must_match_index(self):
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 4, 4, 1, 64), DataType.BF16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        bad_src = ir.TileType(_const_dims(span, 3, 4, 1, 64), DataType.BF16)  # b=3, not 2
+
+        with pytest.raises(ValueError, match=r"leading dimensions must match index's \[b, s\]"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", bad_src, span),
+            )
+
+    def test_tile_scatter_update_4d_src_axis_2_must_be_the_declared_singleton(self):
+        """Axis 2 is structural, not a data extent.
+
+        Both declared 4D layouts pin it to one -- input ``[blockNum, blockSize, 1, d]``
+        and src ``[b, s, 1, d]`` -- so a non-unit value is not a bigger scatter, it is a
+        shape that means nothing.
+        """
+        span = ir.Span.unknown()
+        input_type = ir.TileType(_const_dims(span, 4, 4, 1, 64), DataType.BF16)
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        bad_src = ir.TileType(_const_dims(span, 2, 4, 2, 64), DataType.BF16)  # axis 2 = 2
+
+        with pytest.raises(ValueError, match=r"4D src's axis 2 must be the singleton"):
+            tile.scatter_update(
+                ir.Var("inp", input_type, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", bad_src, span),
+            )
+
+    def test_tile_scatter_update_4d_input_axis_2_must_be_the_declared_singleton(self):
+        """The same defect one operand over -- the input's layout pins axis 2 too."""
+        span = ir.Span.unknown()
+        bad_input = ir.TileType(_const_dims(span, 4, 4, 2, 64), DataType.BF16)  # axis 2 = 2
+        index_type = ir.TileType(_const_dims(span, 2, 4), DataType.INT32)
+        src_type = ir.TileType(_const_dims(span, 2, 4, 1, 64), DataType.BF16)
+
+        with pytest.raises(ValueError, match=r"4D input's axis 2 must be the singleton"):
+            tile.scatter_update(
+                ir.Var("inp", bad_input, span),
+                -2,
+                ir.Var("idx", index_type, span),
+                ir.Var("src", src_type, span),
+            )
+
+    def test_tile_scatter_update_symbolic_extent_is_not_rejected(self):
+        """An undecidable relation is left to the backend rather than refused here.
+
+        The row relation also holds *symbolically* here: `index` is ``[rows, 1]``, so
+        ``b * s`` simplifies back to ``rows`` and the check must not over-reject it.
+        """
+        span = ir.Span.unknown()
+        rows = ir.Var("rows", ir.ScalarType(DataType.INDEX), span)
+        d_a = ir.Var("d_a", ir.ScalarType(DataType.INDEX), span)
+        d_b = ir.Var("d_b", ir.ScalarType(DataType.INDEX), span)
+        one = ir.ConstInt(1, DataType.INDEX, span)
+
+        result = tile.scatter_update(
+            ir.Var("inp", ir.TileType([rows, d_a], DataType.FP16), span),
+            -2,
+            ir.Var("idx", ir.TileType([rows, one], DataType.INT32), span),
+            ir.Var("src", ir.TileType([rows, d_b], DataType.FP16), span),
+        ).type
+        assert isinstance(result, ir.TileType)
+
+    def test_tile_scatter_update_provably_wrong_symbolic_row_count_is_rejected(self):
+        """Provable is not the same as literal.
+
+        Comparing three `ConstInt`s would skip this entirely: `index` is ``[n, 1]`` so
+        ``b * s == n``, and an ``n + 1`` row count is a mismatch the analyzer can settle
+        without knowing ``n``. Proving against the product catches it here rather than
+        letting it reach lowering, where a dynamic dimension surfaces as an unrelated
+        internal-check failure.
+        """
+        span = ir.Span.unknown()
+        n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+        d = ir.Var("d", ir.ScalarType(DataType.INDEX), span)
+        one = ir.ConstInt(1, DataType.INDEX, span)
+        n_plus_1 = ir.add(n, one, span)
+
+        with pytest.raises(ValueError, match=r"2D src must have b\*s rows"):
+            tile.scatter_update(
+                ir.Var("inp", ir.TileType([n, d], DataType.FP16), span),
+                -2,
+                ir.Var("idx", ir.TileType([n, one], DataType.INT32), span),
+                ir.Var("src", ir.TileType([n_plus_1, d], DataType.FP16), span),
+            )
+
+    def test_tile_scatter_update_undecidable_symbolic_row_count_is_accepted(self):
+        """Two unrelated symbols say nothing, so the relation stays the backend's call."""
+        span = ir.Span.unknown()
+        n = ir.Var("n", ir.ScalarType(DataType.INDEX), span)
+        m = ir.Var("m", ir.ScalarType(DataType.INDEX), span)
+        d = ir.Var("d", ir.ScalarType(DataType.INDEX), span)
+        one = ir.ConstInt(1, DataType.INDEX, span)
+
+        result = tile.scatter_update(
+            ir.Var("inp", ir.TileType([n, d], DataType.FP16), span),
+            -2,
+            ir.Var("idx", ir.TileType([n, one], DataType.INT32), span),
+            ir.Var("src", ir.TileType([m, d], DataType.FP16), span),
+        ).type
+        assert isinstance(result, ir.TileType)
+
     @pytest.mark.parametrize(
         ("src_dtype", "dim", "match"),
         [
@@ -7969,6 +8519,38 @@ class TestTileSort32Ops:
         assert valid_width.left is valid_cols
         assert isinstance(valid_width.right, ir.ConstInt)
         assert valid_width.right.value == factor
+
+    def test_idx_shape_must_match_src(self):
+        """idx carries one index per src element, so a mismatched extent is rejected."""
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([1, 32], DataType.FP32), span)
+        wide_idx = ir.Var("idx", ir.TileType([1, 64], DataType.UINT32), span)
+
+        with pytest.raises(ValueError, match="same shape as src"):
+            tile.sort32(src, wide_idx)
+
+    def test_idx_rank_must_match_src(self):
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TileType([1, 32], DataType.FP32), span)
+        rank1_idx = ir.Var("idx", ir.TileType([32], DataType.UINT32), span)
+
+        with pytest.raises(ValueError, match="same rank as src"):
+            tile.sort32(src, rank1_idx)
+
+    def test_symbolic_idx_extent_is_not_rejected(self):
+        """An undecidable relation is left to the backend rather than refused here.
+
+        Two *distinct* symbols, so the analyzer can prove neither equality nor
+        inequality — the case that must stay accepted.
+        """
+        span = ir.Span.unknown()
+        one = ir.ConstInt(1, DataType.INDEX, span)
+        src_cols = ir.Var("src_cols", ir.ScalarType(DataType.INDEX), span)
+        idx_cols = ir.Var("idx_cols", ir.ScalarType(DataType.INDEX), span)
+        src = ir.Var("src", ir.TileType([one, src_cols], DataType.FP32), span)
+        idx = ir.Var("idx", ir.TileType([one, idx_cols], DataType.UINT32), span)
+
+        assert isinstance(tile.sort32(src, idx).type, ir.TileType)
 
 
 class TestB03TriAndGatherOps:

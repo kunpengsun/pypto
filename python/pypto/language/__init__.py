@@ -66,6 +66,7 @@ from .dsl_api import (
     cond,
     const,
     func_attr,
+    graph,
     parallel,
     pipeline,
     range,
@@ -137,7 +138,6 @@ from .op.tile_ops import (
     load,
     lrelu,
     matmul_bias,
-    matmul_mx,
     matmul_mx_acc,
     matmul_mx_bias,
     max,
@@ -159,9 +159,6 @@ from .op.tile_ops import (
 )
 from .op.tile_ops import (
     mscatter as mscatter,
-)
-from .op.tile_ops import (
-    quant_mx as quant_mx,
 )
 from .op.tile_ops import (
     tmov_x2zz as tmov_x2zz,
@@ -202,6 +199,7 @@ from .op.unified_ops import (
     log,
     matmul,
     matmul_acc,
+    matmul_mx,
     maximum,
     minimum,
     mrgsort,
@@ -214,6 +212,7 @@ from .op.unified_ops import (
     part_max,
     part_min,
     part_mul,
+    quant_mx,
     read,
     recip,
     reinterpret_view,
@@ -346,6 +345,7 @@ __all__ = [
     "func_attr",
     "at",
     "cluster",
+    "graph",
     "spmd",
     "split_aiv",
     "optimizations",

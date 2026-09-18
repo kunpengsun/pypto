@@ -250,6 +250,21 @@ Pass MaterializeCommDomainScopes();
 Pass LowerHostTensorCollectives();
 
 /**
+ * @brief Lower managed collectives written in a CHIP/L2 orchestration body into
+ *        one local builtin AIV task.
+ *
+ * The CHIP counterpart of ``LowerHostTensorCollectives``: instead of fanning the
+ * collective out into one chip dispatch per device (a nested L2 orchestration
+ * task), it rewrites the call into a call to a synthesized AIV kernel backed by
+ * the same hand-written builtin template source. The kernel joins the caller's
+ * own task DAG, so ``compute -> collective -> consume`` is ordered by ordinary
+ * TensorMap dependencies and the host dispatches one pipeline per rank.
+ *
+ * Today only ``pld.tensor.all_to_all_v`` with ``core_num=1`` is supported.
+ */
+Pass LowerL2TensorCollectives();
+
+/**
  * @brief Materialize one CommCtx parameter/argument per DistributedTensor parameter.
  */
 Pass MaterializeDistTensorCtx();
@@ -457,6 +472,27 @@ Pass OutlineHierarchyScopes();
 Pass OutlineClusterScopes();
 
 /**
+ * @brief Outline Graph scopes into separate `FunctionType::Graph` functions
+ *
+ * `with pl.graph("name"):` is sugar over `@pl.jit.graph`: this pass extracts the
+ * region into a Graph function named after the region and leaves a `Call` at the
+ * site, so from here on the two surfaces are indistinguishable. It runs
+ * immediately before `OutlineIncoreScopes`, which then outlines the InCore scopes
+ * inside the freshly minted Graph body exactly as it does for a hand-written
+ * `@pl.jit.graph` function.
+ *
+ * Requirements:
+ * - Input IR must be in SSA form (run ConvertToSSA first)
+ * - Only processes Opaque/Orchestration functions containing Graph scopes
+ * - Runs before OutlineIncoreScopes and OutlineClusterScopes
+ *
+ * The runtime contract on the resulting function (boundary shape, scalar
+ * pass-through, node budget) is not checked here — `LegalizeGraphBoundary` and
+ * the Graph verifier own it, and they see the outlined form either way.
+ */
+Pass OutlineGraphScopes();
+
+/**
  * @brief Convert tensor ops to tile ops in InCore functions
  *
  * Inserts tile.load at InCore function entry, converts tensor ops to tile ops
@@ -490,12 +526,12 @@ Pass OptimizeOrchTensors();
 /**
  * @brief Rewrite logical ``pl.NZ`` tensors into pto-isa's blocked NZ form
  *
- * A ``pl.Tensor[[..., R, C], dtype, pl.NZ]`` annotation asserts that the GM
+ * A ``pl.Tensor[[R, C], dtype, pl.NZ]`` annotation — or ``[[B, R, C], ...]`` — asserts that the GM
  * bytes are already in PTO-native NZ fractal order while the DSL keeps the
  * logical shape and slicing. pto-isa describes such a buffer with a blocked
- * rank-(r+2) GlobalTensor, so this pass rewrites:
+ * rank-5 GlobalTensor, so this pass rewrites:
  *
- *   - every NZ ``TensorType`` shape to ``[..., C/c0, R/16, 16, c0]``, where
+ *   - every NZ ``TensorType`` shape to ``[B, C/c0, R/16, 16, c0]``, where
  *     ``c0`` is the number of elements in a 32-byte C0 line (``256 / bits``);
  *     strides stay empty for ``MaterializeTensorStrides``, whose plain
  *     row-major rule already yields pto-isa's NZ strides once blocked;
@@ -515,6 +551,16 @@ Pass OptimizeOrchTensors();
  *   so the logical window is still intact here.
  */
 Pass BlockNzTensorViews();
+
+/**
+ * @brief Rewrite logical MX scale tensor views into A5's packed rank-5 form
+ *
+ * Converts MX_A_ZZ ``[M, G]`` and MX_B_NN ``[G, N]`` TensorTypes and their
+ * tile.load windows to ``[1, block/16, group/2, 16, 2]``. Symbolic offsets
+ * are accepted only when their alignment and non-negativity can be proven.
+ * Must run after FlattenTileNdTo2D and before MaterializeTensorStrides.
+ */
+Pass BlockMxScaleTensorViews();
 
 /**
  * @brief Flatten ND tile ops to 2D in InCore functions

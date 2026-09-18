@@ -14,7 +14,7 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 
 **原因：** 嵌入分析逻辑的代码生成会变得脆弱——它重复了 Pass 已有的逻辑，且更难以独立测试。保持代码生成为直接的转换，确保其可预测性和可维护性。
 
-**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/26-normalize_return_order.md) pass。
+**当发现代码生成中存在分析逻辑时：** 创建跟踪 Issue，在有带宽时将其重构为专用 Pass。[#814](https://github.com/hw-native-sys/pypto/issues/814) 就是一个实例：编排代码生成中的返回值到参数追踪逻辑已重构为 [`NormalizeReturnOrder`](../passes/28-normalize_return_order.md) pass。
 
 ## 概述
 
@@ -40,6 +40,24 @@ PTO 代码生成 (CodeGen) (`PTOCodegen`) 从 PyPTO 中间表示 (IR) 生成 PTO
 stride 表达式里的常量 (例如复合参数维度 `M * 2` 中的 `2`) 也会在使用前被声明到常量块。
 
 ## 架构
+
+### 显式 Buffer 输入
+
+`GenerateBufferFunction` 在发射前验证显式构造的 Buffer IR。GM 路径支持
+物理形状静态、紧密 ND 布局的二维 FP32 Tensor 参数，以及规范化的 Tensor
+参数返回值。它复用现有 GM 张量视图前缀和原生“Tensor 在前、标量在后”的
+ABI。Tensor 返回值保留在 IR 中供编排处理别名，不产生原生返回值。
+
+`buffer.load` 和 `buffer.store` 将显式窗口发射为 `pto.partition_view`，
+随后发射 `pto.tload` 或 `pto.tstore`。目标、偏移和 valid extent 均来自
+普通操作数。`buffer.add`、`mul`、`copy` 直接使用显式 buffer 目标。
+每个 `pto.alloc_tile` 对应同一作用域内的 `buffer.alloc`；只有地址操作数
+存在时才发射地址，不受旧发射标志影响。GM 传输不创建 buffer、不推导
+valid 状态更新，也不重建逻辑 Tile。
+
+此直接路径不启用自动 Tile-to-Buffer 转换，也不修改默认流水线。
+描述符、方向、动态窗口和 ABI 限制见 [Buffer 契约](../ir/02-types.md#buffer-算子契约)。
+原生编译测试验证语法和操作数数据流；数值执行是单独的集成验收要求。
 
 ### 类结构
 
@@ -144,6 +162,9 @@ print(pto_code)
 | `tile.addsc(src0, scalar, carry)` | `pto.taddsc`（`src0 + scalar + carry`） |
 | `tile.subsc(src0, scalar, carry)` | `pto.tsubsc`（`src0 - scalar + carry`） |
 | `tile.adds(tile, scalar)` | `pto.tadds` (Tile + 标量) |
+| `tile.and_(lhs, rhs)` / `tile.ands(lhs, scalar)` | `pto.tand` / `pto.tands`；scalar 使用同位宽 signless `iN` |
+| `tile.or_(lhs, rhs)` / `tile.ors(lhs, scalar)` | `pto.tor` / `pto.tors`；scalar 使用同位宽 signless `iN` |
+| `tile.xor(lhs, rhs, tmp)` / `tile.xors(lhs, scalar, tmp)` | `pto.txor` / `pto.txors`；scalar 使用同位宽 signless `iN` |
 | `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)`（`shape` 元组仅用于类型推导；更大的 `dst` 及其 pad 来自结果类型） |
 
 **`tile.slice` / `tile.assemble` 下沉细节。** 两个 op 都通过 `pto.subview`
@@ -211,8 +232,8 @@ tile 调用 `set_validshape`。
   `eL` 是 lane `L` 在切分轴上的**运行时** valid extent——ISA 直接从被弹出的 tile 上读取
   （`popVecTileFromGMFiFo`），因此偶数 code 要求 `e0 == e1`，奇数 code 要求
   `e0 == e1 + 1`。这些 extent 由
-  [LowerAutoVectorSplit](../passes/21-lower_auto_vector_split.md) 物化，
-  [ExpandMixedKernel](../passes/22-expand_mixed_kernel.md) 选择匹配的 code。
+  [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md) 物化，
+  [ExpandMixedKernel](../passes/24-expand_mixed_kernel.md) 选择匹配的 code。
 - Cube-to-Vector FIFO 搬运的是紧凑矩形：producer 以 `valid_col` 为行间距写入
   `valid_row` x `valid_col` 数据块，每个消费 lane 再以相同间距读回自己的数据段
   （`gmStrideR = valid_col`，左右切分的 code 下加倍）。因此若传输两侧的 valid shape
@@ -537,7 +558,7 @@ allocate 112 on that axis and declare 100 as the tile's valid_shape ...
 `ComputeAllocTileFields` 是所有分配的唯一收口——逐变量声明、被提升出来的
 `extra_alloc_tiles`、以及控制流路径都经过它——因此校验看到的正是最终发射的内容，不会与之
 漂移。张量层的 `pl.matmul` / `pl.matmul_acc` 不会因 *M 轴*触发它：M 轴已由
-[`ConvertTensorToTileOps`](../passes/10-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing)
+[`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing)
 自动对齐；仍需用户自行保证的是 `K` 与 `N`。
 
 ## 完整示例

@@ -51,69 +51,96 @@ def _mx_tensor_var(name, rows, cols, layout=ir.TensorLayout.MX_A_ZZ, dtype=DataT
     )
 
 
+def _mx_blocked_tensor_var(name, shape, layout=ir.TensorLayout.MX_A_ZZ):
+    span = ir.Span.unknown()
+    return ir.Var(
+        name,
+        ir.TensorType(
+            [dim if isinstance(dim, ir.Expr) else ir.ConstInt(dim, DataType.INDEX, span) for dim in shape],
+            DataType.FP8E8M0,
+            tensor_view=ir.TensorView([], layout),
+        ),
+        span,
+    )
+
+
 class TestMxScaleMemSpaces:
-    def test_leftscale_move_layout_row_major_fractal32(self):
+    @pytest.mark.parametrize(
+        ("target", "shape", "expected_layout"),
+        [
+            (ir.MemorySpace.LeftScale, (16, 8), ir.TileLayout.row_major),
+            (ir.MemorySpace.RightScale, (8, 16), ir.TileLayout.col_major),
+        ],
+    )
+    def test_scale_move_preserves_required_layout_and_promotes_uint8(self, target, shape, expected_layout):
         src = _tile_var(
-            _const_shape(16, 8),
+            _const_shape(*shape),
             DataType.UINT8,
             memory=ir.MemorySpace.Mat,
             view=ir.TileView(
-                blayout=ir.TileLayout.row_major,
-                slayout=ir.TileLayout.row_major,
+                blayout=expected_layout,
+                slayout=expected_layout,
                 fractal=32,
             ),
         )
-        call = tile.move(src, target_memory=ir.MemorySpace.LeftScale)
+        call = tile.move(src, target_memory=target)
         out = call.type
         assert isinstance(out, ir.TileType)
-        assert out.memory_space == ir.MemorySpace.LeftScale
+        assert out.memory_space == target
         assert out.dtype == DataType.FP8E8M0  # ui8 promotes for loc=scaling
         view = out.get_effective_tile_view()
-        assert view.blayout == ir.TileLayout.row_major
-        assert view.slayout == ir.TileLayout.row_major
+        assert view.blayout == expected_layout
+        assert view.slayout == expected_layout
         assert view.fractal == 32
 
-    def test_rightscale_move_layout_col_major_fractal32(self):
-        src = _tile_var(
-            _const_shape(8, 16),
-            DataType.UINT8,
-            memory=ir.MemorySpace.Mat,
-            view=ir.TileView(
-                blayout=ir.TileLayout.col_major,
-                slayout=ir.TileLayout.col_major,
-                fractal=32,
-            ),
-        )
-        call = tile.move(src, target_memory=ir.MemorySpace.RightScale)
-        out = call.type
-        assert isinstance(out, ir.TileType)
-        assert out.memory_space == ir.MemorySpace.RightScale
-        assert out.dtype == DataType.FP8E8M0
-        view = out.get_effective_tile_view()
-        assert view.blayout == ir.TileLayout.col_major
-        assert view.slayout == ir.TileLayout.col_major
-        assert view.fractal == 32
+    @pytest.mark.parametrize(
+        ("layout", "shape", "expected_layout", "explicit_mat"),
+        [
+            (ir.TensorLayout.MX_A_ZZ, (16, 8), ir.TileLayout.row_major, False),
+            (ir.TensorLayout.MX_A_ZZ, (16, 8), ir.TileLayout.row_major, True),
+            (ir.TensorLayout.MX_B_NN, (8, 16), ir.TileLayout.col_major, False),
+            (ir.TensorLayout.MX_B_NN, (8, 16), ir.TileLayout.col_major, True),
+        ],
+    )
+    def test_mx_layout_load_uses_mat(self, layout, shape, expected_layout, explicit_mat):
+        tensor = _mx_tensor_var("scale", *shape, layout=layout)
 
-    def test_mx_layout_load_requires_explicit_mat(self):
-        tensor = _mx_tensor_var("s", 16, 8)
-        with pytest.raises(ValueError, match="requires explicit target_memory=MemorySpace.Mat"):
-            tile.load(tensor, [0, 0], [16, 8])
+        if explicit_mat:
+            call = tile.load(tensor, [0, 0], list(shape), target_memory=ir.MemorySpace.Mat)
+        else:
+            call = tile.load(tensor, [0, 0], list(shape))
 
-    def test_mx_b_layout_load_col_major(self):
-        tensor = _mx_tensor_var("w_s", 8, 16, ir.TensorLayout.MX_B_NN)
-        call = tile.load(tensor, [0, 0], [8, 16], target_memory=ir.MemorySpace.Mat)
+        assert call.op.name == ir.get_op("tile.load").name
+        assert dict(call.kwargs) == {"target_memory": ir.MemorySpace.Mat}
         out = call.type
         assert isinstance(out, ir.TileType)
         assert out.memory_space == ir.MemorySpace.Mat
         view = out.get_effective_tile_view()
-        assert view.blayout == ir.TileLayout.col_major
-        assert view.slayout == ir.TileLayout.col_major
+        assert view.blayout == expected_layout
+        assert view.slayout == expected_layout
         assert view.fractal == 32
 
-    def test_mx_layout_rejects_vec_target(self):
+    def test_raw_mx_layout_load_still_requires_explicit_mat(self):
+        tensor = _mx_tensor_var("scale", 16, 8)
+        explicit = tile.load(tensor, [0, 0], [16, 8], target_memory=ir.MemorySpace.Mat)
+
+        with pytest.raises(ValueError, match="requires target_memory=MemorySpace.Mat"):
+            ir.create_op_call("tile.load", list(explicit.args), {}, ir.Span.unknown())
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            ir.MemorySpace.Vec,
+            ir.MemorySpace.Left,
+            ir.MemorySpace.Right,
+            ir.MemorySpace.LeftScale,
+            ir.MemorySpace.RightScale,
+        ],
+    )
+    def test_mx_layout_rejects_non_mat_target(self, target):
         tensor = _mx_tensor_var("s", 16, 8)
-        with pytest.raises(ValueError, match="Mat|Vec"):
-            tile.load(tensor, [0, 0], [16, 8], target_memory=ir.MemorySpace.Vec)
+        with pytest.raises(ValueError, match="only supports target_memory=MemorySpace.Mat"):
+            tile.load(tensor, [0, 0], [16, 8], target_memory=target)
 
     @pytest.mark.parametrize("layout", [ir.TensorLayout.MX_A_ZZ, ir.TensorLayout.MX_B_NN])
     def test_gather_row_rejects_mx_source_at_tensor_and_tile_layers(self, layout):
@@ -142,6 +169,62 @@ class TestMxScaleMemSpaces:
         tensor = _mx_tensor_var("s", 16, 8)
         with pytest.raises(ValueError, match="2D load window"):
             tile.load(tensor, [0], [16], target_memory=ir.MemorySpace.Mat)
+
+    def test_blocked_mx_load_accepts_canonical_window_geometry(self):
+        tensor = _mx_blocked_tensor_var("s", [1, 2, 2, 16, 2])
+        call = tile.load(
+            tensor,
+            [0, 1, 1, 0, 0],
+            [1, 1, 1, 16, 2],
+            valid_shape=[1, 1, 1, 16, 2],
+            target_memory=ir.MemorySpace.Mat,
+        )
+        assert isinstance(call.type, ir.TileType)
+
+    @pytest.mark.parametrize(
+        ("field", "index", "value", "match"),
+        [
+            ("tensor_shape", 0, 2, "tensor shape"),
+            ("tensor_shape", 1, 0, "tensor shape"),
+            ("tensor_shape", 2, 0, "tensor shape"),
+            ("tensor_shape", 3, 8, "tensor shape"),
+            ("tensor_shape", 4, 1, "tensor shape"),
+            ("offsets", 0, 1, r"requires offsets \[0, block offset, group offset, 0, 0\]"),
+            ("offsets", 3, 1, r"requires offsets \[0, block offset, group offset, 0, 0\]"),
+            ("offsets", 4, 1, r"requires offsets \[0, block offset, group offset, 0, 0\]"),
+            ("shapes", 3, 8, "requires shapes"),
+            ("valid_shape", 4, 1, "physical valid_shape to equal shapes"),
+        ],
+    )
+    def test_blocked_mx_load_rejects_noncanonical_geometry(self, field, index, value, match):
+        geometry = {
+            "tensor_shape": [1, 2, 2, 16, 2],
+            "offsets": [0, 0, 0, 0, 0],
+            "shapes": [1, 1, 1, 16, 2],
+            "valid_shape": [1, 1, 1, 16, 2],
+        }
+        geometry[field][index] = value
+        tensor = _mx_blocked_tensor_var("s", geometry["tensor_shape"])
+        with pytest.raises(ValueError, match=match):
+            tile.load(
+                tensor,
+                geometry["offsets"],
+                geometry["shapes"],
+                valid_shape=geometry["valid_shape"],
+                target_memory=ir.MemorySpace.Mat,
+            )
+
+    def test_blocked_mx_load_rejects_dynamic_tensor_block_count(self):
+        span = ir.Span.unknown()
+        blocks = ir.Var("blocks", ir.ScalarType(DataType.INDEX), span)
+        tensor = _mx_blocked_tensor_var("s", [1, blocks, 1, 16, 2])
+        with pytest.raises(ValueError, match=r"blocked MX-layout tensor requires tensor shape"):
+            tile.load(
+                tensor,
+                [0, 0, 0, 0, 0],
+                [1, 1, 1, 16, 2],
+                target_memory=ir.MemorySpace.Mat,
+            )
 
     def test_scale_move_rejects_non_scale_dtype(self):
         src = _tile_var(
@@ -246,10 +329,31 @@ class TestMxScaleMemSpaces:
         with pytest.raises(ValueError, match="tensor.slice does not support MX-layout tensors"):
             tensor.slice(source, [8, 8], [1, 0])
 
-    def test_store_rejects_mx_destination(self):
+    @pytest.mark.parametrize(
+        ("destination_layout", "shape", "source_memory", "message"),
+        [
+            (ir.TensorLayout.MX_A_ZZ, (16, 16), ir.MemorySpace.RightScale, "row_major/row_major/32"),
+            (ir.TensorLayout.MX_B_NN, (16, 16), ir.MemorySpace.LeftScale, "col_major/col_major/32"),
+        ],
+    )
+    def test_store_rejects_cross_side_mx_scale_orientation(
+        self, destination_layout, shape, source_memory, message
+    ):
+        destination = _mx_tensor_var("destination", *shape, layout=destination_layout)
+        source = _tile_var(_const_shape(*shape), DataType.FP8E8M0, memory=source_memory)
+        with pytest.raises(ValueError, match=message):
+            tile.store(source, [0, 0], destination)
+
+    def test_store_rejects_non_scale_tile_for_mx_destination(self):
+        destination = _mx_tensor_var("destination", 16, 8)
+        source = _tile_var(_const_shape(16, 8), DataType.FP16, memory=ir.MemorySpace.LeftScale)
+        with pytest.raises(ValueError, match="requires an FP8E8M0 source tile"):
+            tile.store(source, [0, 0], destination)
+
+    def test_store_rejects_unboxed_tile_for_mx_destination(self):
         destination = _mx_tensor_var("destination", 16, 8)
         source = _tile_var(_const_shape(16, 8), DataType.FP8E8M0, memory=ir.MemorySpace.Vec)
-        with pytest.raises(ValueError, match="tile.store does not support MX-layout"):
+        with pytest.raises(ValueError, match="requires a fractal-32 source tile"):
             tile.store(source, [0, 0], destination)
 
     def test_mscatter_rejects_mx_destination(self):
@@ -377,12 +481,14 @@ class TestMxScaleMemSpaces:
             builder.return_stmt(scale)
 
         program = ir.Program([function.get_result()], "mx_load_codegen", span)
+        program = passes.block_mx_scale_tensor_views()(program)
+        program = passes.materialize_tensor_strides()(program)
         pto = codegen.PTOCodegen().generate(program)
-        # MX param views are skipped; tile.load owns the packed rank-5 view
-        # (EmitMxPhysicalView) because PTOAS logical mx_* expansion is incomplete.
+        # The ordinary tensor-view path emits the packed rank-5 descriptor after
+        # BlockMxScaleTensorViews and MaterializeTensorStrides establish its contract.
         assert pto.count("pto.make_tensor_view") == 1
         assert "pto.make_tensor_view %arg0" in pto
-        assert "mx5d_view" in pto
+        assert "mx5d_view" not in pto
         # Logical [16, 2] MX_A_ZZ -> physical [1, 16/16, 2/2, 16, 2]
         assert "shape = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in pto
         assert "strides = [%c32_index, %c32_index, %c32_index, %c2_index, %c1_index]" in pto

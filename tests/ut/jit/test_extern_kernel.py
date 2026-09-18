@@ -40,8 +40,8 @@ def _write_kernel(tmp_path: Path, name: str = "ext.cpp") -> Path:
 
 def _specialize(entry, *args):
     """Run the JIT front-half (bind -> contexts -> specialize) and return source."""
-    pn, _, tmeta, sv, sd, pfd = entry._bind_args(args, {})
-    contexts = entry._build_contexts(tmeta, sv, sd, pfd)
+    pn, _, tmeta, sd, pfd = entry._bind_args(args, {})
+    contexts = entry._build_contexts(tmeta, sd, pfd)
     return Specializer(f"_jit_{entry.__name__}", contexts).specialize()
 
 
@@ -260,7 +260,6 @@ def test_source_hash_tracks_cpp_edits(tmp_path):
 
     h1 = entry._get_source_hash()
     cpp.write_text(_KERNEL_SRC + "\n// changed\n")
-    entry._source_hash = None  # force recompute (normally a fresh interpreter)
     h2 = entry._get_source_hash()
     assert h1 != h2
 

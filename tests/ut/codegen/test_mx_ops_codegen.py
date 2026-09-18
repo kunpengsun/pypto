@@ -110,7 +110,9 @@ class TestMxMatmulCodegen:
                 )
 
         mlir = _emit_incore_mlir(Program)
-        assert "mx5d_view" in mlir
+        assert "cf.assert" not in mlir
+        assert "arith.remui" not in mlir
+        assert "arith.divsi" in mlir or "arith.divui" in mlir
         assert "pto.tload" in mlir
         load = next(line for line in mlir.splitlines() if "pto.tload " in line)
         if source_memory == pl.Mem.SRAM:
@@ -118,13 +120,23 @@ class TestMxMatmulCodegen:
         else:
             assert "source_memory" not in load
         partitions = [line for line in mlir.splitlines() if "partition_view" in line]
-        # Physical TLoad box remains shapes=[16,2] -> one SFractal block row.
         assert any(
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions
-        ), mlir
+        )
 
-    def test_mx_scale_load_accepts_dynamic_narrowed_valid_shape(self):
-        """Dynamic valid_shape must not shrink the physical partition box."""
+    def test_mx_scale_load_joins_layout_and_cache_policy_in_one_attr_dict(self):
+        """An MX scale load declared `cache=BYPASS` carries BOTH attributes.
+
+        The MX ``layout`` and the L2-bypass ``cache_policy`` (pypto #2680) can
+        co-occur on one ``pto.tload``, and PTOAS takes all present attributes in
+        a single dict — two dicts, or a dropped attribute, would not assemble.
+        ``layout`` stays first so an MX load that declares no policy keeps its
+        byte-identical form.
+
+        Verified against a real ptoas v0.61 run of this emit (accepted; the load
+        lowers to ``TLOAD<pto::TLoadL2Hint::NotAllocKeep>``). UTs themselves run
+        with ``skip_ptoas=True``, so the assertion here is on the emitted text.
+        """
 
         @pl.program
         class Program:
@@ -132,23 +144,102 @@ class TestMxMatmulCodegen:
             def main(
                 self,
                 a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
-                valid_rows: pl.Scalar[pl.INDEX],
+            ):
+                _ = pl.load(a_s, [0, 0], [16, 2], target_memory=pl.Mem.Mat, cache=pl.CachePolicy.BYPASS)
+
+        mlir = _emit_incore_mlir(Program)
+        tloads = [line for line in mlir.splitlines() if "pto.tload" in line]
+        assert len(tloads) == 1, f"expected one MX scale load:\n{mlir}"
+        assert (
+            "{layout = #pto.layout<mx_a_zz>, cache_policy = #pto.load_cache_policy<l2_bypass>}" in tloads[0]
+        ), tloads[0]
+
+    def test_mx_scale_load_rejects_unprovable_dynamic_offset(self):
+        """Unaligned / unprovable dynamic MX offsets fail at BlockMxScaleTensorViews."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
+                row_off: pl.Scalar[pl.INDEX],
+                col_off: pl.Scalar[pl.INDEX],
+            ):
+                _ = pl.load(a_s, [row_off, col_off], [16, 2], target_memory=pl.Mem.Mat)
+
+        with pytest.raises(ValueError, match=r"MX_A_ZZ.*cannot be proven|multiple of"):
+            _emit_incore_mlir(Program)
+
+    def test_mx_scale_load_accepts_narrowed_valid_shape(self):
+        """Physical shapes stay fractal-aligned; valid_shape may narrow M."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
             ):
                 _ = pl.load(
                     a_s,
                     [0, 0],
                     [16, 2],
-                    valid_shape=[valid_rows, 2],
+                    valid_shape=[8, 2],
                     target_memory=pl.Mem.Mat,
                 )
 
         mlir = _emit_incore_mlir(Program)
-        assert "mx5d_view" in mlir
         assert "pto.tload" in mlir
         partitions = [line for line in mlir.splitlines() if "partition_view" in line]
+        # Physical TLoad box remains shapes=[16,2] -> one SFractal block row.
         assert any(
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions
-        ), mlir
+        )
+
+    def test_mx_scale_load_rejects_static_misaligned_offset(self):
+        with pytest.raises(ValueError, match=r"MX_A_ZZ.*multiple of 16"):
+
+            @pl.program
+            class Program:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main(self, a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ]):
+                    _ = pl.load(a_s, [8, 0], [16, 2], target_memory=pl.Mem.Mat)
+
+            _emit_incore_mlir(Program)
+
+    def test_mx_scale_load_rejects_static_misaligned_group_offset(self):
+        with pytest.raises(ValueError, match=r"MX_A_ZZ.*multiple of 2"):
+
+            @pl.program
+            class Program:
+                @pl.function(type=pl.FunctionType.InCore)
+                def main(self, a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ]):
+                    _ = pl.load(a_s, [0, 1], [16, 2], target_memory=pl.Mem.Mat)
+
+            _emit_incore_mlir(Program)
+
+    def test_mx_scale_load_floordiv_ks_is_provable(self):
+        """Expert-style ``ks = k0 // 32`` must prove group-axis alignment."""
+
+        @pl.program
+        class Program:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main(
+                self,
+                a_s: pl.Tensor[[16, 64], pl.FP8E8M0, pl.MX_A_ZZ],
+                b_s: pl.Tensor[[64, 32], pl.FP8E8M0, pl.MX_B_NN],
+            ):
+                for k0 in pl.pipeline(256, 2048, 256, stage=1):
+                    ks = k0 // 32
+                    _a = pl.load(a_s, [0, ks], [16, 8], target_memory=pl.Mem.Mat)
+                    _b = pl.load(b_s, [ks, 0], [8, 32], target_memory=pl.Mem.Mat)
+
+        mlir = _emit_incore_mlir(Program)
+        assert "cf.assert" not in mlir
+        assert "pto.tload" in mlir
+        assert "{layout = #pto.layout<mx_a_zz>}" in mlir
+        assert "{layout = #pto.layout<mx_b_nn>}" in mlir
 
     def test_emits_tmatmul_mx_and_tget(self):
         @pl.program
@@ -162,15 +253,11 @@ class TestMxMatmulCodegen:
                 b_s: pl.Tensor[[2, 64], pl.FP8E8M0, pl.MX_B_NN],
                 out: pl.Tensor[[128, 64], pl.FP32],
             ):
-                ta = pl.load(a, [0, 0], [128, 64], target_memory=pl.Mem.Mat)
-                tas = pl.load(a_s, [0, 0], [128, 2], target_memory=pl.Mem.Mat)
-                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
-                tbs = pl.load(b_s, [0, 0], [2, 64], target_memory=pl.Mem.Mat)
-                la = pl.move(ta, target_memory=pl.Mem.Left)
-                las = pl.move(tas, target_memory=pl.Mem.LeftScale)
-                rb = pl.move(tb, target_memory=pl.Mem.Right)
-                rbs = pl.move(tbs, target_memory=pl.Mem.RightScale)
-                c = pl.matmul_mx(la, las, rb, rbs)
+                ta = pl.load(a, [0, 0], [128, 64])
+                tas = pl.load(a_s, [0, 0], [128, 2])
+                tb = pl.load(b, [0, 0], [64, 64])
+                tbs = pl.load(b_s, [0, 0], [2, 64])
+                c = pl.matmul_mx(ta, tas, tb, tbs)
                 pl.store(c, [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
@@ -182,8 +269,12 @@ class TestMxMatmulCodegen:
         assert "make_tensor_view" in mlir and "#pto.layout<mx_a_zz>" in mlir
         assert "#pto.layout<mx_b_nn>" in mlir
         assert "pto.tload" in mlir
-        mx_a_view = next(line for line in mlir.splitlines() if "mx5d_view" in line and "mx_a_zz" in line)
-        mx_b_view = next(line for line in mlir.splitlines() if "mx5d_view" in line and "mx_b_nn" in line)
+        mx_views = [
+            line for line in mlir.splitlines() if "pto.make_tensor_view" in line and "#pto.layout<mx_" in line
+        ]
+        assert len(mx_views) >= 2
+        mx_a_view = next(line for line in mx_views if "mx_a_zz" in line)
+        mx_b_view = next(line for line in mx_views if "mx_b_nn" in line)
         assert "shape = [%c1_index, %c8_index, %c1_index, %c16_index, %c2_index]" in mx_a_view
         assert "strides = [%c256_index, %c32_index, %c32_index, %c2_index, %c1_index]" in mx_a_view
         assert "shape = [%c1_index, %c4_index, %c1_index, %c16_index, %c2_index]" in mx_b_view
@@ -245,14 +336,10 @@ class TestMxMatmulCodegen:
                 out: pl.Tensor[[128, 64], pl.FP32],
             ):
                 ta = pl.cast(pl.load(a, [0, 0], [128, 64]), pl.FP8E4M3FN)
-                tas = pl.load(a_s, [0, 0], [128, 2], target_memory=pl.Mem.Mat)
-                tb = pl.load(b, [0, 0], [64, 64], target_memory=pl.Mem.Mat)
-                tbs = pl.load(b_s, [0, 0], [2, 64], target_memory=pl.Mem.Mat)
-                la = pl.move(ta, target_memory=pl.Mem.Left)
-                las = pl.move(tas, target_memory=pl.Mem.LeftScale)
-                rb = pl.move(tb, target_memory=pl.Mem.Right)
-                rbs = pl.move(tbs, target_memory=pl.Mem.RightScale)
-                pl.store(pl.matmul_mx(la, las, rb, rbs), [0, 0], out)
+                tas = pl.load(a_s, [0, 0], [128, 2])
+                tb = pl.load(b, [0, 0], [64, 64])
+                tbs = pl.load(b_s, [0, 0], [2, 64])
+                pl.store(pl.matmul_mx(ta, tas, tb, tbs), [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
         assert mlir.count("pto.tcvt") == 3
@@ -358,7 +445,11 @@ class TestMxMatmulCodegen:
                 pl.store(pl.matmul_mx(lhs, lhs_scale, rhs, rhs_scale), [0, 0], out)
 
         mlir = _emit_incore_mlir(Program)
-        partitions = [line for line in mlir.splitlines() if "partition_view" in line and "mx5d_view" in line]
+        partitions = [
+            line
+            for line in mlir.splitlines()
+            if "partition_view" in line and "offsets = [%c0_index" in line and "%c16_index" in line
+        ]
         assert any(
             "offsets = [%c0_index, %c1_index, %c1_index, %c0_index, %c0_index]" in line for line in partitions
         )

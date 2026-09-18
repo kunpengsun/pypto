@@ -35,6 +35,8 @@ __all__ = [
     "arange",
     "random",
     "matmul",
+    "quant_mx",
+    "matmul_mx",
     "matmul_acc",
     "mul",
     "muls",
@@ -131,7 +133,7 @@ from pypto.pypto_core import DataType
 from pypto.pypto_core import ir as _ir_core
 from pypto.pypto_core.ir import AtomicType, CachePolicy, Expr, MemorySpace, PadValue, TensorLayout
 
-from ..typing import BoolLike, IntLike, Ptr, Scalar, Tensor, predicate_to_expr
+from ..typing import BoolLike, IntLike, Ptr, Scalar, Tensor, Tile, predicate_to_expr
 
 # Bound TypeVar lets slice / assemble propagate the caller's concrete tensor
 # class (Tensor or its DistributedTensor subclass) through to the return type.
@@ -440,12 +442,10 @@ def set_cache_policy(tensor: Tensor, policy: CachePolicy) -> None:
       ``cache=pl.CachePolicy.DEFAULT`` opts a single read back into the cache
       inside a bypassing scope.
 
-    Current status: PTOAS has no L2-bypass path yet
-    (https://github.com/hw-native-sys/PTOAS/issues/1356). The declaration is
-    carried all the way to codegen, but codegen emits a warning and compiles it
-    as an ordinary cached access, so generated code is unchanged today. Writing
-    the declaration now is what makes the kernel pick the bypass up for free
-    once that lands.
+    Requires PTOAS >= v0.61: a declared read compiles to
+    a ``cache_policy`` attribute on ``pto.tload``, which the assembler lowers to
+    pto-isa's own L2 hint. ``CachePolicy.DEFAULT`` emits nothing, so a read that
+    declares no policy generates exactly the code it did before.
 
     Args:
         tensor: The tensor whose reads the policy applies to. Must be a
@@ -782,6 +782,72 @@ def matmul(
     rhs_expr = rhs.unwrap()
     call_expr = _ir_ops.matmul(lhs_expr, rhs_expr, out_dtype, a_trans, b_trans, c_matrix_nz)
     return Tensor(expr=call_expr)
+
+
+def quant_mx(
+    src: Tensor,
+    *,
+    group_axis: int,
+    dtype: DataType = DataType.FP8E4M3FN,
+) -> tuple[Tensor, Tensor]:
+    """Quantize a 2D tensor to MXFP8 data and its packed FP8E8M0 scale.
+
+    ``group_axis=1`` produces A-oriented ``[M, K]`` data and an
+    ``MX_A_ZZ`` scale tensor ``[M, K/32]``. ``group_axis=0`` accepts B input
+    ``[N, K]`` and produces Cube-oriented ``[K, N]`` data plus ``MX_B_NN``
+    scale ``[K/32, N]``.
+
+    Args:
+        src: Source tensor. Must be a static-rank 2D FP16, BF16, or FP32 tensor.
+        group_axis: Quantization group axis. Use ``1`` for A/LHS data and ``0``
+            for B/RHS data.
+        dtype: Quantized MX data dtype. Defaults to ``FP8E4M3FN``.
+
+    Returns:
+        A pair ``(data, scale)``. ``data`` is the quantized MX tensor and
+        ``scale`` is the packed FP8E8M0 MX scale tensor with the orientation
+        implied by ``group_axis``.
+
+    Raises:
+        ValueError: If ``src`` is not a supported static 2D FP16, BF16, or FP32
+            tensor, K is not divisible by 64, M is not divisible by 16 for
+            ``group_axis=1``, N is not divisible by 32 for ``group_axis=0``,
+            ``group_axis`` is not supported, or ``dtype`` is not a supported MX
+            data dtype.
+    """
+    call_expr = _ir_ops.quant_mx(src.unwrap(), group_axis=group_axis, dtype=dtype)
+    span = call_expr.span
+    return (
+        Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
+        Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 1, span)),
+    )
+
+
+def matmul_mx(lhs: Tensor, lhs_scale: Tensor, rhs: Tensor, rhs_scale: Tensor) -> Tensor:
+    """MXFP8 matrix multiplication returning an FP32 tensor.
+
+    Inputs must use the oriented outputs of :func:`quant_mx`: A data/scale as
+    ``[M, K]`` / ``MX_A_ZZ[M, K/32]`` and B data/scale as
+    ``[K, N]`` / ``MX_B_NN[K/32, N]``.
+
+    Args:
+        lhs: A-side quantized data tensor with shape ``[M, K]``.
+        lhs_scale: A-side ``MX_A_ZZ`` FP8E8M0 scale tensor with shape
+            ``[M, K/32]``.
+        rhs: B-side quantized data tensor with shape ``[K, N]``.
+        rhs_scale: B-side ``MX_B_NN`` FP8E8M0 scale tensor with shape
+            ``[K/32, N]``.
+
+    Returns:
+        FP32 result tensor with shape ``[M, N]``.
+
+    Raises:
+        ValueError: If the operands are not supported static 2D MX tensors, the
+            M/N/K dimensions are inconsistent, M is not divisible by 16, N is
+            not divisible by 32, K is not divisible by 64, or the scale tensors
+            have the wrong dtype, shape, or MX layout.
+    """
+    return Tensor(expr=_ir_ops.matmul_mx(lhs.unwrap(), lhs_scale.unwrap(), rhs.unwrap(), rhs_scale.unwrap()))
 
 
 def matmul_acc(
@@ -1937,6 +2003,8 @@ def cast(
     input: Tensor,
     target_type: int | DataType,
     mode: str | int = "round",
+    *,
+    saturation_mode: str | int | None = None,
 ) -> Tensor:
     """Type casting operation.
 
@@ -1945,12 +2013,24 @@ def cast(
         target_type: Target data type
         mode: Rounding mode — string name ("none", "rint", "round", "floor",
               "ceil", "trunc", "odd") or int (0–6)
+        saturation_mode: Destination saturation — ``"on"`` (1) clamps a
+              rounded value that falls outside the destination range to that
+              range; ``"off"`` (0) keeps the target's non-saturating
+              conversion, including its overflow and non-finite behavior.
+              **Defaults to** ``"on"`` **for an integer destination**:
+              nothing standard fixes what an overflowing conversion to an
+              integer produces, clamping is the safer of the two to get by
+              accident, and it is what the hardware converts natively. A float
+              destination keeps the target's own IEEE behavior (an out-of-range
+              narrowing yields an infinity) unless you ask otherwise. When the
+              cast lowers to a chain of native conversions, the mode applies to
+              the final hop.
 
     Returns:
         Tensor wrapping the cast operation
     """
     input_expr = input.unwrap()
-    call_expr = _ir_ops.cast(input_expr, target_type, mode)
+    call_expr = _ir_ops.cast(input_expr, target_type, mode, saturation_mode=saturation_mode)
     return Tensor(expr=call_expr)
 
 
@@ -2251,6 +2331,14 @@ def gather(input: Tensor, dim: int, index: Tensor) -> Tensor: ...
 
 
 @overload
+def gather(input: Tensor | Tile, dim: Tensor | Tile) -> Tensor: ...
+
+
+@overload
+def gather(input: Tensor | Tile, *, index: Tensor | Tile) -> Tensor: ...
+
+
+@overload
 def gather(input: Tensor, *, mask_pattern: int, output_dtype: int | DataType | None = None) -> Tensor: ...
 
 
@@ -2267,9 +2355,9 @@ def gather(
 
 
 def gather(
-    input: Tensor,
-    dim: int | None = None,
-    index: Tensor | None = None,
+    input: Tensor | Tile,
+    dim: int | Tensor | Tile | None = None,
+    index: Tensor | Tile | None = None,
     *,
     mask_pattern: int | None = None,
     output_dtype: int | DataType | None = None,
@@ -2279,18 +2367,39 @@ def gather(
     offset: int = 0,
     count_dtype: int | DataType | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
-    """Gather elements of ``input`` (tensor-level) — index / mask / compare form.
+    """Gather elements of ``input`` — flat / axis / mask / compare form.
 
     The tensor layer exposes a single unified ``gather``. Based on the arguments
-    you pass, it lowers to one of three tile-level ops:
+    you pass, it selects the matching form and lowering:
 
-    Index form (``dim`` + ``index``) → [`pl.tile.gather`][pypto.language.tile.gather]::
+    Flat form (``index``, no ``dim``)::
+
+        output = input.reshape(-1)[index]
+
+        Also accepts ``pl.gather(input, index)``. Runtime indices are 2D INT32;
+        shape and valid shape follow ``index``, dtype follows ``input``
+        (FP16/FP32/INT16/INT32). Indices must address valid source elements;
+        negative indexing and bounds checking are unsupported.
+        Contiguous ND GM sources use [`pl.tile.mgather`][pypto.language.tile.mgather];
+        static 2D unboxed row-major Vec sources use
+        [`pl.tile.gather`][pypto.language.tile.gather] with managed packing/scratch.
+        On-chip source rows must be 32-byte aligned unless there is only one row.
+        GM operands accept local distributed windows; tile indices must be
+        unboxed row-major Vec. Physical index columns must be positive static
+        multiples of 16 for FP16/INT16, or 8 for FP32/INT32, including single-row
+        tiles. Pad physical storage and use ``set_validshape`` for narrower
+        valid regions, which need not be aligned.
+
+    Axis form (``dim`` + ``index``) → [`pl.tile.gather`][pypto.language.tile.gather],
+    for example ``dim=1``::
 
         output[b, k] = input[b, index[b, k]]
 
-        MVP: only rank-2 inputs with ``dim == -1`` (or ``rank - 1``).
+        Lowering supports rank-2/rank-3 inputs and any axis, including negative axes.
         ``index`` must be an INT32 tensor, or INT16 when ``input`` is a 16-bit
-        dtype (FP16/INT16); its shape matches ``input`` on every axis except ``dim``.
+        dtype (FP16/INT16; INT16 indices require A5). Its rank matches ``input``;
+        non-gather extents cannot exceed the source. Output shape follows ``index``
+        and dtype follows ``input``.
 
     Mask form (``mask_pattern=<int>``) → [`pl.tile.gather_mask`][pypto.language.tile.gather_mask]:
         Selects columns of each row by a fixed hardware mask pattern. Last-dim
@@ -2303,9 +2412,11 @@ def gather(
         ``[1, rows] count_dtype``.
 
     Args:
-        input: Source tensor (FP16/FP32/INT16/INT32).
-        dim: (index form) Axis to gather along; only ``-1`` / ``rank - 1`` accepted in MVP.
-        index: (index form) Index tensor (INT32, or INT16 with a 16-bit input), same rank as input.
+        input: Source tensor (FP16/FP32/INT16/INT32); flat form also accepts a Tile.
+        dim: Axis to gather along; omit for flat indexing. A tensor/tile in this
+            positional slot is interpreted as the flat index.
+        index: Flat form: 2D INT32 tensor/tile. Axis form: tensor with the same
+            rank as ``input`` and the index dtype constraints above.
         mask_pattern: (mask form, keyword-only) Mask pattern selector (1-7).
             1=P0101, 2=P1010, 3=P0001, 4=P0010, 5=P0100, 6=P1000, 7=P1111.
         output_dtype: (mask form, keyword-only) Optional output dtype with the same
@@ -2322,54 +2433,34 @@ def gather(
         Tensor (index/mask form) or ``(dst, cdst)`` tuple (compare form).
 
     Examples:
+        out = gather(input, index=flat_idx)
+        out = gather(input, flat_idx)
         out = gather(input, dim=-1, index=idx)
         out = gather(input, mask_pattern=1)
         out = gather(input, mask_pattern=pl.tile.MaskPattern.P1010, output_dtype=pl.UINT32)
         dst, cdst = gather(input, kvalue=kv, cmp_mode="eq", out_cols=8)
     """
-    is_index = dim is not None or index is not None
-    is_mask = mask_pattern is not None
-    is_compare = kvalue is not None or cmp_mode is not None or out_cols is not None
-    if int(is_index) + int(is_mask) + int(is_compare) > 1:
-        raise ValueError(
-            "gather() index form (dim, index), mask form (mask_pattern=...) and "
-            "compare form (kvalue=..., cmp_mode=..., out_cols=...) are mutually "
-            "exclusive; do not mix kwargs from different forms"
-        )
-    if is_mask:
-        call_expr = _ir_ops.gather(input.unwrap(), mask_pattern=mask_pattern, output_dtype=output_dtype)
-        return Tensor(expr=call_expr)
-    if is_compare:
-        if kvalue is None or cmp_mode is None or out_cols is None:
-            raise ValueError("gather() compare form requires kvalue, cmp_mode and out_cols all set")
-        if output_dtype is not None:
-            raise ValueError(
-                "output_dtype is only valid for the mask form of gather(); use mask_pattern=<int>"
-            )
+    kv_expr = None
+    if kvalue is not None:
         kv_expr = kvalue.unwrap() if isinstance(kvalue, Scalar) else _normalize_expr(kvalue)
-        call_expr = _ir_ops.gather(
-            input.unwrap(),
-            kvalue=kv_expr,
-            cmp_mode=cmp_mode,
-            out_cols=out_cols,
-            offset=offset,
-            count_dtype=count_dtype,
-        )
+    call_expr = _ir_ops.gather(
+        input.unwrap(),
+        dim.unwrap() if isinstance(dim, (Tensor, Tile)) else dim,
+        index.unwrap() if index is not None else None,
+        mask_pattern=mask_pattern,
+        output_dtype=output_dtype,
+        kvalue=kv_expr,
+        cmp_mode=cmp_mode,
+        out_cols=out_cols,
+        offset=offset,
+        count_dtype=count_dtype,
+    )
+    if isinstance(call_expr.type, _ir_core.TupleType):
         span = call_expr.span
         return (
             Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 0, span)),
             Tensor(expr=_ir_core.TupleGetItemExpr(call_expr, 1, span)),
         )
-    if output_dtype is not None:
-        raise ValueError("output_dtype is only valid for the mask form of gather(); use mask_pattern=<int>")
-    if not is_index:
-        raise ValueError(
-            "gather() requires (dim, index) for index form, mask_pattern=<int> for mask form, "
-            "or (kvalue=..., cmp_mode=..., out_cols=...) for compare form"
-        )
-    if dim is None or index is None:
-        raise ValueError("gather() index form requires both dim and index")
-    call_expr = _ir_ops.gather(input.unwrap(), dim, index.unwrap())
     return Tensor(expr=call_expr)
 
 

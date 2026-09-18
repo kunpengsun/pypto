@@ -19,6 +19,7 @@
 
 #include <any>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -105,14 +106,18 @@ TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
   // tensor.matmul requires exactly 2 Expr arguments (lhs, rhs)
   CHECK(args.size() == 2) << "tensor.matmul requires exactly 2 arguments (lhs, rhs), but got " << args.size();
 
-  // First two arguments must be TensorType
-  auto lhs_type = As<TensorType>(args[0]->GetType());
-  auto rhs_type = As<TensorType>(args[1]->GetType());
+  // Both operands must be tensor-shaped. ``AsTensorTypeLike`` accepts a
+  // ``DistributedTensorType`` (window) operand the same as a plain tensor
+  // (issue #1694): inside an InCore scope a window is just this rank's local GM,
+  // so the Cube loads it through the same ``tile.load``. The product is fresh
+  // local data, so the result below is a plain ``TensorType``, never a window view.
+  auto lhs_type = AsTensorTypeLike(args[0]->GetType());
+  auto rhs_type = AsTensorTypeLike(args[1]->GetType());
 
-  CHECK(lhs_type) << "tensor.matmul requires first argument to be a TensorType, but got "
-                  << args[0]->GetType()->TypeName();
-  CHECK(rhs_type) << "tensor.matmul requires second argument to be a TensorType, but got "
-                  << args[1]->GetType()->TypeName();
+  CHECK(lhs_type) << "tensor.matmul requires first argument to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[0]->GetType()->TypeName();
+  CHECK(rhs_type) << "tensor.matmul requires second argument to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[1]->GetType()->TypeName();
 
   // Extract shapes
   const auto& lhs_shape = lhs_type->shape_;
@@ -228,6 +233,115 @@ TypePtr DeduceTensorMatMulType(const std::vector<ExprPtr>& args,
 }
 
 // ============================================================================
+// tensor.quant_mx: GM MXFP8 quantization
+// ============================================================================
+
+TypePtr DeduceTensorQuantMxType(const std::vector<ExprPtr>& args,
+                                const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  constexpr const char* kOpName = "tensor.quant_mx";
+  const Span span = args.empty() ? Span::unknown() : args[0]->span_;
+  CHECK_SPAN(args.size() == 1, span) << kOpName << " requires exactly one source tensor";
+  auto src = AsTensorTypeLike(args[0]->GetType());
+  CHECK_SPAN(src, span) << kOpName << " requires a TensorType or DistributedTensorType source, but got "
+                        << args[0]->GetType()->TypeName();
+  CHECK_SPAN(src->shape_.size() == 2, span) << kOpName << " requires a 2D source tensor";
+  CHECK_SPAN(src->dtype_ == DataType::FP16 || src->dtype_ == DataType::BF16 || src->dtype_ == DataType::FP32,
+             span)
+      << kOpName << " requires source dtype FP16, BF16, or FP32, but got " << src->dtype_.ToString();
+
+  const int group_axis = GetKwarg<int>(kwargs, "group_axis");
+  CHECK_SPAN(group_axis == 0 || group_axis == 1, span)
+      << kOpName << " group_axis must be 0 or 1, but got " << group_axis;
+  const DataType dtype = GetKwarg<DataType>(kwargs, "dtype", DataType::FP8E4M3FN);
+  CHECK_SPAN(dtype == DataType::FP8E4M3FN, span)
+      << kOpName << " supports only dtype FP8E4M3FN (MXFP8), but got " << dtype.ToString();
+
+  auto dim0 = As<ConstInt>(src->shape_[0]);
+  auto k = As<ConstInt>(src->shape_[1]);
+  CHECK_SPAN(dim0 && k && dim0->value_ > 0 && k->value_ > 0, span)
+      << kOpName << " requires static positive 2D dimensions";
+  CHECK_SPAN(k->value_ % 64 == 0, span) << kOpName << " requires K divisible by 64, but got " << k->value_;
+  const int64_t outer_alignment = group_axis == 1 ? 16 : 32;
+  const char* outer_name = group_axis == 1 ? "M" : "N";
+  CHECK_SPAN(dim0->value_ % outer_alignment == 0, span)
+      << kOpName << " with group_axis=" << group_axis << " requires " << outer_name << " divisible by "
+      << outer_alignment << ", but got " << dim0->value_;
+
+  const auto group_count = std::make_shared<ConstInt>(k->value_ / 32, DataType::INDEX, span);
+  std::vector<ExprPtr> data_shape = src->shape_;
+  std::vector<ExprPtr> scale_shape;
+  TensorLayout scale_layout;
+  if (group_axis == 1) {
+    scale_shape = {src->shape_[0], group_count};
+    scale_layout = TensorLayout::MX_A_ZZ;
+  } else {
+    data_shape = {src->shape_[1], src->shape_[0]};
+    scale_shape = {group_count, src->shape_[0]};
+    scale_layout = TensorLayout::MX_B_NN;
+  }
+  TypePtr data = std::make_shared<TensorType>(std::move(data_shape), dtype);
+  TypePtr scale = std::make_shared<TensorType>(std::move(scale_shape), DataType::FP8E8M0, std::nullopt,
+                                               TensorView(std::vector<ExprPtr>{}, scale_layout));
+  return std::make_shared<TupleType>(std::vector<TypePtr>{data, scale});
+}
+
+// ============================================================================
+// tensor.matmul_mx: oriented MXFP8 matrix multiplication
+// ============================================================================
+
+TypePtr DeduceTensorMatMulMxType(const std::vector<ExprPtr>& args,
+                                 const std::vector<std::pair<std::string, std::any>>& kwargs) {
+  constexpr const char* kOpName = "tensor.matmul_mx";
+  const Span span = args.empty() ? Span::unknown() : args[0]->span_;
+  CHECK_SPAN(args.size() == 4, span) << kOpName << " requires lhs, lhs_scale, rhs, and rhs_scale";
+  CHECK_SPAN(kwargs.empty(), span) << kOpName << " does not accept keyword arguments";
+  auto lhs = AsTensorTypeLike(args[0]->GetType());
+  auto lhs_scale = AsTensorTypeLike(args[1]->GetType());
+  auto rhs = AsTensorTypeLike(args[2]->GetType());
+  auto rhs_scale = AsTensorTypeLike(args[3]->GetType());
+  CHECK_SPAN(lhs && lhs_scale && rhs && rhs_scale, span)
+      << kOpName << " requires all operands to be TensorType or DistributedTensorType";
+  CHECK_SPAN(lhs->shape_.size() == 2 && lhs_scale->shape_.size() == 2 && rhs->shape_.size() == 2 &&
+                 rhs_scale->shape_.size() == 2,
+             span)
+      << kOpName << " requires oriented 2D data and scale tensors";
+  CHECK_SPAN(lhs->dtype_ == DataType::FP8E4M3FN && rhs->dtype_ == DataType::FP8E4M3FN, span)
+      << kOpName << " requires FP8E4M3FN data tensors";
+  CHECK_SPAN(lhs_scale->dtype_ == DataType::FP8E8M0 && rhs_scale->dtype_ == DataType::FP8E8M0, span)
+      << kOpName << " requires FP8E8M0 scale tensors";
+  const auto lhs_layout =
+      lhs_scale->tensor_view_.has_value() ? lhs_scale->tensor_view_->layout : TensorLayout::ND;
+  const auto rhs_layout =
+      rhs_scale->tensor_view_.has_value() ? rhs_scale->tensor_view_->layout : TensorLayout::ND;
+  CHECK_SPAN(lhs_layout == TensorLayout::MX_A_ZZ, span) << kOpName << " requires lhs_scale layout MX_A_ZZ";
+  CHECK_SPAN(rhs_layout == TensorLayout::MX_B_NN, span) << kOpName << " requires rhs_scale layout MX_B_NN";
+
+  auto m = As<ConstInt>(lhs->shape_[0]);
+  auto k_lhs = As<ConstInt>(lhs->shape_[1]);
+  auto k_rhs = As<ConstInt>(rhs->shape_[0]);
+  auto n = As<ConstInt>(rhs->shape_[1]);
+  CHECK_SPAN(
+      m && k_lhs && k_rhs && n && m->value_ > 0 && k_lhs->value_ > 0 && k_rhs->value_ > 0 && n->value_ > 0,
+      span)
+      << kOpName << " requires static positive M, K, and N";
+  CHECK_SPAN(k_lhs->value_ == k_rhs->value_, span)
+      << kOpName << " requires matching K dimensions, but got " << k_lhs->value_ << " and " << k_rhs->value_;
+  CHECK_SPAN(m->value_ % 16 == 0 && n->value_ % 32 == 0 && k_lhs->value_ % 64 == 0, span)
+      << kOpName << " requires M divisible by 16, N divisible by 32, and K divisible by 64";
+  const int64_t groups = k_lhs->value_ / 32;
+  auto check_shape = [span, kOpName](const std::vector<ExprPtr>& shape, int64_t dim0, int64_t dim1,
+                                     const char* operand) {
+    auto got0 = As<ConstInt>(shape[0]);
+    auto got1 = As<ConstInt>(shape[1]);
+    CHECK_SPAN(got0 && got1 && got0->value_ == dim0 && got1->value_ == dim1, span)
+        << kOpName << " requires " << operand << " shape [" << dim0 << ", " << dim1 << "]";
+  };
+  check_shape(lhs_scale->shape_, m->value_, groups, "lhs_scale");
+  check_shape(rhs_scale->shape_, groups, n->value_, "rhs_scale");
+  return std::make_shared<TensorType>(std::vector<ExprPtr>{lhs->shape_[0], rhs->shape_[1]}, DataType::FP32);
+}
+
+// ============================================================================
 // Registration Function for Tensor Matrix Multiplication Operations
 // ============================================================================
 
@@ -245,6 +359,31 @@ REGISTER_OP("tensor.matmul")
       return DeduceTensorMatMulType(args, kwargs);
     });
 
+REGISTER_OP("tensor.quant_mx")
+    .set_op_category("TensorOp")
+    .set_description("MXFP8 quantization of a 2D GM tensor into data and MX scale tensors")
+    .add_argument("src", "FP16/BF16/FP32 source tensor")
+    .set_attr<int>("group_axis")
+    .set_attr<DataType>("dtype")
+    .set_output_arity(2)
+    .no_arg_writes()
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorQuantMxType(args, kwargs);
+    });
+
+REGISTER_OP("tensor.matmul_mx")
+    .set_op_category("TensorOp")
+    .set_description("MXFP8 matrix multiplication of oriented data and scale tensors")
+    .add_argument("lhs", "Left FP8E4M3FN tensor [M, K]")
+    .add_argument("lhs_scale", "Left FP8E8M0 MX_A_ZZ scale tensor [M, K/32]")
+    .add_argument("rhs", "Right FP8E4M3FN tensor [K, N]")
+    .add_argument("rhs_scale", "Right FP8E8M0 MX_B_NN scale tensor [K/32, N]")
+    .f_deduce_type([](const std::vector<ExprPtr>& args,
+                      const std::vector<std::pair<std::string, std::any>>& kwargs) {
+      return DeduceTensorMatMulMxType(args, kwargs);
+    });
+
 // ============================================================================
 // tensor.matmul_acc: Matrix multiplication with accumulation
 // ============================================================================
@@ -256,16 +395,24 @@ TypePtr DeduceTensorMatMulAccType(const std::vector<ExprPtr>& args,
       << "predicate, but got " << args.size();
   CheckMatmulInitCond(args, 3, "tensor.matmul_acc");
 
+  // lhs / rhs take a window operand for the same reason as in tensor.matmul above: the Cube
+  // loads them from GM. The accumulator does NOT -- it is never loaded at all (nothing but the
+  // matrix unit writes L0C), so a window has no data path into it and ConvertTensorToTileOps
+  // would reject it as "tile.matmul_acc requires acc to be a TileType". Keep the exact-kind
+  // match here so that limitation is reported at the call site, with a remedy.
   auto acc_type = As<TensorType>(args[0]->GetType());
-  auto lhs_type = As<TensorType>(args[1]->GetType());
-  auto rhs_type = As<TensorType>(args[2]->GetType());
+  auto lhs_type = AsTensorTypeLike(args[1]->GetType());
+  auto rhs_type = AsTensorTypeLike(args[2]->GetType());
 
   CHECK(acc_type) << "tensor.matmul_acc requires first argument (acc) to be a TensorType, but got "
-                  << args[0]->GetType()->TypeName();
-  CHECK(lhs_type) << "tensor.matmul_acc requires second argument (lhs) to be a TensorType, but got "
-                  << args[1]->GetType()->TypeName();
-  CHECK(rhs_type) << "tensor.matmul_acc requires third argument (rhs) to be a TensorType, but got "
-                  << args[2]->GetType()->TypeName();
+                  << args[0]->GetType()->TypeName()
+                  << ". A distributed window cannot be a Cube accumulator: only the matrix unit "
+                     "writes L0C, so there is no data path from GM into it. Accumulate into a "
+                     "local tensor and store the result into the window afterwards.";
+  CHECK(lhs_type) << "tensor.matmul_acc requires second argument (lhs) to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[1]->GetType()->TypeName();
+  CHECK(rhs_type) << "tensor.matmul_acc requires third argument (rhs) to be a TensorType or "
+                  << "DistributedTensorType, but got " << args[2]->GetType()->TypeName();
 
   const auto& acc_shape = acc_type->shape_;
   const auto& lhs_shape = lhs_type->shape_;

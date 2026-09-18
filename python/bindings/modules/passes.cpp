@@ -67,6 +67,8 @@ void BindPass(nb::module_& m) {
       .value("UseAfterDef", IRProperty::UseAfterDef, "All variable uses are dominated by a definition")
       .value("HierarchyOutlined", IRProperty::HierarchyOutlined,
              "Hierarchy scopes outlined into level/role functions")
+      .value("GraphOutlined", IRProperty::GraphOutlined,
+             "Graph scopes outlined into FunctionType::Graph functions")
       .value("StructuredCtrlFlow", IRProperty::StructuredCtrlFlow,
              "No BreakStmt/ContinueStmt — only structured control flow")
       .value("VectorKernelSplit", IRProperty::VectorKernelSplit,
@@ -146,7 +148,19 @@ void BindPass(nb::module_& m) {
              "Every tile.gemv/tile.gemv_acc/tile.gemv_bias with acc_phase=AccPhase.Final is paired in "
              "the "
              "same straight-line region with exactly one tile.store of that value using "
-             "st_phase=STPhase.Final, and every final store has such a live producer");
+             "st_phase=STPhase.Final, and every final store has such a live producer")
+      .value("NoScalarKernelReturn", IRProperty::NoScalarKernelReturn,
+             "No device function (InCore / AIC / AIV / Group / Spmd) returns a Scalar. Those types "
+             "mean a dispatchable task, and the runtime passes scalars in by value while returning "
+             "only tensors, so such a return has no carrier -- write the value into a [1] tensor "
+             "output and read it back with pl.tensor.read. Scalar[TASK_ID] is exempt, and a "
+             "device-side scalar helper belongs in an Inline function")
+      .value("AivSplitLoweredValid", IRProperty::AivSplitLoweredValid,
+             "Lowered AIV split regions and compatible flat bodies have valid cross-core boundaries")
+      .value("BufferIR", IRProperty::BufferIR,
+             "InCore/AIC/AIV use explicit buffer handles and valid registered buffer calls; "
+             "includes SSA, lexical use-after-definition, and assignment symmetry, not lifetime or "
+             "initialization proofs");
 
   // Bind IRPropertySet
   auto ir_property_set = nb::class_<IRPropertySet>(passes, "IRPropertySet", "A set of IR properties");
@@ -440,7 +454,9 @@ void BindPass(nb::module_& m) {
              typecheck::ErrorType::DISTRIBUTED_WINDOW_IDENTITY_MISMATCH,
              "Distributed tensors refer to different window buffers")
       .value("TILE_VIEW_MISMATCH", typecheck::ErrorType::TILE_VIEW_MISMATCH,
-             "Effective TileView metadata mismatch");
+             "Effective TileView metadata mismatch")
+      .value("BUFFER_DESCRIPTOR_MISMATCH", typecheck::ErrorType::BUFFER_DESCRIPTOR_MISMATCH,
+             "Buffer descriptor or multi-buffer slot count mismatch");
 
   // Bind NestedCallErrorType enum
   nb::enum_<nested_call::ErrorType>(passes, "NestedCallErrorType", "Nested call verification error types")
@@ -507,6 +523,8 @@ void BindPass(nb::module_& m) {
              "and standalone Spmd scopes into Spmd functions");
   passes.def("outline_hierarchy_scopes", &pass::OutlineHierarchyScopes,
              "Create a pass that outlines Hierarchy scopes into separate level/role functions");
+  passes.def("outline_graph_scopes", &pass::OutlineGraphScopes,
+             "Create a pass that outlines Graph scopes (pl.graph) into FunctionType::Graph functions");
   passes.def("convert_tensor_to_tile_ops", &pass::ConvertTensorToTileOps,
              "Create a pass that converts tensor ops to tile ops in InCore functions");
   passes.def("optimize_orch_tensors", &pass::OptimizeOrchTensors,
@@ -516,12 +534,21 @@ void BindPass(nb::module_& m) {
              "(convert tile.assemble loops to tile.store loops).");
   passes.def("block_nz_tensor_views", &pass::BlockNzTensorViews,
              "Create a pass that rewrites logical pl.NZ tensors into pto-isa's blocked NZ form\n\n"
-             "An NZ TensorType shape [..., R, C] becomes [..., C/c0, R/16, 16, c0], where\n"
-             "c0 is the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
+             "An NZ TensorType shape [B, R, C] becomes [B, C/c0, R/16, 16, c0] and [R, C]\n"
+             "becomes [1, C/c0, R/16, 16, c0] — the leading slot is always present, so a\n"
+             "rank-2 tensor gets a batch extent of 1 rather than a shorter shape. c0 is\n"
+             "the element count of a 32-byte C0 line (256 / dtype bits), and every\n"
              "consuming tile.load has its offsets / shapes / valid_shape rewritten into\n"
              "blocked coordinates while its logical 2-D destination TileType is preserved.\n"
              "Must run after ConvertTensorToTileOps and after FlattenTileNdTo2D (it\n"
              "requires TileOps2D: the destination tile must already be 2-D).");
+  passes.def("block_mx_scale_tensor_views", &pass::BlockMxScaleTensorViews,
+             "Create a pass that rewrites logical MX scale tensors into A5's packed rank-5 form\n\n"
+             "MX_A_ZZ [M, G] and MX_B_NN [G, N] become [1, block/16, group/2, 16, 2].\n"
+             "The pass rewrites tile.load windows and ND/MX backing aliases while preserving\n"
+             "logical tile result types. Symbolic offsets must be provably aligned and\n"
+             "non-negative. Must run after FlattenTileNdTo2D and before\n"
+             "MaterializeTensorStrides.");
   passes.def("flatten_tile_nd_to_2d", &pass::FlattenTileNdTo2D,
              "Create a pass that flattens ND tile ops to 2D in InCore functions\n\n"
              "Merges all dimensions except the last into a single dimension.\n"
@@ -619,6 +646,11 @@ void BindPass(nb::module_& m) {
              "LowerHostTensorCollectives, while the host dispatch chain is still intact.");
   passes.def("lower_host_tensor_collectives", &pass::LowerHostTensorCollectives,
              "Lower host-level pld.tensor.allreduce calls to builtin tensor collective dispatches.");
+  passes.def("lower_l2_tensor_collectives", &pass::LowerL2TensorCollectives,
+             "Lower managed pld.tensor.* collectives written in a CHIP/L2 orchestration body\n"
+             "into one local builtin AIV task (no per-device fan-out, no nested L2 dispatch).\n"
+             "Runs immediately before DeriveCallDirections so the emitted call gets its\n"
+             "argument directions and TensorMap task edges derived like any kernel call.");
   passes.def("materialize_dist_tensor_ctx", &pass::MaterializeDistTensorCtx,
              "Materialize CommCtx parameters and arguments for DistributedTensor function parameters.");
   passes.def("legalize_graph_boundary", &pass::LegalizeGraphBoundary,

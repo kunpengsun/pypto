@@ -13,12 +13,15 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstddef>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -174,6 +177,8 @@ void BindBackend(nb::module_& m) {
   // ========== Backend abstract base class ==========
   nb::class_<Backend>(backend_mod, "Backend", "Abstract backend base class")
       .def("get_type_name", &Backend::GetTypeName, "Get backend type name")
+      .def("get_registered_op_names", &Backend::GetRegisteredOpNames,
+           "Get a sorted snapshot of this backend's registered operator names")
       .def("get_handler", &Backend::GetHandler, nb::rv_policy::reference,
            "Get the per-backend BackendHandler singleton")
       .def("export_to_file", &Backend::ExportToFile, nb::arg("path"), "Export backend to msgpack file")
@@ -222,6 +227,21 @@ void BindBackend(nb::module_& m) {
       nb::rv_policy::reference,
       "Get the BackendHandler for the currently configured backend. "
       "Throws if backend type has not been configured.");
+
+  backend_mod.def(
+      "get_input_tile_layout",
+      [](const std::string& op_name, size_t input_index) -> std::optional<ir::TileLayout> {
+        const auto* spec = backend::BackendConfig::GetBackend()->GetTileLayoutSpec(op_name);
+        if (spec == nullptr || input_index >= spec->input_layouts.size()) {
+          return std::nullopt;
+        }
+        return spec->input_layouts[input_index];
+      },
+      nb::arg("op_name"), nb::arg("input_index"),
+      "Tile layout the configured backend requires for one input of `op_name`, or None when that "
+      "input is unconstrained. ResolveBackendOpLayouts repairs an operand that disagrees, so an "
+      "operator whose lowering addresses its operands linearly must constrain every tile input. "
+      "Throws if the backend type has not been configured.");
 
   backend_mod.def("is_backend_configured", &backend::BackendConfig::IsConfigured,
                   "Check if backend type has been configured.");

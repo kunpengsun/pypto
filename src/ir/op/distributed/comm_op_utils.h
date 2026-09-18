@@ -31,6 +31,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <utility>
 #include <vector>
@@ -138,7 +139,11 @@ inline void ValidateStageFitsTransfer(const std::vector<ExprPtr>& stage_shape,
       cols_static = static_cast<bool>(d);
       if (d) transfer_cols = d->value_;
     } else if (d) {
-      transfer_rows *= d->value_;
+      if (d->value_ > 0 && transfer_rows > std::numeric_limits<int64_t>::max() / d->value_) {
+        transfer_rows = std::numeric_limits<int64_t>::max();
+      } else {
+        transfer_rows *= d->value_;
+      }
     } else {
       rows_static = false;
     }

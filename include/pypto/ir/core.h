@@ -98,6 +98,7 @@ enum class ObjectKind {
   SplitAivScopeStmt,
   RuntimeScopeStmt,
   CommDomainScopeStmt,
+  GraphScopeStmt,
   SeqStmts,
   EvalStmt,
   BreakStmt,
@@ -106,6 +107,9 @@ enum class ObjectKind {
 
   // Type kinds
   UnknownType,
+  VoidType,
+  BufferType,
+  MultiBufferType,
   MemRefType,
   PtrType,
   ScalarType,

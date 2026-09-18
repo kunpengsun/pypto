@@ -47,10 +47,12 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::SplitIncoreOrch, CreateSplitIncoreOrchPropertyVerifier);
   Register(IRProperty::ClusterOutlined, CreateClusterOutlinedPropertyVerifier);
   Register(IRProperty::HierarchyOutlined, CreateHierarchyOutlinedPropertyVerifier);
+  Register(IRProperty::GraphOutlined, CreateGraphOutlinedPropertyVerifier);
   Register(IRProperty::HasMemRefs, CreateHasMemRefsPropertyVerifier);
   Register(IRProperty::IncoreTileOps, CreateIncoreTileOpsPropertyVerifier);
   Register(IRProperty::MixedKernelExpanded, CreateMixedKernelExpandedPropertyVerifier);
   Register(IRProperty::AivSplitValid, CreateAivSplitValidPropertyVerifier);
+  Register(IRProperty::AivSplitLoweredValid, CreateAivSplitLoweredValidPropertyVerifier);
   Register(IRProperty::AllocatedMemoryAddr, CreateAllocatedMemoryAddrPropertyVerifier);
   Register(IRProperty::TileOps2D, CreateTileOps2DPropertyVerifier);
   Register(IRProperty::TileMemoryInferred, CreateTileMemoryInferredPropertyVerifier);
@@ -68,6 +70,7 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   Register(IRProperty::IterArgCarryClassified, CreateIterArgCarryClassifiedPropertyVerifier);
   Register(IRProperty::CallDirectionsResolved, CreateCallDirectionsResolvedPropertyVerifier);
   Register(IRProperty::TileTypeCoherence, CreateTileTypeCoherencePropertyVerifier);
+  Register(IRProperty::BufferIR, CreateBufferIRPropertyVerifier);
   Register(IRProperty::AccToGmStoreValid, CreateAccToGmStoreValidPropertyVerifier);
   Register(IRProperty::AccCompactValid, CreateAccCompactValidPropertyVerifier);
   // AtomicAddDtypeValid: an atomic-add into a bf16 GM destination is A2/A3-only
@@ -79,6 +82,13 @@ PropertyVerifierRegistry::PropertyVerifierRegistry() {
   // after InlineFunctions, so a final producer returned by an Inline helper is
   // analyzed in the same function and region as its consuming store.
   Register(IRProperty::AccStorePhaseValid, CreateAccStorePhaseValidPropertyVerifier);
+  // NoScalarKernelReturn (#631): the runtime has no scalar output channel, so a
+  // ScalarType in a device function's return_types_ is unrepresentable. Also in
+  // GetStructuralProperties(), so it fires at every pass boundary — rejecting a
+  // user-written signature at pipeline input and catching any pass that
+  // synthesises one.
+  Register(IRProperty::NoScalarKernelReturn, CreateNoScalarKernelReturnPropertyVerifier);
+
   Register(IRProperty::InlineFunctionsEliminated, CreateInlineFunctionsEliminatedPropertyVerifier);
   Register(IRProperty::OrchestrationReferencesResolved,
            CreateOrchestrationReferencesResolvedPropertyVerifier);

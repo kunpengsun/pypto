@@ -204,21 +204,6 @@ class PTOCodegen : public CodegenBase {
   [[nodiscard]] std::string TryGetTensorView(const ir::VarPtr& tensor) const;
 
   /**
-   * @brief Record that a tensor's `CachePolicy.BYPASS` request has been reported.
-   *
-   * A declaration is made once per tensor but read by every load of it, and a
-   * load inside an unrolled loop is emitted many times over. Diagnose the
-   * declaration, not the emission: this returns true only the FIRST time the
-   * current function sees @p tensor, so the caller warns once per tensor per
-   * kernel. State lives on the per-function frame, so the next kernel warns
-   * about its own tensors again.
-   *
-   * @param tensor Tensor variable key (`VarPtr::get()`, like `tensor_to_view`)
-   * @return true if this is the first report for @p tensor in this function
-   */
-  bool NoteCacheBypassWarned(const ir::Var* tensor);
-
-  /**
    * @brief Get or emit a numeric constant of any dtype (int, index, or float).
    *
    * Both overloads write the constant to the constants section on first use and
@@ -496,6 +481,10 @@ class PTOCodegen : public CodegenBase {
     std::string source_type;
     std::string row_off_ssa;
     std::string col_off_ssa;
+    /// Original pure index expressions. Equal expressions can emit different
+    /// scalar SSAs, but still name the same slice/writeback window.
+    ir::ExprPtr row_offset;
+    ir::ExprPtr col_offset;
     std::string materialize_target_ssa;
     std::string materialize_target_type;
     std::optional<ir::MemorySpace> source_memory_space;
@@ -731,7 +720,7 @@ class PTOCodegen : public CodegenBase {
  protected:
   // Statement-entry dispatch guard: rejects any SplitAivScopeStmt that survived
   // to PTO codegen (it must be lowered and erased by LowerAutoVectorSplit,
-  // pass 21). The base visitor would otherwise silently unwrap it.
+  // pass 23). The base visitor would otherwise silently unwrap it.
   void VisitStmt(const ir::StmtPtr& stmt) override;
 
   // Override visitor methods for code generation - Statements
@@ -786,6 +775,13 @@ class PTOCodegen : public CodegenBase {
    * @brief Generate PTO-ISA MLIR for a single function
    */
   void GenerateFunction(const ir::FunctionPtr& func);
+
+  // Experimental direct emission for explicitly constructed Buffer IR. This
+  // path never enters Tile/MemRef allocation or handle discovery.
+  static bool UsesBufferIR(const ir::FunctionPtr& func);
+  void GenerateBufferFunction(const ir::FunctionPtr& func);
+  bool TryEmitBufferCall(const ir::CallPtr& call, const ir::VarPtr& result = nullptr);
+  std::string EmitBufferIntegerOperand(const ir::ExprPtr& expr, DataType target);
 
   /**
    * @brief Collect deterministic GM slot buffer byte offsets for frontend pipe ids in a module.
@@ -960,6 +956,7 @@ class PTOCodegen : public CodegenBase {
 
   /// Per-function mutable state that is reset at the start of each GenerateFunction call.
   struct FunctionState {
+    bool buffer_ir = false;
     std::ostringstream constants_section;
     std::ostringstream body_section;
     std::string constants_indent;  ///< Fixed indent for constants_section (set once per function)
@@ -993,11 +990,6 @@ class PTOCodegen : public CodegenBase {
     std::map<std::string, SubviewMaterializationInfo> subview_materializations;
     /// SSA names emitted as tile views (`pto.subview` / `pto.treshape`).
     std::set<std::string> tile_view_names;
-
-    /// Tensor vars whose `CachePolicy.BYPASS` request has already been reported
-    /// (pypto #2534). Keeps the diagnostic one-per-tensor instead of
-    /// one-per-emitted-load. See NoteCacheBypassWarned.
-    std::set<const ir::Var*> cache_bypass_warned;
 
     /// Eligible multi-buffer regions, keyed by the allocation's base Ptr.
     std::map<const ir::Var*, MultiBufferRegion> multi_buffer_regions;
@@ -1075,6 +1067,7 @@ class PTOCodegen : public CodegenBase {
     std::vector<std::string> yield_buffer;
 
     void Reset() {
+      buffer_ir = false;
       constants_section.str("");
       constants_section.clear();
       body_section.str("");
@@ -1096,7 +1089,6 @@ class PTOCodegen : public CodegenBase {
       ssa_to_tile_buf_type.clear();
       subview_materializations.clear();
       tile_view_names.clear();
-      cache_bypass_warned.clear();
 
       temp_counter = 0;
       used_ssa_names.clear();

@@ -168,6 +168,7 @@ class PassManager:
         )
         tensor_only_passes: tuple[PassFactory, ...] = (
             passes.outline_hierarchy_scopes,
+            passes.outline_graph_scopes,
             passes.outline_incore_scopes,
             passes.outline_cluster_scopes,
             passes.convert_tensor_to_tile_ops,
@@ -176,7 +177,7 @@ class PassManager:
         tile_pto_passes: tuple[PassFactory, ...] = (
             passes.lower_composite_ops,
             passes.flatten_tile_nd_to_2d,
-            # Rewrite `pl.NZ` tensors into pto-isa's blocked rank-(r+2) form and
+            # Rewrite `pl.NZ` tensors into pto-isa's blocked rank-5 form and
             # retarget their tile.load coordinates. Runs immediately after
             # FlattenTileNdTo2D so the destination tile is already the logical 2D
             # operand: blocking a still-ND-rank tile would leave a tile.load whose
@@ -184,6 +185,10 @@ class PassManager:
             # its ND2NZ window collapse for NZ sources so the logical window is
             # still intact here.
             passes.block_nz_tensor_views,
+            # Physicalize logical MX_A_ZZ / MX_B_NN scale tensors and their
+            # tile.load windows into A5's packed rank-5 SFractal form. This is
+            # independent from NZ blocking and owns its own offset proofs.
+            passes.block_mx_scale_tensor_views,
             # Expand non-native tile.cast (src,dst) pairs into shortest native
             # cast chains (e.g. A5 INT32→FP16 → INT32→FP32→FP16) before
             # AutoTileMatmulL0 may FIXPIPE-fold already-native f32→bf16/f16.
@@ -234,6 +239,14 @@ class PassManager:
             passes.allocate_memory_addr,
             passes.fold_no_op_reshape,
             passes.fuse_create_assemble_to_slice,
+            # Rewrite a managed collective written in a CHIP/L2 orchestration
+            # body into one local builtin AIV task. It runs here, immediately
+            # before DeriveCallDirections, because the emitted call must get its
+            # argument directions and TensorMap task edges derived like any
+            # other kernel call — that is what orders compute -> collective ->
+            # consume inside a single per-rank pipeline. HOST orchestrators are
+            # untouched; they keep the per-device fan-out rail below.
+            passes.lower_l2_tensor_collectives,
             passes.derive_call_directions,
             lambda: passes.auto_derive_task_dependencies(analyze_auto_scopes=analyze_auto_scopes_for_deps),
             passes.expand_manual_phase_fence,

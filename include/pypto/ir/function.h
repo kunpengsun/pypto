@@ -417,9 +417,9 @@ inline constexpr const char* kAttrSpmdUnwrapped = "spmd_unwrapped";
  * @brief Reserved Function attr key marking an AIV kernel that runs on BOTH
  * vector sub-lanes of a mixed kernel.
  *
- * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 20) and
- * ``SplitVectorKernel`` (pass 23) onto the AIV lane, and by
- * ``ExpandMixedKernel`` (pass 21) for the backend-inferred no-split case
+ * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 23) and
+ * ``SplitVectorKernel`` (pass 26) onto the AIV lane, and by
+ * ``ExpandMixedKernel`` (pass 24) for the backend-inferred no-split case
  * (``BackendHandler::RequiresNoSplitDualAivDispatch``). Read by PTO codegen
  * (``PTOCodegen::IsDualAivDispatchFunction`` — subblock-aware emission),
  * orchestration codegen (both-lanes MixedKernel dispatch) and
@@ -439,30 +439,18 @@ inline constexpr const char* kAttrDualAivDispatch = "dual_aiv_dispatch";
  *
  * Value type: ``bool``. Written by ``ScopeOutliner`` (pass 8) when it outlines a
  * CORE_GROUP scope containing ``SplitAivScopeStmt`` regions, and re-stamped by
- * ``LowerAutoVectorSplit`` (pass 20) on the functions it lowers. Read by
- * ``SplitVectorKernel`` (pass 23, to stamp ``dual_aiv_dispatch`` without
- * re-halving an already-lowered body), ``MemoryReuse`` (pass 33 — it gates the
+ * ``LowerAutoVectorSplit`` (pass 23) on the functions it lowers. Read by
+ * ``SplitVectorKernel`` (pass 26, to stamp ``dual_aiv_dispatch`` without
+ * re-halving an already-lowered body), ``MemoryReuse`` (pass 36 — it gates the
  * Ascend910B ``tile.load`` + ``tpop_from_aic`` in-place hazard guard) and
  * ``VerifyAivSplit`` (provenance for the boundary-op checks). Never stripped.
  *
  * ``MemoryReuse`` keys on this marker rather than on ``Function::GetSplitMode``
  * precisely because a multi-mode region function has no single function-level
- * mode once pass 20 has lowered and erased the per-region ones — dropping the
+ * mode after region consumption in ExpandMixedKernel — dropping the
  * marker there silently disables a hardware-correctness guard.
  */
 inline constexpr const char* kAttrSplitAiv = "split_aiv";
-
-/**
- * @brief Reserved Function attr key recording that ``pl.split_aiv`` regions were
- * already transpose-hazard-checked per region.
- *
- * Value type: ``bool``. Written by ``LowerAutoVectorSplit`` (pass 20), which
- * validates each region against its own unambiguous mode. Read by
- * ``ExpandMixedKernel`` (pass 21) to skip its single-function-mode transpose
- * check, which would otherwise mis-check a multi-mode function against whichever
- * mode happened to be stamped function-level. Never stripped.
- */
-inline constexpr const char* kAttrSplitAivRegionValidated = "split_aiv_region_validated";
 
 /**
  * @brief Reserved Function attr key naming a hand-written external C++ kernel
@@ -484,14 +472,41 @@ inline constexpr const char* kAttrSplitAivRegionValidated = "split_aiv_region_va
 inline constexpr const char* kAttrExternalSource = "external_source";
 
 /**
+ * @brief Reserved Function attr key naming the builtin template package that
+ * supplies a compiler-synthesized kernel's hand-written C++ source.
+ *
+ * Value type: ``std::string`` — an OpRegistry-style package-resource handle
+ * (``":pypto.runtime.builtins.collectives.all_to_all_v"``), the same form
+ * ``OpRegistryEntry::set_template_dir`` uses.
+ *
+ * Written by ``LowerL2TensorCollectives`` on the AIV function it synthesizes
+ * for a managed CHIP/L2 collective; read by the PTO backend, which renders the
+ * package's ``templates/kernel.cpp.in`` into the chip sub-build and lists the
+ * result in ``kernel_config.py``. Like ``kAttrExternalSource``, the function
+ * carries no PyPTO-generated kernel body, so ptoas is skipped for it.
+ */
+inline constexpr const char* kAttrBuiltinTemplateDir = "builtin_template_dir";
+
+/**
+ * @brief Reserved Function attr key carrying the substitutions used to render
+ * the template named by ``kAttrBuiltinTemplateDir``.
+ *
+ * Value type: ``std::string`` — a comma-separated ``key=value`` list (e.g.
+ * ``"dtype_cpp=float,ctx_arg_index=5"``). A flat string keeps the payload to a
+ * type the printer, serializer and attr binding already round-trip; the backend
+ * splits it back into the template variable map.
+ */
+inline constexpr const char* kAttrBuiltinTemplateVars = "builtin_template_vars";
+
+/**
  * @brief Reserved Function attr key opting a function out of automatic
  * ``RuntimeScopeStmt`` materialization.
  *
  * Value type: ``bool``; **absent means true**, so only the opt-out (``false``)
  * is ever stored. Written by the ``@pl.function(auto_scope=False)`` decorator and
- * by ``MaterializeRuntimeScopes`` (pass 44), which stamps ``false`` on the
+ * by ``MaterializeRuntimeScopes`` (pass 49), which stamps ``false`` on the
  * functions it has already processed. Read by that same pass (idempotence),
- * ``AutoDeriveTaskDependencies`` (pass 38), ``VerifyRuntimeScopesMaterialized``
+ * ``AutoDeriveTaskDependencies`` (pass 42), ``VerifyRuntimeScopesMaterialized``
  * and the Python printer.
  *
  * Decorator-only, for the same reason as ``kAttrExternalSource`` — see there.
@@ -541,6 +556,9 @@ class Function : public IRNode {
         role_(role),
         attrs_(std::move(attrs)),
         requires_runtime_binding_(requires_runtime_binding) {
+    for (const auto& return_type : return_types_) {
+      detail::CheckValueType(return_type, span_, "Function return type; use an empty return_types list");
+    }
     CHECK(params_.size() == param_directions_.size())
         << "params and param_directions must have same size, got " << params_.size() << " vs "
         << param_directions_.size();

@@ -55,6 +55,7 @@ struct AccPackingPlan {
   DataType dtype = DataType::FP32;  ///< 4-byte accumulator element type.
   std::vector<int64_t> batch_dims;  ///< The ND batch dims, for per-page drain offsets.
   std::vector<int64_t> nd_shape;    ///< The full pre-flatten ND accumulator shape.
+  bool row_windows = false;         ///< Logical 2-D row windows, drained back along rows.
 };
 
 /// Which (pre-rewrite) Vars name a column-packed accumulator, and with what
@@ -115,6 +116,9 @@ bool IsNdTile(const TileTypePtr& tile_type);
 int64_t GetStaticDim(const ExprPtr& expr, const std::string& context);
 std::pair<int64_t, int64_t> ComputeMergedShape(const std::vector<ExprPtr>& shape, const std::string& context);
 ExprPtr MakeShapeTupleFromInts(const std::vector<int64_t>& dims, const Span& span);
+std::vector<ExprPtr> ComputeStorePartitionShape(const std::vector<ExprPtr>& tile_shape,
+                                                const std::vector<ExprPtr>& tensor_shape,
+                                                const std::vector<ExprPtr>& offsets, const Span& span);
 std::vector<ExprPtr> Make2DShapeExprs(int64_t merged, int64_t last, const Span& span);
 std::vector<ExprPtr> ComputeMergedValidShape(const std::vector<ExprPtr>& valid, const Span& span);
 ExprPtr MakeCanonicalIndexAdd(const ExprPtr& lhs, const ExprPtr& rhs, const Span& span);

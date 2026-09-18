@@ -8,11 +8,10 @@ The policy is a *contract the author states*, never a hint the compiler infers.
 It is therefore written explicitly, at one of two granularities, and is carried
 unchanged from the DSL to codegen.
 
-> **Current status**: PTOAS has no L2-bypass path yet
-> ([PTOAS#1356](https://github.com/hw-native-sys/PTOAS/issues/1356)), so a
-> `BYPASS` declaration currently **warns and compiles as an ordinary cached
-> access**. Generated code is byte-identical with and without it. See
-> [Current status](#current-status).
+> **Requires PTOAS >= v0.61** (`PTOAS_VERSION` in `toolchain/versions.env`). A
+> `BYPASS` declaration becomes a `cache_policy` attribute on `pto.tload`, which
+> the assembler lowers to pto-isa's own L2 hint. See
+> [What codegen emits](#what-codegen-emits).
 
 ## Two surfaces
 
@@ -140,34 +139,34 @@ a reason; none of them is interchangeable with the others.
 
 ```text
 pl.set_cache_policy(b, BYPASS)                 statement, consumed at parse
-  -> ScopeStmt.attrs_["cache_policy_vars"]     parse .. pass 8   (Var identity)
-  -> Function attr "cache_policy"              pass 8 .. pass 10 (param INDICES)
-  -> tile.load kwarg "cache"                   pass 10 .. codegen
-  -> codegen: warn, emit an ordinary cached access
+  -> ScopeStmt.attrs_["cache_policy_vars"]     parse .. pass 9   (Var identity)
+  -> Function attr "cache_policy"              pass 9 .. pass 11 (param INDICES)
+  -> tile.load kwarg "cache"                   pass 11 .. codegen
+  -> codegen: `cache_policy` attribute on each emitted `pto.tload`
 ```
 
 | Hop | Carrier | Payload type | Written by | Consumed by |
 | --- | ------- | ------------ | ---------- | ----------- |
-| 1 | `ScopeStmt.attrs_[kAttrCachePolicyVars]` | `vector<pair<VarPtr, int>>` | DSL parser | [`OutlineIncoreScopes`](../passes/08-outline_incore_scopes.md) (pass 8) |
-| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`, sorted by index | pass 8 | [`ConvertTensorToTileOps`](../passes/10-convert_tensor_to_tile_ops.md) (pass 10) |
-| 3 | `tile.load` kwarg `cache` | `int` (`ir::CachePolicy`) | pass 10 | PTO codegen |
+| 1 | `ScopeStmt.attrs_[kAttrCachePolicyVars]` | `vector<pair<VarPtr, int>>` | DSL parser | [`OutlineIncoreScopes`](../passes/09-outline_incore_scopes.md) (pass 9) |
+| 2 | `Function.attrs_[kAttrCachePolicyParams]` | `vector<pair<int32_t, int>>`, sorted by index | pass 9 | [`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md) (pass 11) |
+| 3 | `tile.load` kwarg `cache` | `int` (`ir::CachePolicy`) | pass 11 | PTO codegen |
 
 Design notes that keep the chain honest:
 
 - **Not a field on `TensorView`.** A plain kernel parameter has no
   `tensor_view_` at all, so stamping a policy there would force one into
   existence — dragging in the strict `TensorViewCanonical` verifier, and
-  [`MaterializeTensorStrides`](../passes/31-materialize_tensor_strides.md)
+  [`MaterializeTensorStrides`](../passes/33-materialize_tensor_strides.md)
   rebuilds the view through a positional constructor that would silently drop
   the field.
 - **Param indices are valid only across passes 8..10.** Only
   `OutlineClusterScopes` sits between them, and it does not mutate an outlined
   InCore param list. Downstream passes *do*:
-  [`InjectGMPipeBuffer`](../passes/23-inject_gm_pipe_buffer.md) and
-  [`MaterializeDistTensorCtx`](../passes/44-materialize_dist_tensor_ctx.md)
+  [`InjectGMPipeBuffer`](../passes/25-inject_gm_pipe_buffer.md) and
+  [`MaterializeDistTensorCtx`](../passes/47-materialize_dist_tensor_ctx.md)
   append, and
-  [`MaterializeValidShapeSymbols`](../passes/49-materialize_valid_shape_symbols.md)
-  *prepends*. That is why pass 10 erases the attr after converting it.
+  [`MaterializeValidShapeSymbols`](../passes/52-materialize_valid_shape_symbols.md)
+  *prepends*. That is why pass 11 erases the attr after converting it.
 - **The kwarg is an `int`, not the enum.** It follows `tile.store`'s `atomic`
   kwarg, so the serializer, deserializer, `structural_hash` and
   `structural_equal` need no new enum arm. `pl.CachePolicy` is bound
@@ -193,26 +192,43 @@ with pl.at(level=pl.Level.CORE_GROUP, name_hint="mm"):
 | Ordering | Position-normalising — markers always print first, however the author ordered them; the parser hoists them from anywhere in the body |
 | Spmd inline forms | Printed from the nested InCore carrier, whose `pl.at(...)` header the Spmd printer inlines away |
 | Otherwise-empty scope | A scope holding only a declaration prints the marker instead of `pass` |
-| Function attr (`cache_policy`) | Prints as a list of `(index, policy)` tuples, so a pass dump taken between pass 8 and pass 10 — the only window where it exists — re-parses |
+| Function attr (`cache_policy`) | Prints as a list of `(index, policy)` tuples, so a pass dump taken between pass 9 and pass 11 — the only window where it exists — re-parses |
 
-## Current status
+## What codegen emits
 
-PTOAS has no L2-bypass path yet
-([PTOAS#1356](https://github.com/hw-native-sys/PTOAS/issues/1356)). Codegen
-therefore carries the request all the way down, then compiles it as an ordinary
-cached access and warns once per tensor per kernel (not once per emitted load —
-an unrolled loop emits the same load many times):
+A `BYPASS` read becomes one attribute on the emitted load — there is no extra
+operation, no second tensor view, and no architecture-specific address alias:
 
-```text
-[warning] [CacheBypassUnsupported] tensor 'b' requests CachePolicy.BYPASS, but PTOAS
-has no L2-bypass path yet (https://github.com/hw-native-sys/PTOAS/issues/1356);
-compiling as an ordinary cached access at <file>:<line>
+```mlir
+pto.tload ins(%b__ssa_v0_pview : !pto.partition_tensor_view<256x256xf32>)
+          outs(%b__ssa_v0_mat  : !pto.tile_buf<loc=mat, ...>)
+          {cache_policy = #pto.load_cache_policy<l2_bypass>}
 ```
 
-The generated MLIR is **byte-identical** with and without the declaration.
-Writing it today is what makes a kernel pick the bypass up for free when the
-PTOAS side lands: at that point the warn site is replaced in place by a
-bypass-rooted tensor view, and nothing upstream of codegen changes.
+PTOAS >= v0.61 lowers that to pto-isa's own L2 hint, which is the whole
+difference in the generated CCE:
+
+```diff
+-  TLOAD(v45, v50);
++  TLOAD<pto::TLoadL2Hint::NotAllocKeep>(v45, v50);
+```
+
+Three properties of the emit are worth stating, because each one is asserted in
+`tests/ut/codegen/test_cache_policy_codegen.py`:
+
+| Property | Why |
+| -------- | --- |
+| `CachePolicy.DEFAULT` emits **nothing** | A kernel that states no policy keeps the PTO form it had before this existed, so the attribute is the only difference between two otherwise identical kernels |
+| The attribute is emitted **per load**, not per tensor | It is a property of the instruction; a hint on only the first of two loads would leave the second one allocating in L2 (the superseded `[CacheBypassUnsupported]` diagnostic was deliberately once-per-tensor — the opposite granularity) |
+| It joins the MX `layout` in **one** attribute dict, after it | PTOAS takes all present attributes in a single dict; keeping `layout` first leaves an MX load that declares no policy byte-identical |
+
+### Older assemblers
+
+The emit is unconditional: there is no version gate, and no mechanism in the
+tree reads the pinned assembler version at compile time. A build pointed at an
+assembler older than the `PTOAS_VERSION` this repo pins is therefore out of
+contract — `cache_policy` is a v0.61 addition, so expect it to fail the
+`pto.tload` verifier there.
 
 ### Limits
 
@@ -240,5 +256,5 @@ bypass-rooted tensor view, and nothing upstream of codegen changes.
 
 - [Statements and Control Flow](01-statements.md) — scope forms and the other
   parse-time markers (`pl.dump_tag`, `pl.static_assert`).
-- [OutlineIncoreScopes](../passes/08-outline_incore_scopes.md) — hop 1 → hop 2.
-- [ConvertTensorToTileOps](../passes/10-convert_tensor_to_tile_ops.md) — hop 2 → hop 3.
+- [OutlineIncoreScopes](../passes/09-outline_incore_scopes.md) — hop 1 → hop 2.
+- [ConvertTensorToTileOps](../passes/11-convert_tensor_to_tile_ops.md) — hop 2 → hop 3.

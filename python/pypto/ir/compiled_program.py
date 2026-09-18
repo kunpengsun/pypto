@@ -38,10 +38,11 @@ import json
 import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
+from pypto._artifact_contract import ArtifactExecutionMode, ExecutionCapabilities
 from pypto.backend import BackendType
 from pypto.pypto_core import DataType
 from pypto.pypto_core import backend as _backend_core
@@ -63,6 +64,7 @@ from .param_info import (  # noqa: F401  -- re-export
     ParamInfo,
     _ParamInfo,
     _to_torch_dtype,
+    bind_complete_args,
 )
 
 # Type alias for arguments accepted by CompiledProgram.__call__().
@@ -73,6 +75,10 @@ from .param_info import (  # noqa: F401  -- re-export
 # coerced to the correct ctypes type internally).
 CallArg = torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool | ctypes._SimpleCData
 
+if TYPE_CHECKING:
+    from pypto.runtime._artifact_runtime import ArtifactRuntime
+
+
 # Filename of the small JSON sidecar persisted alongside the build artifacts so
 # a single-orchestration program can be reconstructed (``from_dir``) without the
 # live IR -- the L2 counterpart of ``distributed_meta.json``. Bump
@@ -82,7 +88,7 @@ CallArg = torch.Tensor | DeviceTensor | StackedDeviceTensor | int | float | bool
 # independently, so a change to *that* shared format must bump this schema AND
 # ``distributed_compiled_program._META_SCHEMA``.
 _COMPILED_META_FILENAME = "compiled_meta.json"
-_COMPILED_META_SCHEMA = 1
+_COMPILED_META_SCHEMA = 2
 
 # The L3 counterpart, kept here so both names sit next to the marker table below;
 # ``distributed_compiled_program`` re-exports it and owns its schema constant.
@@ -353,12 +359,18 @@ def _load_meta(meta_path: Path, *, filename: str, schema: int) -> dict[str, Any]
         raise _bad(f"expected a JSON object, got {type(meta).__name__}")
 
     found_schema = meta.get("schema")
-    if found_schema != schema:
+    if type(found_schema) is not int or found_schema != schema:
         raise ValueError(
             f"Incompatible {filename} schema {found_schema!r} (expected "
             f"{schema}) in {meta_path}. The metadata was written by a "
             f"different pypto version — recompile via ir.compile() to refresh."
         )
+
+    try:
+        capabilities = ExecutionCapabilities.from_record(meta.get("supported_execution_modes"))
+        capabilities.require(ArtifactExecutionMode.PROGRAM)
+    except ValueError as exc:
+        raise _bad(str(exc)) from exc
 
     raw_params = meta.get("params")
     if not isinstance(raw_params, list):
@@ -388,6 +400,7 @@ def _load_meta(meta_path: Path, *, filename: str, schema: int) -> dict[str, Any]
         raise _bad(f"'platform' must be a string or absent, got {type(platform).__name__}")
 
     return {
+        "execution_capabilities": capabilities,
         "param_infos": param_infos,
         "num_return_types": num_return_types,
         "platform": platform,
@@ -582,7 +595,7 @@ def _coerce_args(  # noqa: PLR0912 — branches for in-place vs return + scalar/
     return_style = has_return and len(args) == n_inputs
 
     if len(args) == n_params:
-        all_args: list[CallArg] = list(args)
+        all_args = bind_complete_args(args, param_infos, caller_name=caller_name)
     elif return_style:
         all_args = _build_full_args(args, param_infos, output_indices)
     else:
@@ -637,6 +650,7 @@ def _invoke_compiled(
     args: tuple["CallArg", ...],
     config: Any,
     caller_name: str,
+    artifact_runtime: Any = None,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...] | None":
     """Shared dispatch: coerce args, call the runtime, pack outputs.
 
@@ -669,6 +683,7 @@ def _invoke_compiled(
         dfx=config.dfx_options(),
         aicpu_thread_num=config.aicpu_thread_num,
         config=config,
+        **({"artifact_runtime": artifact_runtime} if artifact_runtime is not None else {}),
     )
 
     if not return_style:
@@ -736,6 +751,12 @@ class _RuntimeFacade:
     _chip_callable: Any
     _runtime_name: str | None
     _runtime_config: dict[str, Any] | None
+    _execution_capabilities: ExecutionCapabilities
+
+    @property
+    def execution_capabilities(self) -> ExecutionCapabilities:
+        """Artifact consumers declared at compilation, without loading a runtime."""
+        return self._execution_capabilities
 
     def _check_runtime_access(self) -> None:
         """Hook run before the first compile-and-load. Default: allow.
@@ -748,9 +769,13 @@ class _RuntimeFacade:
         if self._chip_callable is not None:
             return
         self._check_runtime_access()
-        from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
+        artifact_runtime = getattr(self, "_artifact_runtime", None)
+        if artifact_runtime is None:
+            from pypto.runtime.device_runner import _compile_and_assemble  # noqa: PLC0415
 
-        cc, rn, rc = _compile_and_assemble(self._output_dir, self._platform)
+            cc, rn, rc = _compile_and_assemble(self._output_dir, self._platform)
+        else:
+            cc, rn, rc = artifact_runtime.load()["."]
         # Publish the "loaded" sentinel (_chip_callable) last so a reader can
         # never observe it set while _runtime_name / _runtime_config are None.
         self._runtime_name = rn
@@ -815,6 +840,7 @@ class CompiledProgram(_RuntimeFacade):
     """
 
     __test__ = False  # Not a pytest test class
+    _artifact_runtime: "ArtifactRuntime | None" = None
 
     def __init__(
         self,
@@ -827,12 +853,15 @@ class CompiledProgram(_RuntimeFacade):
         _output_indices: list[int] | None = None,
         _return_types: list[Any] | None = None,
         _sub_chip_names: Sequence[str] | None = None,
+        _execution_capabilities: ExecutionCapabilities = ExecutionCapabilities(),
     ) -> None:
         # ``program`` is ``None`` on the :meth:`from_dir` reload path: param
         # metadata is supplied pre-derived via the ``_param_infos`` /
         # ``_output_indices`` / ``_return_types`` kwargs (read back from
         # ``compiled_meta.json``), and the runtime artefacts are assembled from
         # the on-disk ``kernel_config.py`` -- so no live IR is needed.
+        _execution_capabilities.require(ArtifactExecutionMode.PROGRAM)
+        self._execution_capabilities = _execution_capabilities
         self._program = program
         self._output_dir = Path(output_dir).resolve()
         self._backend_type = backend_type
@@ -934,6 +963,7 @@ class CompiledProgram(_RuntimeFacade):
         """
         meta = {
             "schema": _COMPILED_META_SCHEMA,
+            "supported_execution_modes": self.execution_capabilities.record(),
             "params": [_param_info_to_dict(p) for p in param_infos],
             "num_return_types": len(return_types),
             "platform": self._platform,
@@ -1071,6 +1101,7 @@ class CompiledProgram(_RuntimeFacade):
             _output_indices=output_indices,
             _return_types=return_types,
             _sub_chip_names=[],
+            _execution_capabilities=meta["execution_capabilities"],
         )
 
     # --- Properties -----------------------------------------------------------
@@ -1322,7 +1353,9 @@ class CompiledProgram(_RuntimeFacade):
             raise KeyError(
                 f"next_levels/{name}/ exists but function {name!r} is missing from the program IR."
             )
-        return _SubChipCallable(name, func, self._sub_chip_dirs[name], self._platform)
+        return _SubChipCallable(
+            name, func, self._sub_chip_dirs[name], self._platform, self.execution_capabilities
+        )
 
     def __getattr__(self, name: str) -> "_SubChipCallable":
         # __getattr__ only fires when normal attribute lookup fails. Read
@@ -1385,6 +1418,7 @@ class CompiledProgram(_RuntimeFacade):
             args=args,
             config=config,
             caller_name="CompiledProgram",
+            artifact_runtime=getattr(self, "_artifact_runtime", None),
         )
 
 
@@ -1398,7 +1432,16 @@ class _SubChipCallable(_RuntimeFacade):
 
     __test__ = False
 
-    def __init__(self, name: str, func: Function, sub_dir: Path, platform: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        func: Function,
+        sub_dir: Path,
+        platform: str,
+        execution_capabilities: ExecutionCapabilities = ExecutionCapabilities(),
+    ) -> None:
+        execution_capabilities.require(ArtifactExecutionMode.PROGRAM)
+        self._execution_capabilities = execution_capabilities
         self._name = name
         self._func = func
         self._output_dir = sub_dir

@@ -46,6 +46,7 @@
 #include "pypto/ir/program.h"
 #include "pypto/ir/span.h"
 #include "pypto/ir/stmt.h"
+#include "pypto/ir/tile_view_semantics.h"
 #include "pypto/ir/transforms/base/mutator.h"
 #include "pypto/ir/transforms/pass_properties.h"
 #include "pypto/ir/transforms/passes.h"
@@ -61,7 +62,7 @@ namespace {
 /// Assert that an NZ view has already been rewritten into its blocked form.
 ///
 /// ``BlockNzTensorViews`` turns every logical ``pl.Tensor[..., pl.NZ]``
-/// annotation into the blocked rank-(r+2) shape whose trailing dims are
+/// annotation into the blocked rank-5 shape whose trailing dims are
 /// ``[16, c0]`` (see ``BlockNzShape``). Only in that form does NZ have a
 /// canonical stride — the plain row-major one this pass is about to build.
 ///
@@ -80,8 +81,20 @@ void CheckNzViewIsBlocked(const TensorView& view, const std::vector<ExprPtr>& sh
   if (view.layout != TensorLayout::NZ) return;
   INTERNAL_CHECK_SPAN(tensor_view_semantics::IsBlockedNzShape(shape, dtype), span)
       << "Internal error: MaterializeTensorStrides found an NZ tensor whose shape is not blocked "
-      << "(expected rank >= 4 with trailing dims [" << tensor_view_semantics::kNzFractalRow << ", "
-      << tensor_view_semantics::NzC0Elems(dtype) << "]) — BlockNzTensorViews did not run or missed it";
+      << "(expected rank " << tensor_view_semantics::kNzBlockedRank << " with trailing dims ["
+      << tensor_view_semantics::kNzFractalRow << ", " << tensor_view_semantics::NzC0Elems(dtype)
+      << "]), got rank " << shape.size() << " — BlockNzTensorViews did not run or missed it";
+}
+
+/// Assert that an MX scale view has already been rewritten into its packed
+/// rank-5 form. Same rationale as ``CheckNzViewIsBlocked``.
+void CheckMxViewIsBlocked(const TensorView& view, const std::vector<ExprPtr>& shape, const Span& span) {
+  if (!IsMxTensorLayout(view.layout)) return;
+  INTERNAL_CHECK_SPAN(tensor_view_semantics::IsBlockedMxShape(shape), span)
+      << "Internal error: MaterializeTensorStrides found an MX tensor whose shape is not blocked "
+      << "(expected static [1, positive block count, positive group count, "
+      << tile_view_semantics::kMXSFractalRows << ", " << tile_view_semantics::kMXSFractalCols
+      << "]) — BlockMxScaleTensorViews did not run or missed it";
 }
 
 /// Rewrite a TensorType (or recursively a TupleType containing TensorTypes)
@@ -106,6 +119,7 @@ TypePtr MaterializeType(const TypePtr& type, const Span& span) {
     // ordering: an unblocked NZ view is invalid whether or not its stride is
     // explicit.
     CheckNzViewIsBlocked(view, dist_type->shape_, dist_type->dtype_, span);
+    CheckMxViewIsBlocked(view, dist_type->shape_, span);
     if (!view.stride.empty()) {
       return type;
     }
@@ -124,6 +138,7 @@ TypePtr MaterializeType(const TypePtr& type, const Span& span) {
     }
     const TensorView& view = *tensor_type->tensor_view_;
     CheckNzViewIsBlocked(view, tensor_type->shape_, tensor_type->dtype_, span);
+    CheckMxViewIsBlocked(view, tensor_type->shape_, span);
     if (!view.stride.empty()) {
       // Already explicit.
       return type;

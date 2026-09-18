@@ -218,64 +218,70 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     CHECK(tensor_type->dtype_ == DataType::FP8E8M0 || tensor_type->dtype_ == DataType::UINT8)
         << "The operator " << op_name << " of an MX-layout tensor requires FP8E8M0 or UINT8 dtype, but got "
         << tensor_type->dtype_.ToString();
-    CHECK(tensor_type->shape_.size() == 2)
-        << "The operator " << op_name << " of an MX-layout tensor requires a 2D tensor, got rank "
-        << tensor_type->shape_.size();
-    CHECK(shapes_tuple->elements_.size() == 2)
-        << "The operator " << op_name << " of an MX-layout tensor requires a 2D load window, got rank "
-        << shapes_tuple->elements_.size();
-    CHECK(valid_shape_tuple->elements_.size() == 2)
-        << "The operator " << op_name << " of an MX-layout tensor requires 2D valid_shape, got rank "
-        << valid_shape_tuple->elements_.size();
-    const TensorView& source_view = *tensor_type->tensor_view_;
-    const auto packed_stride =
-        tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_, source_view.layout);
-    CHECK(source_view.stride.empty() ||
-          tile_view_semantics::ShapeExprListsEquivalent(source_view.stride, packed_stride))
-        << "The operator " << op_name
-        << " of an MX-layout tensor only supports packed 2D sources; strided sources are not supported";
-    const bool is_mx_a = source_view.layout == TensorLayout::MX_A_ZZ;
-    const size_t block_axis = is_mx_a ? 0 : 1;
-    const size_t group_axis = is_mx_a ? 1 : 0;
-    const std::string layout_name = TensorLayoutToString(source_view.layout);
-    constexpr int64_t kRows = tile_view_semantics::kMXSFractalRows;
-    constexpr int64_t kCols = tile_view_semantics::kMXSFractalCols;
-    // PTOAS / pto-isa special requirement (feeds EmitMxPhysicalView):
-    //   Physical MX GlobalTensor needs SFractal axes [16, 2], so every logical
-    //   block/group *extent*, physical *load shapes*, and *offset* must be
-    //   static and divisible by 16 (block) / 2 (group).  Example: logical
-    //   MX_A_ZZ [64, 4] load shapes [64,4] -> physical [1,4,2,16,2]; a dynamic
-    //   or misaligned shapes extent cannot form that box and A5 TLoad
-    //   static_asserts.
-    //
-    //   *valid_shape* may narrow the tile relative to shapes (partial M/N). The
-    //   hardware transfer still uses fractal-aligned shapes; tile metadata
-    //   carries the narrower valid region for consumers such as matmul_mx.
-    //   Bounds 0 < valid_shape[i] <= shapes[i] are enforced by
-    //   InferWindowReadValidShape.
-    auto check_static_aligned = [&](const ExprPtr& expr, int64_t alignment, int64_t minimum, const char* name,
-                                    const Span& span) {
-      auto value = As<ConstInt>(expr);
-      CHECK_SPAN(value, span) << "The operator " << op_name << " of an " << layout_name
-                              << " tensor requires static " << name;
-      CHECK_SPAN(value->value_ >= minimum && value->value_ % alignment == 0, span)
-          << "The operator " << op_name << " of an " << layout_name << " tensor requires " << name
-          << " >= " << minimum << " and divisible by " << alignment << ", but got " << value->value_;
-    };
-    check_static_aligned(tensor_type->shape_[block_axis], kRows, kRows, "tensor block dimension",
-                         args[0]->span_);
-    check_static_aligned(tensor_type->shape_[group_axis], kCols, kCols, "tensor group dimension",
-                         args[0]->span_);
-    check_static_aligned(shapes_tuple->elements_[block_axis], kRows, kRows, "load block shape",
-                         args[2]->span_);
-    check_static_aligned(shapes_tuple->elements_[group_axis], kCols, kCols, "load group shape",
-                         args[2]->span_);
-    check_static_aligned(offsets_tuple->elements_[block_axis], kRows, 0, "load block offset", args[1]->span_);
-    check_static_aligned(offsets_tuple->elements_[group_axis], kCols, 0, "load group offset", args[1]->span_);
-    // MX cube scale loads are Mat-only (TLoadMxCube*) and require the caller to
-    // spell the target explicitly. The public load interface keeps its ordinary
-    // Vec default, so an omitted target fails instead of being silently changed.
-    CHECK(target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat)
+    // MX has two valid representations at this boundary. Before pass 16,
+    // DSL/type inference sees the logical rank-2 view. After
+    // BlockMxScaleTensorViews, verification and printer round-trips see the
+    // canonical physical rank-5 view. The pass owns MX blocking and offset
+    // proofs; this operator-level code keeps only structural/type safety.
+    if (tensor_type->shape_.size() == 2) {
+      CHECK(shapes_tuple->elements_.size() == 2)
+          << "The operator " << op_name << " of an MX-layout tensor requires a 2D load window, got rank "
+          << shapes_tuple->elements_.size();
+      CHECK(valid_shape_tuple->elements_.size() == 2)
+          << "The operator " << op_name << " of an MX-layout tensor requires 2D valid_shape, got rank "
+          << valid_shape_tuple->elements_.size();
+      const TensorView& source_view = *tensor_type->tensor_view_;
+      const auto packed_stride =
+          tensor_view_semantics::BuildLogicalStridesFromLayout(tensor_type->shape_, source_view.layout);
+      CHECK(source_view.stride.empty() ||
+            tile_view_semantics::ShapeExprListsEquivalent(source_view.stride, packed_stride))
+          << "The operator " << op_name
+          << " of an MX-layout tensor only supports packed 2D sources; strided sources are not supported";
+      // Pass 16 validates static/fractal-aligned extents and proves both
+      // constant and symbolic offsets while converting this logical view.
+    } else {
+      // A rank other than 2 can only be the physical result of pass 16. Keep
+      // this validation here because deserialized or hand-built IR may bypass
+      // the pass; generic codegen must never receive a malformed rank-5 MX
+      // window.
+      CHECK_SPAN(tensor_type->shape_.size() == 5, args[0]->span_)
+          << "The operator " << op_name
+          << " of an MX-layout tensor requires rank 2 before pass 16 or rank 5 after it, got rank "
+          << tensor_type->shape_.size();
+      CHECK_SPAN(tensor_view_semantics::IsBlockedMxShape(tensor_type->shape_), args[0]->span_)
+          << "The operator " << op_name
+          << " of a blocked MX-layout tensor requires tensor shape "
+             "[1, positive block count, positive group count, 16, 2] with static dimensions";
+      CHECK_SPAN(offsets_tuple->elements_.size() == 5 && shapes_tuple->elements_.size() == 5 &&
+                     valid_shape_tuple->elements_.size() == 5,
+                 args[0]->span_)
+          << "The operator " << op_name
+          << " of a blocked MX-layout tensor requires rank-5 offsets/shapes/valid_shape, got "
+          << offsets_tuple->elements_.size() << "/" << shapes_tuple->elements_.size() << "/"
+          << valid_shape_tuple->elements_.size();
+      auto is_const_zero = [](const ExprPtr& expr) {
+        auto value = As<ConstInt>(expr);
+        return value && value->value_ == 0;
+      };
+      CHECK_SPAN(is_const_zero(offsets_tuple->elements_[0]) && is_const_zero(offsets_tuple->elements_[3]) &&
+                     is_const_zero(offsets_tuple->elements_[4]),
+                 args[1]->span_)
+          << "The operator " << op_name
+          << " of a blocked MX-layout tensor requires offsets [0, block offset, group offset, 0, 0]";
+      CHECK_SPAN(tensor_view_semantics::IsBlockedMxShape(shapes_tuple->elements_), args[2]->span_)
+          << "The operator " << op_name
+          << " of a blocked MX-layout tensor requires shapes "
+             "[1, positive block count, positive group count, 16, 2] with static dimensions";
+      CHECK_SPAN(tile_view_semantics::ShapeExprListsEquivalent(valid_shape_tuple->elements_,
+                                                               shapes_tuple->elements_),
+                 args[3]->span_)
+          << "The operator " << op_name
+          << " of a blocked MX-layout tensor requires physical valid_shape to equal shapes";
+    }
+    // MX cube scale loads are Mat-only (TLoadMxCube*). The public load builder
+    // normalizes an omitted target to Mat; raw tile.load IR must carry that
+    // explicit Mat target.
+    CHECK_SPAN(target_memory_opt.has_value() && *target_memory_opt == MemorySpace::Mat, args[0]->span_)
         << "The operator " << op_name << " of an MX-layout tensor requires target_memory=MemorySpace.Mat";
   }
   // Nz/Zn layout: only chosen when target_memory is known. If it is absent,
@@ -327,9 +333,20 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
     // row_major -- an explicit claim contradicting InferImplicitTileLayoutFromShape,
     // which makes it col_major. Because the two disagreed the view could not
     // canonicalize away, and a downstream row_expand_add read the wrong layout.
-  } else if (auto last_dim = As<ConstInt>(shapes_tuple->elements_.back());
-             last_dim && last_dim->value_ == 1) {
-    tile_view.blayout = TileLayout::col_major;
+    //
+    // Derive the layout from the shared helper rather than re-deriving it here.
+    // A hand-rolled `shape.back() == 1` test agrees with the helper only on a
+    // rank-2 shape whose rows exceed one, and diverges on exactly the shapes
+    // the helper excludes: a `[1, 1]` tile (the helper needs rows > 1 for a
+    // column to mean anything) and any rank != 2 shape ending in 1. On those
+    // the stamp was an explicit col_major the helper contradicts, so it could
+    // not canonicalize away and rode into codegen, where `pto.alloc_tile`
+    // rejects a col-major none_box tile whose column byte size
+    // (rows * sizeof(dtype)) is not 32-byte aligned -- 4 bytes for a one-row
+    // FP32 carrier. Routing both through one helper is what keeps them from
+    // drifting again.
+  } else {
+    tile_view.blayout = tile_view_semantics::InferImplicitTileLayoutFromShape(shapes_tuple->elements_);
   }
 
   // Build tile shape from shapes tuple (always in source-tensor coordinates).
@@ -417,9 +434,43 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
       << "The operator " << op_name
       << " requires third argument to be a TensorType or DistributedTensorType, but got "
       << args[2]->GetType()->TypeName();
-  CHECK_SPAN(!output_tensor_type->tensor_view_ || !IsMxTensorLayout(output_tensor_type->tensor_view_->layout),
-             args[2]->span_)
-      << "The operator " << op_name << " does not support MX-layout output tensors";
+  // MX scale tensors are written in their logical 2-D coordinates here. The
+  // BlockMxScaleTensorViews pass converts both the destination and these
+  // coordinates to the packed rank-5 SFractal representation before codegen.
+  // Validate the hardware-facing source contract here so malformed authored
+  // stores remain user errors rather than surfacing as pass/codegen invariants.
+  if (output_tensor_type->tensor_view_ && IsMxTensorLayout(output_tensor_type->tensor_view_->layout)) {
+    const TensorLayout destination_layout = output_tensor_type->tensor_view_->layout;
+    const TileView source_view = tile_view_semantics::GetEffectiveTileView(*tile_type);
+    CHECK_SPAN(tile_type->dtype_ == DataType::FP8E8M0, args[0]->span_)
+        << "The operator " << op_name << " into an MX-layout tensor requires an FP8E8M0 source tile, but got "
+        << tile_type->dtype_.ToString();
+    CHECK_SPAN(source_view.fractal == tile_view_semantics::kMXScaleFractal, args[0]->span_)
+        << "The operator " << op_name << " into an MX-layout tensor requires a fractal-32 source tile";
+
+    const bool is_a = destination_layout == TensorLayout::MX_A_ZZ;
+    const TileLayout required_layout = is_a ? TileLayout::row_major : TileLayout::col_major;
+    CHECK_SPAN(source_view.blayout == required_layout && source_view.slayout == required_layout,
+               args[0]->span_)
+        << "The operator " << op_name << " requires source "
+        << (is_a ? "row_major/row_major/32" : "col_major/col_major/32") << " for "
+        << TensorLayoutToString(destination_layout) << " destination";
+
+    CHECK_SPAN(source_view.valid_shape.size() == 2, args[0]->span_)
+        << "The operator " << op_name << " into an MX-layout tensor requires a 2D source tile";
+    auto rows = As<ConstInt>(source_view.valid_shape[0]);
+    auto cols = As<ConstInt>(source_view.valid_shape[1]);
+    CHECK_SPAN(rows && cols && rows->value_ > 0 && cols->value_ > 0, args[0]->span_)
+        << "The operator " << op_name
+        << " into an MX-layout tensor requires static positive source valid dimensions";
+    const int64_t row_alignment =
+        is_a ? tile_view_semantics::kMXSFractalRows : tile_view_semantics::kMXSFractalCols;
+    const int64_t col_alignment =
+        is_a ? tile_view_semantics::kMXSFractalCols : tile_view_semantics::kMXSFractalRows;
+    CHECK_SPAN(rows->value_ % row_alignment == 0 && cols->value_ % col_alignment == 0, args[0]->span_)
+        << "The operator " << op_name << " requires complete " << row_alignment << "x" << col_alignment
+        << " MX scale boxes, but got source valid shape [" << rows->value_ << ", " << cols->value_ << "]";
+  }
 
   // Optional fourth argument (when 4 args total) must be a shapes tuple
   MakeTuplePtr shapes_tuple;
@@ -502,17 +553,22 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
   const std::vector<ExprPtr>& dest_shape = output_tensor_type->shape_;
   const size_t dest_rank = dest_shape.size();
 
-  // The optional ``shapes`` operand carries FlattenTileNdTo2D's ND partition,
-  // which is a *collapsed-dims* descriptor rather than a rectangle in
-  // destination coordinates: it is built as leading 1s followed by the
-  // pre-flatten tile shape, whose leading extent may be the product of several
-  // destination axes. A [2, 3, 8] gather, for one, stores its collapsed [6, 8]
-  // tile as partition [1, 6, 8], where 6 spans two axes of a destination whose
-  // own axis 1 is only 3. Codegen consumes that through pto.partition_view,
-  // which understands the collapse; reading it as an origin-anchored rectangle
-  // here would both mis-bound the write and place the union on the wrong axes.
-  // So the ND form keeps the destination type it had — recovering the written
-  // region on ND axes is the ND-to-2D mapping problem, not this rule's.
+  // The optional ``shapes`` operand carries FlattenTileNdTo2D's ND partition
+  // window. It IS a rectangle in destination coordinates: a box the destination
+  // contains, anchored at the store's own offsets. It used to be a
+  // *collapsed-dims* descriptor instead — leading 1s followed by the pre-flatten
+  // tile shape, so a [2, 3, 8] gather stored its collapsed [6, 8] tile as
+  // [1, 6, 8], where 6 spanned two axes of a destination whose own axis 1 is
+  // only 3. That form was not lowerable: pto.partition_view describes a box and
+  // nothing else, and PTOAS >= 0.61 rejects an out-of-bounds size outright. The
+  // pass now emits [2, 3, 8] there and refuses the stores that have no box at
+  // all. See ComputeStorePartitionShape.
+  //
+  // Deriving the valid-region union from that rectangle is now possible in
+  // principle, but it is a separate change: the union below is written against
+  // the tile's own extent, and an ND partition covers a window the 2D tile only
+  // describes after the flatten mapping. So the ND form still keeps the
+  // destination type it had.
   if (shapes_tuple) {
     return output_tensor_type;
   }
@@ -636,19 +692,22 @@ TypePtr DeduceTileMoveType(const std::vector<ExprPtr>& args,
   tile_view.slayout = requested_slayout;
 
   // TQUANT produces its exponent bytes as row/row/32 and the MX_B_NN path
-  // materializes col/col/32 with a Vec-to-Vec TMOV.  Vec's ordinary implicit
-  // fractal is 512, so retaining the source's MX-scale marker here keeps the
-  // moved result type consistent with the physical 32-byte scale boxes.  Keep
-  // this exception deliberately narrow: byte-valued scale payloads, complete
-  // row/row or col/col layouts, and a Vec destination.
+  // materializes col/col/32 with a Vec-to-Vec TMOV. Preserve that scale boxing
+  // while staging a public FP8E8M0 scale through Mat for a cross-core transfer.
   const bool source_is_complete_box =
       source_view.blayout == source_view.slayout && source_view.blayout != TileLayout::none_box;
   const bool destination_is_complete_box =
       requested_blayout == requested_slayout && requested_blayout != TileLayout::none_box;
   const bool is_mx_scale_payload =
       tile_type->dtype_ == DataType::UINT8 || tile_type->dtype_ == DataType::FP8E8M0;
-  if (space == MemorySpace::Vec && source_view.fractal == tile_view_semantics::kMXScaleFractal &&
-      source_is_complete_box && destination_is_complete_box && is_mx_scale_payload) {
+  const bool is_vec_move = space == MemorySpace::Vec;
+  const bool is_vec_to_mat_staging =
+      space == MemorySpace::Mat &&
+      (!tile_type->memory_space_.has_value() || tile_type->memory_space_ == MemorySpace::Vec);
+  const bool preserves_mx_scale_boxes = (is_vec_move && is_mx_scale_payload) ||
+                                        (is_vec_to_mat_staging && tile_type->dtype_ == DataType::FP8E8M0);
+  if (preserves_mx_scale_boxes && source_view.fractal == tile_view_semantics::kMXScaleFractal &&
+      source_is_complete_box && destination_is_complete_box) {
     tile_view.fractal = tile_view_semantics::kMXScaleFractal;
   }
 

@@ -885,7 +885,7 @@ class TestConvertTensorToTileOps:
         """``pld.tensor.allreduce(target, signal, op=...)`` upgrades both
         ``target`` and ``signal`` params from In to InOut.
 
-        ConvertTensorToTileOps runs upstream of LowerCompositeOps (pass 12),
+        ConvertTensorToTileOps runs upstream of LowerCompositeOps (pass 13),
         so it sees ``pld.tensor.allreduce`` as a single composite Call before
         the ready-plus-per-chunk decomposition exists. Without the explicit
         ``has_read | has_write`` marking, the param-direction analysis
@@ -3225,6 +3225,86 @@ class TestNestedControlFlow:
         with pytest.raises(pypto.InternalError, match="has no registered tile conversion"):
             passes.convert_tensor_to_tile_ops()(prog)
 
+    def test_gm_for_carry_loads_current_value_without_unused_seed_load(self):
+        """A GM carry may switch tensors, so its initializer cache cannot serve its uses."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, (carried,) in pl.range(2, init_values=(x,)):
+                    r = pl.row_max(carried)
+                    scalar = pl.tensor.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    result = pl.yield_(y)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, (carried,) in pl.range(2, init_values=(x,)):
+                    current = pl.load(carried, [0, 0], [16, 32])
+                    tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                    r = pl.tile.row_max(current, tmp)
+                    scalar = pl.tile.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    result = pl.yield_(y)
+                return result
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_while_carry_loads_current_value_without_unused_seed_load(self):
+        """While carries retain GM identity without allocating an unused entry tile."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    r = pl.row_max(carried)
+                    scalar = pl.tensor.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    _last_i, result = pl.yield_(i + 1, y)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[2], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    current = pl.load(carried, [0, 0], [16, 32])
+                    tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                    r = pl.tile.row_max(current, tmp)
+                    scalar = pl.tile.read(r, [0, 0])
+                    pl.tensor.write(out, [i], scalar)
+                    _last_i, result = pl.yield_(i + 1, y)
+                return result
+
+        _assert_convert_equal(Before, Expected)
+
     def test_iter_arg_init_from_tensor_param_gets_preloaded(self):
         """Tensor parameter used only as ForStmt iter_arg initValue must be pre-loaded.
 
@@ -3341,9 +3421,9 @@ class TestNestedControlFlow:
                 a__tile = pl.load(a, [0], [64])
                 b__tile = pl.load(b, [0], [64])
                 if n == 0:
-                    ra: pl.Tile[[64], pl.FP32] = a__tile
-                    rb: pl.Tile[[64], pl.FP32] = b__tile
-                    phi_a, phi_b = pl.yield_(ra, rb)
+                    _ra: pl.Tensor[[64], pl.FP32] = a
+                    _rb: pl.Tensor[[64], pl.FP32] = b
+                    phi_a, phi_b = pl.yield_(a__tile, b__tile)
                 else:
                     ra__tile = pl.tile.add(a__tile, b__tile)
                     rb__tile = pl.tile.mul(a__tile, b__tile)
@@ -3581,28 +3661,38 @@ class TestGmLocalTensorConversion:
         @pl.program
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
-            def main_incore_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Scalar[pl.FP32]:
+            def main_incore_0(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Tensor[[4], pl.FP32]
+            ) -> pl.Tensor[[4], pl.FP32]:
                 t: pl.Tensor[[64], pl.FP32] = pl.create_tensor([64], dtype=pl.FP32)
                 v: pl.Scalar[pl.FP32] = pl.tensor.read(t, [0])
-                return v
+                pl.tensor.write(out, [0], v)
+                return out
 
             @pl.function
-            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Scalar[pl.FP32]:
-                v: pl.Scalar[pl.FP32] = self.main_incore_0(x)
-                return v
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Tensor[[4], pl.FP32]
+            ) -> pl.Tensor[[4], pl.FP32]:
+                r: pl.Tensor[[4], pl.FP32] = self.main_incore_0(x, out)
+                return r
 
         @pl.program
         class Expected:
             @pl.function(type=pl.FunctionType.InCore)
-            def main_incore_0(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Scalar[pl.FP32]:
+            def main_incore_0(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[4], pl.FP32]]
+            ) -> pl.Tensor[[4], pl.FP32]:
                 t_tile = pl.tile.create([64], dtype=pl.FP32)
                 v_tile = pl.tile.read(t_tile, [0])
-                return v_tile
+                pl.tensor.write(out, [0], v_tile)
+                return out
 
             @pl.function
-            def main(self, x: pl.Tensor[[64], pl.FP32]) -> pl.Scalar[pl.FP32]:
-                v = self.main_incore_0(x)
-                return v
+            def main(
+                self, x: pl.Tensor[[64], pl.FP32], out: pl.Out[pl.Tensor[[4], pl.FP32]]
+            ) -> pl.Tensor[[4], pl.FP32]:
+                r = self.main_incore_0(x, out)
+                return r
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
@@ -3622,17 +3712,17 @@ class TestGmLocalTensorConversion:
                 self,
                 dst: pl.Tensor[[4], pl.FP32],
                 val: pl.Scalar[pl.FP32],
-            ) -> pl.Scalar[pl.FP32]:
+            ) -> pl.Tensor[[4], pl.FP32]:
                 pl.tensor.write(dst, [0], val)
-                return val
+                return dst
 
             @pl.function
             def main(
                 self,
                 dst: pl.Tensor[[4], pl.FP32],
                 val: pl.Scalar[pl.FP32],
-            ) -> pl.Scalar[pl.FP32]:
-                result: pl.Scalar[pl.FP32] = self.main_incore_0(dst, val)
+            ) -> pl.Tensor[[4], pl.FP32]:
+                result: pl.Tensor[[4], pl.FP32] = self.main_incore_0(dst, val)
                 return result
 
         @pl.program
@@ -3642,21 +3732,521 @@ class TestGmLocalTensorConversion:
                 self,
                 dst: pl.Out[pl.Tensor[[4], pl.FP32]],
                 val: pl.Scalar[pl.FP32],
-            ) -> pl.Scalar[pl.FP32]:
+            ) -> pl.Tensor[[4], pl.FP32]:
                 pl.tensor.write(dst, [0], val)
-                return val
+                return dst
 
             @pl.function
             def main(
                 self,
                 dst: pl.Out[pl.Tensor[[4], pl.FP32]],
                 val: pl.Scalar[pl.FP32],
-            ) -> pl.Scalar[pl.FP32]:
+            ) -> pl.Tensor[[4], pl.FP32]:
                 result = self.main_incore_0(dst, val)
                 return result
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+    def test_gm_write_after_reduction_preserves_destination(self):
+        """Loading a compute operand must not redirect its GM side effects."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                r = pl.row_max(x)
+                out[0:16, 0:1] = r
+                pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                xt = pl.load(x, [0, 0], [16, 32])
+                tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                r = pl.tile.row_max(xt, tmp)
+                stored = pl.store(r, [0, 0], out)
+                pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                return stored
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_write_between_computations_reloads_at_each_use(self):
+        """An intervening GM write invalidates the value loaded for computation."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                first: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+                second: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                r = pl.row_max(x)
+                first[0:16, 0:1] = r
+                pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                y = pl.add(x, 2.0)
+                second[0:16, 0:32] = y
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                first: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+                second: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                before = pl.load(x, [0, 0], [16, 32])
+                tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                r = pl.tile.row_max(before, tmp)
+                _stored_first = pl.store(r, [0, 0], first)
+                pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                after = pl.load(x, [0, 0], [16, 32])
+                y = pl.tile.adds(after, 2.0)
+                _stored_second = pl.store(y, [0, 0], second)
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_write_before_computation_is_not_preloaded(self):
+        """A write's returned alias stays GM and is loaded after the write."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                updated: pl.Tensor[[16, 32], pl.FP32] = pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                y = pl.add(updated, x)
+                out[0:16, 0:32] = y
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                updated: pl.Tensor[[16, 32], pl.FP32] = pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                lhs = pl.load(updated, [0, 0], [16, 32])
+                rhs = pl.load(x, [0, 0], [16, 32])
+                y = pl.tile.add(lhs, rhs)
+                _stored = pl.store(y, [0, 0], out)
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_compute_and_scalar_read_preserve_param_return(self):
+        """A read-only tile cache must not change GM scalar reads or return aliases."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[16, 32], pl.FP32], out: pl.Out[pl.Tensor[[16, 1], pl.FP32]]
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                r = pl.row_max(x)
+                value = pl.tensor.read(x, [0, 0])
+                y = pl.add(r, value)
+                out[0:16, 0:1] = y
+                return x
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[16, 32], pl.FP32], out: pl.Out[pl.Tensor[[16, 1], pl.FP32]]
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                xt = pl.load(x, [0, 0], [16, 32])
+                tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                r = pl.tile.row_max(xt, tmp)
+                value = pl.tensor.read(x, [0, 0])
+                y = pl.tile.adds(r, value)
+                _stored = pl.store(y, [0, 0], out)
+                return x
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_window_gm_write_after_reduction_preserves_destination(self):
+        """DistributedTensor GM handles obey the same conversion boundary."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pld.DistributedTensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ):
+                r = pl.row_max(x)
+                out[0:16, 0:1] = r
+                pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pld.DistributedTensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                r = pl.tile.row_max(xt, tmp)
+                _stored = pl.store(r, [0, 0], out)
+                pl.tensor.write(x, [0, 0], pl.const(1.0, pl.FP32))
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_loop_carry_used_by_compute_stays_gm(self):
+        """A GM handle yielded through a write must not become a tile carry."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, (carried,) in pl.range(2, init_values=(x,)):
+                    r = pl.row_max(carried)
+                    out[0:16, 0:1] = r
+                    updated: pl.Tensor[[16, 32], pl.FP32] = pl.tensor.write(
+                        carried, [0, 0], pl.cast(i, pl.FP32)
+                    )
+                    result = pl.yield_(updated)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, (carried,) in pl.range(2, init_values=(x,)):
+                    xt = pl.load(carried, [0, 0], [16, 32])
+                    tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                    r = pl.tile.row_max(xt, tmp)
+                    _stored = pl.store(r, [0, 0], out)
+                    updated: pl.Tensor[[16, 32], pl.FP32] = pl.tensor.write(
+                        carried, [0, 0], pl.cast(i, pl.FP32)
+                    )
+                    result = pl.yield_(updated)
+                return result
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_while_carry_and_branch_write_reload_inside_loop(self):
+        """Neither the loop nor a conditional write may hoist a mutable GM load."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    if i == 0:
+                        alias = carried
+                        pl.tensor.write(alias, [0, 0], pl.const(1.0, pl.FP32))
+                    r = pl.row_max(carried)
+                    out[0:16, 0:1] = r
+                    _last_i, result = pl.yield_(i + 1, carried)
+                return result
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 32], pl.FP32]:
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    if i == 0:
+                        alias = carried
+                        pl.tensor.write(alias, [0, 0], pl.const(1.0, pl.FP32))
+                    xt = pl.load(carried, [0, 0], [16, 32])
+                    tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                    r = pl.tile.row_max(xt, tmp)
+                    _stored = pl.store(r, [0, 0], out)
+                    _last_i, result = pl.yield_(i + 1, carried)
+                return result
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_local_view_write_does_not_modify_a_later_gm_compute_operand(self):
+        """A mutated local snapshot cannot serve as a cache of the GM source."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[16, 32], pl.FP32], out: pl.Out[pl.Tensor[[16, 1], pl.FP32]]
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                snapshot = pl.reshape(x, [32, 16])
+                pl.tensor.write(snapshot, [0, 0], pl.const(1.0, pl.FP32))
+                r = pl.row_max(x)
+                out[0:16, 0:1] = r
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self, x: pl.Tensor[[16, 32], pl.FP32], out: pl.Out[pl.Tensor[[16, 1], pl.FP32]]
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                first = pl.load(x, [0, 0], [16, 32])
+                snapshot = pl.tile.reshape(first, [32, 16])
+                pl.tile.write(snapshot, [0, 0], pl.const(1.0, pl.FP32))
+                second = pl.load(x, [0, 0], [16, 32])
+                tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                r = pl.tile.row_max(second, tmp)
+                stored = pl.store(r, [0, 0], out)
+                return stored
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_alias_chain_projection_loads_the_gm_branch_yield(self):
+        """A projected computed tensor makes its branch result tile-valued."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                flag: pl.Scalar[pl.BOOL],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                local = pl.add(x, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[0]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    value = pl.yield_(y)
+                out[0:16, 0:32] = value
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                flag: pl.Scalar[pl.BOOL],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                local = pl.tile.adds(xt, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[0]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    yt = pl.load(y, [0, 0], [16, 32])
+                    value = pl.yield_(yt)
+                _stored = pl.store(value, [0, 0], out)
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_alias_chain_gm_projection_keeps_branch_yields_gm(self):
+        """A computed sibling must not turn the selected GM element into a tile."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                flag: pl.Scalar[pl.BOOL],
+            ):
+                local = pl.add(x, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[1]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    value = pl.yield_(y)
+                pl.tensor.write(value, [0, 0], pl.const(2.0, pl.FP32))
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                flag: pl.Scalar[pl.BOOL],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                local = pl.tile.adds(xt, 1.0)
+                pair = (local, y)
+                alias = pair
+                inner = alias
+                projected = inner[1]
+                if flag:
+                    value = pl.yield_(projected)
+                else:
+                    value = pl.yield_(y)
+                pl.tensor.write(value, [0, 0], pl.const(2.0, pl.FP32))
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_projection_yield_converts_for_carry_to_tile(self):
+        """Resolve a direct projection after indexing its loop-local tuple."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                for _i, (carried,) in pl.range(2, init_values=(x,)):
+                    local = pl.add(carried, 1.0)
+                    pair = (local, y)
+                    result = pl.yield_(pair[0])
+                out[0:16, 0:32] = result
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                for _i, (carried,) in pl.range(2, init_values=(xt,)):
+                    local = pl.tile.adds(carried, 1.0)
+                    pair = (local, y)
+                    result = pl.yield_(pair[0])
+                _stored = pl.store(result, [0, 0], out)
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_tuple_projection_yield_converts_while_carry_to_tile(self):
+        """A projected tensor leaf propagates through a while carry and result."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                for i, carried in pl.while_(init_values=(0, x)):
+                    pl.cond(i < 2)
+                    local = pl.add(carried, 1.0)
+                    pair = (local, y)
+                    _last_i, result = pl.yield_(i + 1, pair[0])
+                out[0:16, 0:32] = result
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.Tensor[[16, 32], pl.FP32],
+                y: pl.Tensor[[16, 32], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 32], pl.FP32]],
+            ):
+                xt = pl.load(x, [0, 0], [16, 32])
+                for i, carried in pl.while_(init_values=(0, xt)):
+                    pl.cond(i < 2)
+                    local = pl.tile.adds(carried, 1.0)
+                    pair = (local, y)
+                    _last_i, result = pl.yield_(i + 1, pair[0])
+                _stored = pl.store(result, [0, 0], out)
+                return  # noqa: PLR1711 (DSL return terminator)
+
+        _assert_convert_equal(Before, Expected)
+
+    def test_gm_write_through_tuple_alias_precedes_compute_load(self):
+        """Packing a GM handle into a tuple must not hide its write dependency."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                pair = (x, x)
+                alias = pair[0]
+                pl.tensor.write(alias, [0, 0], pl.const(1.0, pl.FP32))
+                r = pl.row_max(x)
+                out[0:16, 0:1] = r
+                return out
+
+        @pl.program
+        class Expected:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                x: pl.InOut[pl.Tensor[[16, 32], pl.FP32]],
+                out: pl.Out[pl.Tensor[[16, 1], pl.FP32]],
+            ) -> pl.Tensor[[16, 1], pl.FP32]:
+                pair = (x, x)
+                alias = pair[0]
+                pl.tensor.write(alias, [0, 0], pl.const(1.0, pl.FP32))
+                xt = pl.load(x, [0, 0], [16, 32])
+                tmp = pl.tile.create([16, 128], dtype=pl.FP32, target_memory=pl.Mem.Vec)
+                r = pl.tile.row_max(xt, tmp)
+                stored = pl.store(r, [0, 0], out)
+                return stored
+
+        _assert_convert_equal(Before, Expected)
 
     def test_mixed_tile_and_scalar_store_to_same_gm_tensor_rejected(self):
         """DMA and scalar stores to one GM tensor have no coherence guarantee."""
@@ -3690,7 +4280,7 @@ class TestGmLocalTensorConversion:
                 dst_index: pl.Tensor[[1, 32], pl.INT32],
                 values: pl.Tensor[[32], pl.INT32],
                 count: pl.Scalar[pl.INDEX],
-            ) -> pl.Scalar[pl.INDEX]:
+            ) -> pl.Tensor[[1, 32], pl.INT32]:
                 pos_fill = pl.full([1, 32], dtype=pl.INT32, value=0)
                 dst_pos[0:1, 0:32] = pos_fill
                 index_fill = pl.full([1, 32], dtype=pl.INT32, value=-1)
@@ -3700,7 +4290,7 @@ class TestGmLocalTensorConversion:
                         value = pl.tensor.read(values, [i])
                         pl.tensor.write(dst_pos, [0, i], value)
                         pl.tensor.write(dst_index, [0, i], pl.cast(i, pl.INT32))
-                return count
+                return dst_pos
 
         after = passes.convert_tensor_to_tile_ops()(Before)
         kernel = _require_function(after, "main_incore_0")
@@ -3718,12 +4308,12 @@ class TestGmLocalTensorConversion:
             def main_incore_0(
                 self,
                 dst: pl.Tensor[[32], pl.INT32],
-            ) -> pl.Scalar[pl.INT32]:
+            ) -> pl.Tensor[[32], pl.INT32]:
                 fill = pl.full([32], dtype=pl.INT32, value=-1)
                 dst[0:32] = fill
                 old = pl.tensor.read(dst, [0])
                 pl.tensor.write(dst, [1], old)
-                return old
+                return dst
 
         with pytest.raises(ValueError, match="mixes MTE3 and scalar stores"):
             passes.convert_tensor_to_tile_ops()(Before)
@@ -3873,37 +4463,55 @@ class TestGmLocalTensorConversion:
         class Before:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(
-                self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]
-            ) -> pl.Scalar[pl.FP32]:
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                b: pl.Tensor[[4], pl.FP32],
+                out: pl.Tensor[[4], pl.FP32],
+            ) -> pl.Tensor[[4], pl.FP32]:
                 t: pl.Tensor[[4], pl.FP32] = pl.add(a, b)
                 val: pl.Scalar[pl.FP32] = pl.tensor.read(a, [0])
                 pl.tensor.write(t, [0], val)
                 v: pl.Scalar[pl.FP32] = pl.tensor.read(t, [0])
-                return v
+                pl.tensor.write(out, [0], v)
+                return out
 
             @pl.function
-            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]) -> pl.Scalar[pl.FP32]:
-                v: pl.Scalar[pl.FP32] = self.main_incore_0(a, b)
-                return v
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                b: pl.Tensor[[4], pl.FP32],
+                out: pl.Tensor[[4], pl.FP32],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                r: pl.Tensor[[4], pl.FP32] = self.main_incore_0(a, b, out)
+                return r
 
         @pl.program
         class Expected:
             @pl.function(type=pl.FunctionType.InCore)
             def main_incore_0(
-                self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]
-            ) -> pl.Scalar[pl.FP32]:
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                b: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
                 a_tile = pl.load(a, [0], [4])
                 b_tile = pl.load(b, [0], [4])
                 t_tile = pl.tile.add(a_tile, b_tile)
-                val = pl.tile.read(a_tile, [0])
+                val = pl.tensor.read(a, [0])
                 pl.tile.write(t_tile, [0], val)
                 v = pl.tile.read(t_tile, [0])
-                return v
+                pl.tensor.write(out, [0], v)
+                return out
 
             @pl.function
-            def main(self, a: pl.Tensor[[4], pl.FP32], b: pl.Tensor[[4], pl.FP32]) -> pl.Scalar[pl.FP32]:
-                v = self.main_incore_0(a, b)
-                return v
+            def main(
+                self,
+                a: pl.Tensor[[4], pl.FP32],
+                b: pl.Tensor[[4], pl.FP32],
+                out: pl.Out[pl.Tensor[[4], pl.FP32]],
+            ) -> pl.Tensor[[4], pl.FP32]:
+                r = self.main_incore_0(a, b, out)
+                return r
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
@@ -4771,6 +5379,207 @@ class TestConvertSortOps:
 
         After = passes.convert_tensor_to_tile_ops()(Before)
         ir.assert_structural_equal(After, Expected)
+
+
+class TestConvertFlatGatherOp:
+    @pytest.mark.parametrize("source_type", [ir.TensorType, ir.DistributedTensorType])
+    @pytest.mark.parametrize("index_type", [ir.TensorType, ir.DistributedTensorType])
+    def test_tensor_like_operands_use_gm_lowering(self, source_type, index_type):
+        span = ir.Span.unknown()
+        extra_specs = [
+            ("src", source_type([ir.ConstInt(65536, DataType.INDEX, span)], DataType.FP32)),
+            ("idx", index_type([ir.ConstInt(n, DataType.INDEX, span) for n in (1, 16)], DataType.INT32)),
+        ]
+        before = _make_before(
+            in_specs=[],
+            extra_specs=extra_specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins, extras: ib.let("y", tensor_ops.gather(extras[0], extras[1])),
+        )
+
+        def expected_body(ib, ins, extras):
+            idx = ib.let(
+                "gather_idx",
+                tile_ops.load(extras[1], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec),
+            )
+            return ib.let("y_tile", tile_ops.mgather(extras[0], idx, coalesce="elem"))
+
+        expected = _make_expected(
+            in_specs=[],
+            extra_specs=extra_specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=expected_body,
+            preload=False,
+        )
+        ir.assert_structural_equal(passes.convert_tensor_to_tile_ops()(before), expected)
+
+    def test_tensor_index_lowered_to_mat_is_rejected(self):
+        def body(ib, ins):
+            idx = ib.let("idx", tensor_ops.create_l1([1, 16], DataType.INT32))
+            return ib.let("y", tensor_ops.gather(ins[0], index=idx))
+
+        before = _make_before(
+            in_specs=[("src", [65536], DataType.FP32)], out_shape=[1, 16], out_dtype=DataType.FP32, body=body
+        )
+        with pytest.raises(ValueError, match="indices in Vec"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_converter_rechecks_index_layout(self):
+        def body(ib, ins):
+            idx = ib.let("idx", tile_ops.load(ins[1], [0, 0], [16, 16], target_memory=MemorySpace.Vec))
+            idx = ib.let("transposed", tile_ops.transpose_view(idx))
+            # A typed call models IR supplied by an earlier transform; the
+            # converter must check the actual lowered operand as well.
+            call = ir.Call(
+                ir.get_op("tensor.gather"),
+                [ins[0], idx],
+                ir.TensorType([16, 16], DataType.FP32),
+                ir.Span.unknown(),
+            )
+            return ib.let("y", call)
+
+        before = _make_before(
+            in_specs=[("src", [1024], DataType.FP32), ("idx", [16, 16], DataType.INT32)],
+            out_shape=[16, 16],
+            out_dtype=DataType.FP32,
+            body=body,
+        )
+        with pytest.raises(ValueError, match="indices with an unboxed row-major layout"):
+            passes.convert_tensor_to_tile_ops()(before)
+
+    def test_gm_source_is_not_loaded(self):
+        specs = [("src", [65536], DataType.FP32), ("idx", [1, 16], DataType.INT32)]
+        before = _make_before(
+            in_specs=specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=lambda ib, ins: ib.let("y", tensor_ops.gather(ins[0], index=ins[1])),
+        )
+
+        def expected_body(ib, ins):
+            idx = ib.let(
+                "gather_idx", tile_ops.load(ins[1], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec)
+            )
+            return ib.let("y_tile", tile_ops.mgather(ins[0], idx, coalesce="elem"))
+
+        expected = _make_expected(
+            in_specs=specs,
+            out_shape=[1, 16],
+            out_dtype=DataType.FP32,
+            body=expected_body,
+            preload=False,
+        )
+        after = passes.convert_tensor_to_tile_ops()(before)
+        ir.assert_structural_equal(after, expected)
+        ir.assert_structural_equal(parse(str(before)), before)
+
+    @pytest.mark.parametrize("dtype", [DataType.FP16, DataType.FP32, DataType.INT16, DataType.INT32])
+    @pytest.mark.parametrize(
+        "source_mode", ["computed", "alias", "valid", "strided", "strided_alias", "strided_valid"]
+    )
+    def test_computed_source_uses_tile_gather(self, dtype, source_mode):
+        specs = [("src", [4, 32], dtype), ("idx", [1, 16], DataType.INT32)]
+
+        def before_body(ib, ins):
+            local = ib.let("local", tensor_ops.add(ins[0], 1))
+            if source_mode.startswith("strided"):
+                local = ib.let("window", tensor_ops.slice(local, [4, 16], [0, 16]))
+            if source_mode.endswith("alias"):
+                local = ib.let("alias", local)
+            if source_mode.endswith("valid"):
+                local = ib.let(
+                    "valid",
+                    tensor_ops.set_validshape(local, 3, 16 if source_mode.startswith("strided") else 32),
+                )
+            return ib.let("y", tensor_ops.gather(local, index=ins[1]))
+
+        before = _make_before(in_specs=specs, out_shape=[1, 16], out_dtype=dtype, body=before_body)
+
+        def expected_body(ib, ins):
+            src = ib.let("src_tile", tile_ops.load(ins[0], [0, 0], [4, 32]))
+            local = ib.let("local_tile", tile_ops.add(src, 1))
+            shape = [4, 16] if source_mode.startswith("strided") else [4, 32]
+            if source_mode.startswith("strided"):
+                local = ib.let("window_tile", tile_ops.slice(local, shape, [0, 16]))
+            if source_mode.endswith("alias"):
+                local = ib.let("alias", local)
+            if source_mode.endswith("valid"):
+                local = ib.let("valid_tile", tile_ops.set_validshape(local, 3, shape[1]))
+            idx = ib.let(
+                "gather_idx", tile_ops.load(ins[1], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec)
+            )
+            packed = local
+            if source_mode.startswith("strided"):
+                packed = ib.let(
+                    "gather_src",
+                    tile_ops.adds(local, 0)
+                    if dtype in (DataType.INT16, DataType.INT32)
+                    else tile_ops.extract(local, 0, 0, shape, target_memory=MemorySpace.Vec),
+                )
+            tmp = ib.let("gather_tmp", tile_ops.create([1, 16], DataType.INT32, MemorySpace.Vec))
+            valid_tmp = ib.let("gather_tmp_valid", tile_ops.set_validshape(tmp, 1, 16))
+            result = ib.let("gather_flat", tile_ops.gather(packed, idx, valid_tmp))
+            return ib.let("y_tile", tile_ops.set_validshape(result, 1, 16))
+
+        expected = _make_expected(
+            in_specs=specs,
+            out_shape=[1, 16],
+            out_dtype=dtype,
+            body=expected_body,
+            preload=False,
+        )
+        after = passes.convert_tensor_to_tile_ops()(before)
+        ir.assert_structural_equal(after, expected)
+
+    @pytest.mark.parametrize("dtype", [DataType.FP32, DataType.INT32])
+    def test_unknown_tile_parameter_keeps_packing(self, dtype):
+        specs = [("idx", [1, 16], DataType.INT32)]
+        extras: list[ExtraSpec] = [("src", ir.TileType([4, 32], dtype, memory_space=MemorySpace.Vec))]
+        before = _make_before(
+            in_specs=specs,
+            extra_specs=extras,
+            out_shape=[1, 16],
+            out_dtype=dtype,
+            body=lambda ib, ins, extra: ib.let("y", tensor_ops.gather(extra[0], ins[0])),
+        )
+
+        def expected_body(ib, ins, extra):
+            idx = ib.let(
+                "gather_idx", tile_ops.load(ins[0], [0, 0], [1, 16], [1, 16], target_memory=MemorySpace.Vec)
+            )
+            packed = ib.let(
+                "gather_src",
+                tile_ops.adds(extra[0], 0)
+                if dtype == DataType.INT32
+                else tile_ops.extract(extra[0], 0, 0, [4, 32], target_memory=MemorySpace.Vec),
+            )
+            tmp = ib.let("gather_tmp", tile_ops.create([1, 16], DataType.INT32, MemorySpace.Vec))
+            valid_tmp = ib.let("gather_tmp_valid", tile_ops.set_validshape(tmp, 1, 16))
+            result = ib.let("gather_flat", tile_ops.gather(packed, idx, valid_tmp))
+            return ib.let("y_tile", tile_ops.set_validshape(result, 1, 16))
+
+        expected = _make_expected(
+            in_specs=specs,
+            extra_specs=extras,
+            out_shape=[1, 16],
+            out_dtype=dtype,
+            body=expected_body,
+            preload=False,
+        )
+        ir.assert_structural_equal(passes.convert_tensor_to_tile_ops()(before), expected)
+
+    def test_unaligned_on_chip_rows_rejected(self):
+        specs = [("src", [4, 15], DataType.FP32), ("idx", [1, 16], DataType.INT32)]
+
+        def body(ib, ins):
+            local = ib.let("local", tensor_ops.add(ins[0], 1))
+            return ib.let("y", tensor_ops.gather(local, index=ins[1]))
+
+        before = _make_before(in_specs=specs, out_shape=[1, 16], out_dtype=DataType.FP32, body=body)
+        with pytest.raises(ValueError, match="32-byte aligned"):
+            passes.convert_tensor_to_tile_ops()(before)
 
 
 class TestConvertGatherOp:
@@ -5861,6 +6670,196 @@ class TestWindowSliceIncoreConversion:
         assert _find_first_call_to(kernel, "tensor.add") is None
         assert _find_first_call_to(kernel, "tensor.slice") is None
 
+    def test_matmul_on_window_slice(self):
+        """A window slice feeding ``pl.matmul`` must load straight into Mat.
+
+        The consumer-driven load (``HandleConsumerDrivenLoad``) already accepts a
+        window source; the gate that rejected this case was the *type* deducer.
+        Locking in the lowering shape here proves the Cube operand path is the
+        same one a plain GM tensor takes -- one ``tile.load`` with
+        ``target_memory=Mat``, no Vec round trip.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                win: pld.DistributedTensor[[16, 32], pl.BF16],
+                w: pl.Tensor[[32, 16], pl.BF16],
+                out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                a = pl.tensor.slice(win, [16, 32], [0, 0])
+                prod = pl.matmul(a, w)
+                out[0:16, 0:16] = prod
+                return  # noqa: PLR1711  (DSL return terminator)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = After.get_function("kernel")
+        assert kernel is not None, "kernel function missing after conversion"
+        mm = _find_first_call_to(kernel, "tile.matmul")
+        assert mm is not None, "matmul over a window slice must lower to tile.matmul"
+        # Both operands arrive as Mat-resident tiles.
+        for operand in mm.args:
+            operand_type = operand.type
+            assert isinstance(operand_type, ir.TileType), (
+                f"tile.matmul operand must be a tile, got {type(operand_type).__name__}"
+            )
+            assert operand_type.memory_space == ir.MemorySpace.Mat, (
+                f"tile.matmul operand must be Mat-resident, got {operand_type.memory_space}"
+            )
+        assert _find_first_call_to(kernel, "tensor.matmul") is None
+        assert _find_first_call_to(kernel, "tensor.slice") is None
+
+    def test_matmul_acc_on_window_slice(self):
+        """``pl.matmul_acc`` accumulates a window-derived operand (split-K idiom)."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                win: pld.DistributedTensor[[16, 32], pl.BF16],
+                w: pl.Tensor[[32, 16], pl.BF16],
+                out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                acc = pl.create_tensor([16, 16], dtype=pl.FP32)
+                a = pl.tensor.slice(win, [16, 32], [0, 0])
+                acc2 = pl.matmul_acc(acc, a, w, init_cond=True)
+                out[0:16, 0:16] = acc2
+                return  # noqa: PLR1711  (DSL return terminator)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = After.get_function("kernel")
+        assert kernel is not None, "kernel function missing after conversion"
+        assert _find_first_call_to(kernel, "tile.matmul_acc") is not None, (
+            "matmul_acc over a window slice must lower to tile.matmul_acc"
+        )
+        assert _find_first_call_to(kernel, "tensor.matmul_acc") is None
+        assert _find_first_call_to(kernel, "tensor.slice") is None
+
+    def test_matmul_on_window_param_without_slice(self):
+        """A window *parameter* fed straight to matmul must be auto-bridged.
+
+        No ``tensor.slice`` stands between the parameter and the matmul, so the
+        Mat load can only come from ``BridgeInputSpaces``. With the exact-kind
+        cast there the window fell through to the tile branch and reached the
+        converter unbridged, tripping its ``INTERNAL_UNREACHABLE`` guard.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                win: pld.DistributedTensor[[16, 32], pl.BF16],
+                w: pl.Tensor[[32, 16], pl.BF16],
+                out: pl.InOut[pl.Tensor[[16, 16], pl.FP32]],
+            ):
+                prod = pl.matmul(win, w)
+                out[0:16, 0:16] = prod
+                return  # noqa: PLR1711  (DSL return terminator)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = After.get_function("kernel")
+        assert kernel is not None, "kernel function missing after conversion"
+        mm = _find_first_call_to(kernel, "tile.matmul")
+        assert mm is not None, "matmul over a window param must lower to tile.matmul"
+        for operand in mm.args:
+            assert isinstance(operand.type, ir.TileType), (
+                "every tile.matmul operand must be bridged to a tile"
+            )
+        assert _find_first_call_to(kernel, "tensor.matmul") is None
+
+    def test_non_fractal_window_operand_is_row_boxed_like_a_plain_tensor(self):
+        """A window cube operand must get the same M boxing a plain GM tensor gets.
+
+        ``ResolveCubeMAlignment`` / ``ResolveCubeNAlignment`` decide the physical extent the
+        bridged load allocates. They matched only the exact ``TensorType``, so a window
+        returned alignment 0 and ``emit_load`` skipped the boxing: a 17-row BF16 operand
+        loaded as a physical ``[17, 32]`` tile instead of the ``[32, 32]`` box with
+        ``valid_shape=[17, 32]``, and reached the Cube with a geometry ptoas rejects.
+        """
+
+        @pl.program
+        class Plain:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tensor[[17, 32], pl.BF16],
+                w: pl.Tensor[[32, 16], pl.BF16],
+                out: pl.InOut[pl.Tensor[[17, 16], pl.FP32]],
+            ):
+                prod = pl.matmul(src, w)
+                out[0:17, 0:16] = prod
+                return  # noqa: PLR1711  (DSL return terminator)
+
+        @pl.program
+        class Window:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pld.DistributedTensor[[17, 32], pl.BF16],
+                w: pl.Tensor[[32, 16], pl.BF16],
+                out: pl.InOut[pl.Tensor[[17, 16], pl.FP32]],
+            ):
+                prod = pl.matmul(src, w)
+                out[0:17, 0:16] = prod
+                return  # noqa: PLR1711  (DSL return terminator)
+
+        def lhs_physical_shape(program):
+            kernel = passes.convert_tensor_to_tile_ops()(program).get_function("kernel")
+            assert kernel is not None, "kernel function missing after conversion"
+            mm = _find_first_call_to(kernel, "tile.matmul")
+            assert mm is not None, "matmul must lower to tile.matmul"
+            lhs_type = mm.args[0].type
+            assert isinstance(lhs_type, ir.TileType)
+            dims = []
+            for dim in lhs_type.shape:
+                assert isinstance(dim, ir.ConstInt), f"expected a static extent, got {dim}"
+                dims.append(dim.value)
+            return dims
+
+        plain_shape = lhs_physical_shape(Plain)
+        window_shape = lhs_physical_shape(Window)
+        assert plain_shape == [32, 32], f"plain operand must be row-boxed, got {plain_shape}"
+        assert window_shape == plain_shape, (
+            f"window operand must be boxed identically to a plain tensor: "
+            f"got {window_shape}, plain gets {plain_shape}"
+        )
+
+    def test_row_max_on_window_param_without_slice(self):
+        """A window param feeding an op with no ``input_reqs`` needs a Phase-1 load.
+
+        ``tensor.row_max`` declares no input space requirement, so its operand is
+        loaded by the entry-load phase rather than by ``BridgeInputSpaces``. That
+        phase collected only exact ``TensorType`` params, so the window reached
+        the converter as a tensor and failed its ``input must be TileType`` check.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                win: pld.DistributedTensor[[16, 32], pl.FP32],
+                out: pl.InOut[pl.Tensor[[16, 1], pl.FP32]],
+            ):
+                r = pl.row_max(win)
+                out[0:16, 0:1] = r
+                return  # noqa: PLR1711  (DSL return terminator)
+
+        After = passes.convert_tensor_to_tile_ops()(Before)
+        kernel = After.get_function("kernel")
+        assert kernel is not None, "kernel function missing after conversion"
+        assert _find_first_call_to(kernel, "tile.load") is not None, (
+            "the window param must get an entry tile.load"
+        )
+        assert _find_first_call_to(kernel, "tile.row_max") is not None, (
+            "row_max over a window param must lower to tile.row_max"
+        )
+        assert _find_first_call_to(kernel, "tensor.row_max") is None
+
     # ------------------------------------------------------------------
     # Composite intrinsic param-direction upgrade tests
     # ------------------------------------------------------------------
@@ -5898,7 +6897,7 @@ class TestWindowSliceIncoreConversion:
     def test_barrier_upgrades_signal_to_inout(self):
         """``pld.tensor.barrier(signal)`` upgrades ``signal`` from In to InOut.
 
-        ConvertTensorToTileOps runs upstream of LowerCompositeOps (pass 12);
+        ConvertTensorToTileOps runs upstream of LowerCompositeOps (pass 13);
         without the explicit has_read|has_write marking, the param-direction
         analysis would leave the window param as In and a downstream reader
         would miss the RAW edge."""
@@ -6159,7 +7158,7 @@ class TestWindowSliceIncoreConversion:
 def _incore_only(program: ir.Program) -> ir.Program:
     """The program's single InCore function, as a one-function Program.
 
-    Expected covers that function only; the Orchestration caller pass 8 mints
+    Expected covers that function only; the Orchestration caller pass 9 mints
     alongside it is OutlineIncoreScopes' output, not this pass's.
     """
     incore = [f for f in program.functions.values() if f.func_type == ir.FunctionType.InCore]
@@ -6177,7 +7176,7 @@ class TestConvertCrossCoreSplitOps:
 
     Each Before is authored the way a user writes one — a plain ``@pl.function``
     (Opaque) holding a ``pl.at(level=CORE_GROUP)`` scope — and the pass input is
-    then **derived by running OutlineIncoreScopes** (pass 8). That is what makes
+    then **derived by running OutlineIncoreScopes** (pass 9). That is what makes
     the input the shape this pass really sees at pass 10: an InCore function
     whose region is *bare*, with the scope already consumed. Hand-writing the
     InCore function with a ``pl.at`` still around the region (as these tests
@@ -6195,13 +7194,13 @@ class TestConvertCrossCoreSplitOps:
     ``pl.tile.aiv_shard(x)`` / ``pl.tile.aic_gather(x)`` without ``split=``.
 
     Expected covers the InCore function only (see :func:`_incore_only`); the
-    Orchestration caller pass 8 mints alongside it is OutlineIncoreScopes'
+    Orchestration caller pass 9 mints alongside it is OutlineIncoreScopes'
     output, not this pass's.
     """
 
     @staticmethod
     def _outline(source: ir.Program) -> ir.Program:
-        """Derive this pass's input by running OutlineIncoreScopes (pass 8)."""
+        """Derive this pass's input by running OutlineIncoreScopes (pass 9)."""
         return passes.outline_incore_scopes()(source)
 
     @classmethod
@@ -6675,14 +7674,14 @@ class TestSynthesizedOpSpans:
 class TestCachePolicyConversion:
     """``pl.set_cache_policy`` reaches this pass as the outlined-function attr
     ``cache_policy`` — ``(param index, CachePolicy-as-int)`` pairs stamped by
-    OutlineIncoreScopes (pass 8) — and leaves it as a ``cache`` kwarg on every
+    OutlineIncoreScopes (pass 9) — and leaves it as a ``cache`` kwarg on every
     ``tile.load`` that reads a declared param. The attr itself is erased here:
     its indices go stale the moment a later pass grows the param list, so
     nothing downstream may see it.
 
     Each Before is authored in the shape pass 8 really hands over: a *bare*
     InCore function (the scope already consumed) carrying the resolved attr via
-    ``pl.func_attr``, plus the Orchestration caller pass 8 mints beside it.
+    ``pl.func_attr``, plus the Orchestration caller pass 9 mints beside it.
     Writing the ``pl.at`` scope here instead would re-test pass 8's translation
     rather than this pass's consumption of its output.
 
@@ -7246,6 +8245,56 @@ class TestCalleeDirectionPropagationThroughCarries:
             p.name_hint.split("__ssa_v")[0]: d for p, d in zip(after.params, after.param_directions)
         }
         assert directions["dst"] == ir.ParamDirection.Out
+
+
+class TestTensorCastConversion:
+    def test_saturation_mode_survives_tensor_to_tile_lowering(self):
+        """tensor.cast -> tile.cast must carry an opt-out across.
+
+        Losing it here would silently re-saturate a cast whose author asked for
+        wrapping, with no diagnostic anywhere downstream.
+        """
+        saturation_mode = "off"
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(self, x: pl.Tensor[[8, 256], pl.FP16]) -> pl.Tensor[[8, 256], pl.INT8]:
+                q: pl.Tensor[[8, 256], pl.INT8] = pl.cast(
+                    x, pl.INT8, mode="trunc", saturation_mode=saturation_mode
+                )
+                return q
+
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 256], pl.FP16]) -> pl.Tensor[[8, 256], pl.INT8]:
+                q: pl.Tensor[[8, 256], pl.INT8] = self.main_incore_0(x)
+                return q
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        cast_calls = _find_calls_to(_require_function(after, "main_incore_0"), "tile.cast")
+        assert len(cast_calls) == 1
+        assert cast_calls[0].kwargs["saturation_mode"] == 0
+        assert cast_calls[0].kwargs["mode"] == 5
+
+    def test_default_cast_gains_no_saturation_kwarg(self):
+        """Conversion must not stamp the default onto a cast that left it implicit."""
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.InCore)
+            def main_incore_0(self, x: pl.Tensor[[8, 256], pl.FP16]) -> pl.Tensor[[8, 256], pl.INT8]:
+                q: pl.Tensor[[8, 256], pl.INT8] = pl.cast(x, pl.INT8, mode="trunc")
+                return q
+
+            @pl.function
+            def main(self, x: pl.Tensor[[8, 256], pl.FP16]) -> pl.Tensor[[8, 256], pl.INT8]:
+                q: pl.Tensor[[8, 256], pl.INT8] = self.main_incore_0(x)
+                return q
+
+        after = passes.convert_tensor_to_tile_ops()(Before)
+        cast_calls = _find_calls_to(_require_function(after, "main_incore_0"), "tile.cast")
+        assert len(cast_calls) == 1
+        assert "saturation_mode" not in cast_calls[0].kwargs
 
 
 if __name__ == "__main__":

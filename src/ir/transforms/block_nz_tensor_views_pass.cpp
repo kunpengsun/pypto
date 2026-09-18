@@ -16,23 +16,30 @@
  * ``pl.Tensor[[E, N, K], pl.INT8, pl.NZ]`` asserts that the bytes in GM are
  * already in PTO-native NZ fractal order while keeping the *logical* shape and
  * slicing at the DSL level. pto-isa describes such a buffer with a blocked
- * rank-(r+2) GlobalTensor (``pto/common/pto_tile.hpp``):
+ * **rank-5** GlobalTensor (``pto/common/pto_tile.hpp``):
  *
  *     shape   = [E, K/c0, N/16, 16, c0]
  *     strides = [K*N,     N*c0, 16*c0, c0, 1]      (c0 = 256 / dtype bits)
+ *
+ * The rank is fixed, not ``logical rank + 2``: the leading batch slot exists
+ * whether or not the logical tensor has a leading axis. A logical rank-2
+ * ``[N, K]`` weight therefore blocks to ``[1, K/c0, N/16, 16, c0]``, with the
+ * batch materialised as 1 — blocking it to rank 4 instead produces a view PTOAS
+ * refuses ("user-specified layout=nz requires a rank-5 view"). Logical rank 4+
+ * has no canonical form yet and is rejected in ``CheckNzLogicalRank``.
  *
  * This pass rewrites the IR into exactly that form:
  *
  *   Phase 1 — every TensorType tagged ``TensorLayout::NZ`` gets its shape
  *             replaced by ``BlockNzShape``. The stride slot is left empty for
- *             ``MaterializeTensorStrides`` (pass 30) to fill; because a blocked
+ *             ``MaterializeTensorStrides`` (pass 33) to fill; because a blocked
  *             NZ shape's row-major strides *are* pto-isa's NZ strides, that
  *             pass needs no NZ-specific rule.
  *
  *   Phase 2 — every ``tile.load`` reading such a tensor gets its offsets /
  *             shapes / valid_shape rewritten into blocked coordinates, while
  *             its result ``TileType`` is preserved verbatim: the GM partition
- *             becomes rank-(r+2) but the destination tile stays the logical
+ *             becomes rank-5 but the destination tile stays the logical
  *             2-D ``[N_TILE, K_TILE]``.
  *
  * After this pass no logical-shaped NZ TensorType survives, so nothing
@@ -42,7 +49,7 @@
  * ``GetTensorViewTypeString`` and the ``tile.load`` ``partition_view`` emitter
  * each read the rank independently and must agree.
  *
- * Ordering constraints (see docs/en/dev/passes/14-block_nz_tensor_views.md):
+ * Ordering constraints (see docs/en/dev/passes/15-block_nz_tensor_views.md):
  *   * after ConvertTensorToTileOps / LowerCompositeOps — the ``tile.load`` ops
  *     Phase 2 rewrites must already exist;
  *   * after FlattenTileNdTo2D — declared as a ``TileOps2D`` requirement. The
@@ -345,8 +352,8 @@ class BlockNzMutator : public IRMutator {
     if (!args_changed && !type_changed) return op;
 
     // Direct ctor, not OpRegistry::Create: re-deducing ``tile.load``'s type
-    // from the now rank-(r+2) shapes argument would turn the destination tile
-    // into a rank-(r+2) TileType. The GM partition is blocked; the tile is not.
+    // from the now rank-5 shapes argument would turn the destination tile into
+    // a rank-5 TileType. The GM partition is blocked; the tile is not.
     return std::make_shared<Call>(op->op_, std::move(new_args), op->kwargs_, op->attrs_,
                                   std::move(new_return_type), op->span_);
   }

@@ -34,6 +34,7 @@ class IRProperty(Enum):
     BreakContinueValid = ...
     UseAfterDef = ...
     HierarchyOutlined = ...
+    GraphOutlined = ...
     StructuredCtrlFlow = ...
     VectorKernelSplit = ...
     OutParamNotShadowed = ...
@@ -62,6 +63,9 @@ class IRProperty(Enum):
     AccCompactValid = ...
     GraphBoundaryLegalized = ...
     AccStorePhaseValid = ...
+    NoScalarKernelReturn = ...
+    AivSplitLoweredValid = ...
+    BufferIR = ...
 
 class IRPropertySet:
     """A set of IR properties backed by a bitset."""
@@ -417,6 +421,7 @@ class TypeCheckErrorType(Enum):
     TENSOR_PADDING_MISMATCH = ...
     DISTRIBUTED_WINDOW_IDENTITY_MISMATCH = ...
     TILE_VIEW_MISMATCH = ...
+    BUFFER_DESCRIPTOR_MISMATCH = ...
 
 def unroll_loops() -> Pass:
     """Create a loop unrolling pass that expands ForKind.Unroll loops at compile time."""
@@ -504,6 +509,9 @@ def outline_cluster_scopes() -> Pass:
 def outline_hierarchy_scopes() -> Pass:
     """Create a pass that outlines Hierarchy scopes into level/role functions."""
 
+def outline_graph_scopes() -> Pass:
+    """Create a pass that outlines Graph scopes (``pl.graph``) into Graph functions."""
+
 def convert_tensor_to_tile_ops() -> Pass:
     """Create a pass that converts tensor ops to tile ops in InCore functions."""
 
@@ -513,10 +521,12 @@ def optimize_orch_tensors() -> Pass:
 def block_nz_tensor_views() -> Pass:
     """Create a pass that rewrites logical ``pl.NZ`` tensors into blocked NZ form.
 
-    An NZ ``TensorType`` shape ``[..., R, C]`` becomes ``[..., C/c0, R/16, 16, c0]``,
-    where ``c0`` is the number of elements in a 32-byte C0 line (``256 / dtype
-    bits``) — the blocked rank-(r+2) form pto-isa's ``Layout::NZ`` GlobalTensor
-    requires. Every consuming ``tile.load`` has its offsets / shapes / valid_shape
+    An NZ ``TensorType`` shape ``[B, R, C]`` becomes ``[B, C/c0, R/16, 16, c0]``
+    and ``[R, C]`` becomes ``[1, C/c0, R/16, 16, c0]``, where ``c0`` is the
+    number of elements in a 32-byte C0 line (``256 / dtype bits``) — the blocked
+    rank-5 form pto-isa's ``Layout::NZ`` GlobalTensor requires. The leading slot
+    is always present, so a rank-2 tensor gets a batch extent of 1 rather than a
+    shorter shape. Every consuming ``tile.load`` has its offsets / shapes / valid_shape
     rewritten into blocked coordinates while its logical 2-D destination
     ``TileType`` is preserved.
 
@@ -524,6 +534,19 @@ def block_nz_tensor_views() -> Pass:
     ``flatten_tile_nd_to_2d`` — it requires ``TileOps2D``, because blocking a
     load whose tile is still ND-rank yields a call whose type annotation and
     argument ranks cannot both be printed.
+    """
+
+def block_mx_scale_tensor_views() -> Pass:
+    """Create a pass that physicalizes logical MX scale tensor views.
+
+    ``MX_A_ZZ [M, G]`` and ``MX_B_NN [G, N]`` become the packed rank-5
+    ``[1, block/16, group/2, 16, 2]`` form required by A5. The pass rewrites
+    ``tile.load`` windows and ND/MX backing aliases while preserving logical
+    tile result types. Symbolic offsets must be provably aligned and
+    non-negative.
+
+    Must run after ``flatten_tile_nd_to_2d`` and before
+    ``materialize_tensor_strides``.
     """
 
 def flatten_tile_nd_to_2d() -> Pass:
@@ -746,6 +769,21 @@ def materialize_comm_domain_scopes() -> Pass:
 
 def lower_host_tensor_collectives() -> Pass:
     """Lower host-level ``pld.tensor.allreduce`` calls to builtin collective dispatches."""
+
+def lower_l2_tensor_collectives() -> Pass:
+    """Lower managed collectives written in a CHIP/L2 orchestration body.
+
+    The CHIP counterpart of :func:`lower_host_tensor_collectives`: instead of
+    fanning the collective out into one chip dispatch per device (a nested L2
+    orchestration task), the call is rewritten into a call to a synthesized AIV
+    kernel backed by the same hand-written builtin template source. The kernel
+    joins the caller's own task DAG, so ``compute -> collective -> consume`` is
+    ordered by ordinary TensorMap dependencies.
+
+    Runs immediately before :func:`derive_call_directions` so the emitted call
+    gets its argument directions and task edges derived like any kernel call.
+    Today only ``pld.tensor.all_to_all_v`` with ``core_num=1`` is supported.
+    """
 
 def materialize_dist_tensor_ctx() -> Pass:
     """Materialize CommCtx parameters and arguments for DistributedTensor function parameters."""
@@ -1029,9 +1067,11 @@ __all__ = [
     "outline_incore_scopes",
     "outline_cluster_scopes",
     "outline_hierarchy_scopes",
+    "outline_graph_scopes",
     "convert_tensor_to_tile_ops",
     "optimize_orch_tensors",
     "block_nz_tensor_views",
+    "block_mx_scale_tensor_views",
     "flatten_tile_nd_to_2d",
     "legalize_tile_cast",
     "auto_tile_matmul_l0",

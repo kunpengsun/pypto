@@ -25,6 +25,7 @@ import pypto.language as pl
 import pypto.language.distributed as pld
 import pytest
 from pypto import ir, passes
+from pypto.pypto_core import DataType
 
 _OP_PLD_TENSOR_ALLREDUCE = ir.get_op("pld.tensor.allreduce").name
 
@@ -1463,6 +1464,93 @@ class TestSingleTripLoopCollapse:
 
 
 # ============================================================================
+# Fold B's substitution-depth cap (kMaxNestedSingleTripFolds in
+# simplify_pass.cpp). Fold B lifts a one-trip body by DeepCloning it and
+# re-visiting the clone; an unbounded chain of nested one-trip loops therefore
+# clones the remaining nest once per level, which is O(N^2) in the nest depth
+# and over the ceiling `.claude/rules/pass-complexity.md` sets. The cap bounds
+# one run to a fixed number of levels; the surplus stays a well-formed ForStmt
+# that the next Simplify run collapses.
+#
+# Built with raw ``ir.*`` rather than the DSL: CPython's compiler rejects more
+# than 20 statically nested blocks, so a nest past the cap has no @pl.program
+# spelling.
+# ============================================================================
+
+_FOLD_B_MAX_NESTED_SINGLE_TRIP_FOLDS = 16
+
+
+def _one_trip_nest(depth: int) -> ir.Program:
+    """A ``depth``-level nest of pure one-trip loops around a scalar assign."""
+    span = ir.Span.unknown()
+    index_ty = ir.ScalarType(DataType.INDEX)
+
+    def const(value: int) -> ir.Expr:
+        return ir.ConstInt(value, DataType.INDEX, span)
+
+    body: ir.Stmt = ir.SeqStmts([ir.AssignStmt(ir.Var("inner", index_ty, span), const(0), span)], span)
+    for level in reversed(range(depth)):
+        loop = ir.ForStmt(
+            ir.Var(f"k{level}", index_ty, span),
+            const(0),
+            const(1),
+            const(1),
+            [],
+            body,
+            [],
+            span,
+        )
+        body = ir.SeqStmts([loop], span)
+    func = ir.Function("main", [], [], body, span)
+    return ir.Program([func], "one_trip_nest", span)
+
+
+def _main_body(program: ir.Program) -> ir.Stmt:
+    main = program.get_function("main")
+    assert main is not None
+    return main.body
+
+
+def _count_for_stmts(stmt: ir.Stmt) -> int:
+    """Number of ForStmt nodes in the ``_one_trip_nest`` shape (For / SeqStmts only)."""
+    if isinstance(stmt, ir.ForStmt):
+        return 1 + _count_for_stmts(stmt.body)
+    if isinstance(stmt, ir.SeqStmts):
+        return sum(_count_for_stmts(inner) for inner in stmt.stmts)
+    return 0
+
+
+class TestSingleTripFoldDepthCap:
+    def test_nest_at_the_cap_collapses_fully(self):
+        """A nest exactly ``kMaxNestedSingleTripFolds`` deep folds in one run."""
+        before = _one_trip_nest(_FOLD_B_MAX_NESTED_SINGLE_TRIP_FOLDS)
+        assert _count_for_stmts(_main_body(before)) == _FOLD_B_MAX_NESTED_SINGLE_TRIP_FOLDS
+
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            after = passes.simplify()(before)
+        assert _count_for_stmts(_main_body(after)) == 0
+
+    def test_nest_past_the_cap_keeps_the_surplus_and_folds_it_next_run(self):
+        """One run past the cap leaves the surplus loops; the next run takes them.
+
+        Declining is sound rather than a missed obligation: the survivors are
+        ordinary single-trip ``ForStmt``s, so re-running Simplify collapses the
+        next ``kMaxNestedSingleTripFolds`` levels.
+        """
+        surplus = 3
+        depth = _FOLD_B_MAX_NESTED_SINGLE_TRIP_FOLDS + surplus
+        before = _one_trip_nest(depth)
+
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            after = passes.simplify()(before)
+        assert _count_for_stmts(_main_body(after)) == surplus
+
+        with passes.PassContext([], passes.VerificationLevel.NONE):
+            after_twice = passes.simplify()(after)
+        assert _count_for_stmts(_main_body(after_twice)) == 0
+
+
+# ============================================================================
 # Fold A composes with Fold B in a single Simplify run: Fold B substitutes
 # loop_var with a literal, exposing always-true/always-false predicates that
 # Fold A then collapses, all in one traversal.
@@ -1925,6 +2013,145 @@ class TestDeadIfReturnVarsDCE:
 
         assert has_tensor_write(then_stmts), "tensor.write side-effect in then branch must survive phi-prune"
         assert has_tensor_write(else_stmts), "tensor.write side-effect in else branch must survive phi-prune"
+
+    def test_keeps_dead_phi_whose_branches_yield_a_call(self):
+        """Same guard on the phi side: dropping slot `i` deletes the expression
+        each branch yields into it, and before `FlattenCallExpr` that can be a
+        call. The phi stays even though nothing reads it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, t: pl.Tensor[[1], pl.INDEX], cond: pl.Scalar[pl.BOOL]) -> pl.Tensor[[1], pl.INDEX]:
+                if cond:
+                    c: pl.Scalar[pl.INDEX] = pl.yield_(pl.tensor.read(t, [0]))  # noqa: F841
+                else:
+                    c: pl.Scalar[pl.INDEX] = pl.yield_(pl.tensor.read(t, [0]))  # noqa: F841
+                return t
+
+        after = passes.simplify()(Before)
+        func_after = next(iter(after.functions.values()))
+        if_stmts = [s for s in ir.flatten_to_stmts(func_after.body) if isinstance(s, ir.IfStmt)]
+        assert len(if_stmts) == 1
+        assert len(if_stmts[0].return_vars) == 1, (
+            "a phi nobody reads must still survive when a branch yields a Call; "
+            f"got return_vars={if_stmts[0].return_vars}"
+        )
+
+
+class TestDeadLoopCarryDCE:
+    """Loop-carried slots (``iter_args_[i]`` / ``return_vars_[i]``) with no
+    reader on either end are dropped, together with the matching yield slot.
+
+    This is the loop half of the dead-phi rule above. Reusing one Python local
+    across two scopes is what produces the shape: SSA seeds the second loop
+    with the first scope's value, the body overwrites it on every trip, and
+    nobody reads either end. Left in place, the carry makes the *earlier*
+    scope's value live-out, which for a device scope forces a Scalar into the
+    outlined kernel's return set — a shape the runtime cannot carry at all.
+    """
+
+    @staticmethod
+    def _only_for_stmt(program):
+        func = next(iter(program.functions.values()))
+        for_stmts = [s for s in ir.flatten_to_stmts(func.body) if isinstance(s, ir.ForStmt)]
+        assert len(for_stmts) == 1
+        return for_stmts[0]
+
+    def test_drops_dead_carry_from_reused_scalar_name(self):
+        """``t`` is bound before the loop and rebound in the body before any
+        read, with no post-loop use: the carry is dead on both ends and the
+        ForStmt keeps no iter_arg for it.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], out: pl.Tensor[[8], pl.INDEX]):
+                t: pl.Scalar[pl.INDEX] = n * 2
+                pl.tensor.write(out, [0], t)
+                for i in pl.range(4):
+                    t: pl.Scalar[pl.INDEX] = i * 2
+                    pl.tensor.write(out, [1], t)
+
+        after = passes.simplify()(passes.convert_to_ssa()(Before))
+        for_stmt = self._only_for_stmt(after)
+        assert len(for_stmt.iter_args) == 0, (
+            "a carry the body overwrites before reading, with no post-loop "
+            f"reader, must be dropped; got iter_args={for_stmt.iter_args}"
+        )
+        assert len(for_stmt.return_vars) == 0, (
+            f"return_vars must be dropped in lockstep; got {for_stmt.return_vars}"
+        )
+
+    def test_keeps_carry_read_in_body(self):
+        """An accumulator reads the incoming value each trip — the carry is
+        live inside the body even though nothing reads it after the loop.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], out: pl.Tensor[[8], pl.INDEX]):
+                acc: pl.Scalar[pl.INDEX] = n
+                for i in pl.range(4):
+                    acc: pl.Scalar[pl.INDEX] = acc + i
+                    pl.tensor.write(out, [1], acc)
+
+        after = passes.simplify()(passes.convert_to_ssa()(Before))
+        for_stmt = self._only_for_stmt(after)
+        assert len(for_stmt.iter_args) == 1, (
+            f"an accumulator carry must survive; got iter_args={for_stmt.iter_args}"
+        )
+
+    def test_keeps_carry_whose_init_or_yield_is_a_call(self):
+        """Dropping a slot deletes its `init_values` and yielded expressions.
+
+        Before `FlattenCallExpr` either can still BE a call, so a slot nothing
+        reads is kept when either side carries one — the IR has no purity
+        annotations, exactly the reason scalar DCE never drops a call-backed
+        assignment.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function(type=pl.FunctionType.Orchestration)
+            def main(self, t: pl.Tensor[[1], pl.INDEX]) -> pl.Tensor[[1], pl.INDEX]:
+                for _i, (c_1,) in pl.range(4, init_values=(pl.tensor.read(t, [0]),)):
+                    c: pl.Scalar[pl.INDEX] = pl.yield_(pl.tensor.read(t, [0]))  # noqa: F841
+                return t
+
+        after = passes.simplify()(Before)
+        for_stmt = self._only_for_stmt(after)
+        assert len(for_stmt.iter_args) == 1, (
+            "a carry nobody reads must still survive when its init / yield expression contains a "
+            f"Call; got iter_args={for_stmt.iter_args}"
+        )
+        assert isinstance(for_stmt.iter_args[0].initValue, ir.Call)
+
+    def test_keeps_carry_used_after_loop(self):
+        """The body rebinds without reading, but the final value is read after
+        the loop — the ``return_var`` end keeps the slot alive.
+        """
+
+        @pl.program
+        class Before:
+            @pl.function
+            def main(self, n: pl.Scalar[pl.INDEX], out: pl.Tensor[[8], pl.INDEX]):
+                t: pl.Scalar[pl.INDEX] = n * 2
+                for i in pl.range(4):
+                    t: pl.Scalar[pl.INDEX] = i * 2
+                pl.tensor.write(out, [0], t)
+
+        after = passes.simplify()(passes.convert_to_ssa()(Before))
+        for_stmt = self._only_for_stmt(after)
+        assert len(for_stmt.iter_args) == 1, (
+            f"a carry read after the loop must survive; got iter_args={for_stmt.iter_args}"
+        )
+        assert len(for_stmt.return_vars) == 1, (
+            f"return_vars must survive in lockstep; got {for_stmt.return_vars}"
+        )
 
 
 class TestDistributedWindowBufferRemap:

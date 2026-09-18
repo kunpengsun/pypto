@@ -58,6 +58,14 @@ def _program_with_param_type(tensor_type):
     return ir.Program([func], "p", span)
 
 
+def _program_with_submit_type(submit_type):
+    """Build a function whose only occurrence of ``submit_type`` is on Submit."""
+    span = _span()
+    submit = ir.Submit(ir.GlobalVar("worker"), [], [], submit_type, span)
+    func = ir.Function("f", [], [], ir.EvalStmt(submit, span), span)
+    return ir.Program([func], "p", span)
+
+
 def _verify(program, *, require_materialized: bool = False):
     return _passes.verify_tensor_view_canonical(program, require_materialized)
 
@@ -143,7 +151,7 @@ def test_empty_stride_fails_strict():
 
 
 def test_unblocked_nz_layout_rejected_weak():
-    # NZ is legal on a TensorType, but only in the blocked rank-(r+2) form.
+    # NZ is legal on a TensorType, but only in the blocked rank-5 form.
     # A logical 2-D NZ shape has no row-major stride that describes the fractal
     # byte order, so the verifier flags it.
     view = ir.TensorView(_stride(16, 1), ir.TensorLayout.NZ)
@@ -163,12 +171,63 @@ def test_unblocked_nz_layout_rejected_strict():
 
 
 def test_blocked_nz_layout_accepted():
-    # The positive counterpart: [256, 512] INT8 blocked to [16, 16, 16, 32]
-    # with pto-isa's NZ strides [8192, 512, 32, 1] is canonical.
+    # The positive counterpart: [256, 512] INT8 blocked to the canonical rank-5
+    # [1, 16, 16, 16, 32] with pto-isa's NZ strides [131072, 8192, 512, 32, 1].
+    view = ir.TensorView(_stride(131072, 8192, 512, 32, 1), ir.TensorLayout.NZ)
+    t = ir.TensorType(_shape(1, 16, 16, 16, 32), DataType.INT8, None, view)
+    diags = _verify(_program_with_param_type(t), require_materialized=True)
+    assert diags == []
+
+
+def test_rank4_nz_layout_rejected():
+    # Trailing dims alone do not make a shape canonical: pto-isa reads NZ at a
+    # fixed rank-5 arity, so the rank-4 form — which PTOAS refuses with
+    # "layout=nz requires a rank-5 view" — must not pass the verifier either.
     view = ir.TensorView(_stride(8192, 512, 32, 1), ir.TensorLayout.NZ)
     t = ir.TensorType(_shape(16, 16, 16, 32), DataType.INT8, None, view)
     diags = _verify(_program_with_param_type(t), require_materialized=True)
-    assert diags == []
+    assert any("NZ" in d.message and "unblocked" in d.message for d in diags)
+
+
+# ============================================================================
+# MX on TensorType — logical rank-2 is always rejected after pass 15
+# ============================================================================
+
+
+def test_unblocked_mx_layout_rejected_weak():
+    view = ir.TensorView(_stride(4, 1), ir.TensorLayout.MX_A_ZZ)
+    t = ir.TensorType(_shape(32, 4), DataType.FP8E8M0, None, view)
+    diags = _verify(_program_with_param_type(t))
+    assert len(diags) == 1
+    assert "MX" in diags[0].message
+    assert "unblocked" in diags[0].message
+
+
+def test_unblocked_mx_layout_rejected_strict():
+    view = ir.TensorView([], ir.TensorLayout.MX_B_NN)
+    t = ir.TensorType(_shape(4, 32), DataType.FP8E8M0, None, view)
+    diags = _verify(_program_with_param_type(t), require_materialized=True)
+    assert len(diags) == 1
+    assert "unblocked MX" in diags[0].message
+
+
+def test_blocked_mx_layout_accepted():
+    view = ir.TensorView(_stride(128, 64, 32, 2, 1), ir.TensorLayout.MX_A_ZZ)
+    t = ir.TensorType(_shape(1, 2, 2, 16, 2), DataType.FP8E8M0, None, view)
+    assert _verify(_program_with_param_type(t), require_materialized=True) == []
+
+
+def test_submit_return_type_is_checked():
+    mx = ir.TensorType(
+        _shape(32, 4),
+        DataType.FP8E8M0,
+        None,
+        ir.TensorView(_stride(4, 1), ir.TensorLayout.MX_A_ZZ),
+    )
+    submit_type = ir.TupleType([mx, ir.ScalarType(DataType.TASK_ID)])
+    diags = _verify(_program_with_submit_type(submit_type))
+    assert len(diags) == 1
+    assert "unblocked MX" in diags[0].message
 
 
 # ============================================================================

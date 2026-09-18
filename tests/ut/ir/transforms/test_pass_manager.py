@@ -16,6 +16,7 @@ from pypto import DataType, ir, passes
 
 TENSOR_ONLY_PASSES = [
     "OutlineHierarchyScopes",
+    "OutlineGraphScopes",
     "OutlineIncoreScopes",
     "OutlineClusterScopes",
     "ConvertTensorToTileOps",
@@ -34,6 +35,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "LowerCompositeOps",
     "FlattenTileNdTo2D",
     "BlockNzTensorViews",
+    "BlockMxScaleTensorViews",
     "LegalizeTileCast",
     "AutoTileMatmulL0",
     "CanonicalizeTileSlice",
@@ -57,6 +59,7 @@ TENSOR_OPTIMIZATION_PASSES = [
     "AllocateMemoryAddr",
     "FoldNoOpReshape",
     "FuseCreateAssembleToSlice",
+    "LowerL2TensorCollectives",
     "DeriveCallDirections",
     "AutoDeriveTaskDependencies",
     "ExpandManualPhaseFence",

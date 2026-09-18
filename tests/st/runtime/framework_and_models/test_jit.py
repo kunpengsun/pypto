@@ -14,6 +14,11 @@ serve from cache on subsequent calls, and execute correctly on device.
 """
 
 import ast
+import logging
+import multiprocessing
+import os
+import traceback
+from pathlib import Path
 
 import pypto.language as pl
 import pytest
@@ -55,8 +60,136 @@ def copy_dyn_batch(
     return out
 
 
+@pl.jit
+def persistent_add(x: pl.Tensor[[16, 16], pl.FP32], out: pl.Out[pl.Tensor[[16, 16], pl.FP32]]):
+    with pl.at(level=pl.Level.CORE_GROUP):
+        pl.store(pl.add(pl.load(x, [0, 0], [16, 16]), 3.0), [0, 0], out)
+    return out
+
+
+def _persistent_process(root, platform, device_id, consume, connection):
+    """Fresh interpreter: ordinary execution publishes, then readonly reuse executes."""
+    phase = "consumer" if consume else "producer"
+    cache_logger = logging.getLogger("pypto.jit._persistent")
+    cache_logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    cache_logger.addHandler(handler)
+    try:
+        from pypto import CacheConfig, cache_stats  # noqa: PLC0415
+        from pypto.runtime import RunConfig  # noqa: PLC0415
+        from pypto.runtime.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+        os.environ.pop("PYPTO_PROG_BUILD_DIR", None)
+        config = RunConfig(
+            platform=platform,
+            device_id=device_id,
+            cache_config=CacheConfig(enabled=True, root=Path(root), readonly=consume),
+        )
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("READY execution invoked a compiler stage")
+
+        with pytest.MonkeyPatch.context() as guard:
+            if consume:
+                guard.setattr(persistent_add, "_compile", forbidden)
+                guard.setattr(KernelCompiler, "compile_incore", forbidden)
+                guard.setattr(KernelCompiler, "compile_orchestration", forbidden)
+                guard.setattr("pypto.backend.pto_backend._run_ptoas", forbidden)
+            x = torch.full((16, 16), 2.0)
+            out = torch.zeros_like(x)
+            persistent_add(x, out, config=config)
+            torch.testing.assert_close(out, torch.full_like(out, 5.0))
+            compiled = persistent_add.compile(config=config)
+            assert compiled._artifact_runtime is not None
+            assert compiled._artifact_runtime.handle.spec.state.value == "ready"
+            assert (compiled.program is None) == consume
+            stats = cache_stats()
+            assert stats.ready_hits == int(consume)
+            assert stats.generation_builds == int(not consume)
+            assert stats.binary_builds == int(not consume)
+        connection.send(None)
+    except BaseException:
+        connection.send(f"Persistent cache {phase} failed:\n{traceback.format_exc()}")
+    finally:
+        cache_logger.removeHandler(handler)
+        connection.close()
+
+
 class TestJITExecution:
     """End-to-end tests for @pl.jit compile + execute on device."""
+
+    def test_persistent_cache_across_processes(self, test_config, tmp_path):
+        """READY reuses every stage in a new process and executes numerically.
+
+        Run in a standalone pytest invocation, before its parent initializes
+        any device. CI selects this node separately from the direct-test shard.
+        """
+        if test_config.codegen_only:
+            pytest.skip("Persistent artifact acceptance requires compiler and runtime")
+        root = tmp_path / "persistent-cache"
+        context = multiprocessing.get_context("spawn")
+        for consume in (False, True):
+            receiving, sending = context.Pipe(duplex=False)
+            process = context.Process(
+                target=_persistent_process,
+                args=(str(root), test_config.platform, test_config.device_id, consume, sending),
+            )
+            process.start()
+            sending.close()
+            try:
+                assert receiving.poll(240), "Cache acceptance child timed out"
+                error = receiving.recv()
+                process.join(timeout=20)
+                assert error is None, error
+                assert process.exitcode == 0
+            finally:
+                receiving.close()
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=20)
+        assert not list(root.rglob("__pycache__"))
+
+    def test_warmup_then_execute_without_recompiling(self, test_config, monkeypatch):
+        """Prepare from annotations without a worker, then execute those binaries."""
+        if test_config.codegen_only:
+            pytest.skip("Warmup acceptance requires the device compiler and runtime")
+
+        from pypto.runtime import ChipWorker  # noqa: PLC0415
+        from pypto.runtime.kernel_compiler import KernelCompiler  # noqa: PLC0415
+        from simpler.worker import Worker  # noqa: PLC0415
+
+        @pl.jit
+        def warm_add(
+            x: pl.Tensor[[16, 16], pl.FP32],
+            out: pl.Out[pl.Tensor[[16, 16], pl.FP32]],
+            value: pl.Scalar[pl.FP32] = 3.0,
+        ):
+            with pl.at(level=pl.Level.CORE_GROUP):
+                tile = pl.load(x, [0, 0], [16, 16])
+                pl.store(pl.add(tile, value), [0, 0], out)
+            return out
+
+        def forbidden_worker(*args, **kwargs):
+            pytest.fail("warmup initialized a runtime worker")
+
+        with monkeypatch.context() as warmup_guard:
+            warmup_guard.setattr(ChipWorker, "__init__", forbidden_worker)
+            warmup_guard.setattr(Worker, "__init__", forbidden_worker)
+            prepared = warm_add.warmup(config=test_config)
+            assert prepared._chip_callable is not None
+
+        def forbidden_compile(*args, **kwargs):
+            pytest.fail("execution recompiled a binary after warmup")
+
+        monkeypatch.setattr(KernelCompiler, "compile_incore", forbidden_compile)
+        monkeypatch.setattr(KernelCompiler, "compile_orchestration", forbidden_compile)
+        x = torch.full((16, 16), 2.0)
+        out = torch.zeros_like(x)
+        # A scalar parameter is a runtime value (issue #2751): the same prepared
+        # binaries serve every value, and each dispatch reads the one passed.
+        for value in (3.0, -1.5, 10.0):
+            prepared(x, out, value, config=test_config)
+            torch.testing.assert_close(out, torch.full_like(out, 2.0 + value))
 
     def test_inplace_add(self, test_config):
         """@pl.jit: first call compiles and executes correctly on device."""

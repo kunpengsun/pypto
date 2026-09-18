@@ -439,7 +439,11 @@ bool ShareOneMemRefWindow(const std::shared_ptr<const TileType>& lhs,
 //   * `IsInPlaceInput0DpsOp` — ops whose in-place-ness is a codegen-lowering fact.
 //     Gated on a shared base memref only, which is the long-standing behaviour.
 //
-//   * the registry (`set_output_reuses_input`) — the declared, op-level truth.
+//   * `BuiltinWritebackArgIndex` — the declared, op-level truth: the registry's
+//     `set_output_reuses_input` slot. Deliberately not `ResultAliasedArgIndex`,
+//     which answers the *lineage* question (which argument does the result
+//     name) and additionally covers host-level ops whose result is a window,
+//     not a buffer this emitter may alias.
 //     This is what lets `tile.matmul_acc` accumulate directly into its
 //     accumulator operand: when that operand is a `tile.slice` of a larger Acc
 //     tile its SSA is a `pto.subview`, so the MAD writes straight into the
@@ -474,9 +478,7 @@ bool ShouldAliasResultToInPlaceInput(const AssignStmtPtr& stmt) {
     return result_memref && input_memref && result_memref->base_.get() == input_memref->base_.get();
   }
 
-  auto& registry = ir::OpRegistry::GetInstance();
-  if (!registry.IsRegistered(call->op_->name_)) return false;
-  auto declared = registry.GetEntry(call->op_->name_).GetOutputReusesInputArg();
+  auto declared = ir::op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
   if (!declared.has_value()) return false;
   auto input_tile_type = input_tile_type_at(*declared);
   if (!input_tile_type) return false;
@@ -850,6 +852,10 @@ void PTOCodegen::EmitDeferredCompletionAdapterDeclaration() {
 }
 
 void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
+  if (UsesBufferIR(func)) {
+    GenerateBufferFunction(func);
+    return;
+  }
   fs_.Reset();
   fs_.current_function = func;
 
@@ -1163,16 +1169,10 @@ void PTOCodegen::GenerateFunction(const FunctionPtr& func) {
         continue;
       }
       if (fs_.ffts_workspace_vars.count(var.get()) > 0) continue;
-      // PTOAS / pto-isa special requirement (MX GM scale rank-5):
-      //   Generic parameter make_tensor_view stays logical rank-2 + layout=mx_*.
-      //   That path does not expand SFractal [16,2] correctly for A5 TLoad
-      //   (expands e.g. [64,4] to Shape<1,1,1,64,4> and fails staticShape[3]==16).
-      //   Skip it here; MX tile.load owns the packed expansion via
-      //   EmitMxPhysicalView (see that helper for a with/without example).
-      const bool is_mx_tensor =
-          tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout);
+      // BlockMxScaleTensorViews rewrites MX TensorTypes into packed rank-5 form;
+      // bind a parameter view like NZ so EmitMakeTensorViews / tile.load share
+      // the same make_tensor_view (no hand-rolled EmitMxPhysicalView).
       RegisterBasePtr(var, GetVarName(var));
-      if (is_mx_tensor) continue;
       std::string tensor_view = NewNamedTemp(var->name_hint_ + "_view");
       BindTensorView(var, tensor_view);
       // Remember the base pointer so mid-body pl.read/pl.write resolve to !pto.ptr
@@ -1287,19 +1287,12 @@ void PTOCodegen::EmitMakeTensorViews(const FunctionPtr& func) {
   for (const auto& param : func->params_) {
     auto tensor_type = ir::AsTensorTypeLike(param->GetType());
     if (!tensor_type) continue;
-    // PTOAS / pto-isa: MX tile.load owns its packed rank-5 view
-    // (EmitMxPhysicalView).  Do not register a generic logical rank-2 parameter
-    // view for these tensors — that would reintroduce the broken SFractal
-    // expansion described on EmitMxPhysicalView.
-    if (tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout)) {
-      continue;
-    }
     // Core-group outlining keeps the complete public signature on both the
     // AIC and AIV functions.  Do not materialize a view for a tensor that the
     // outlined body does not reference: PTOAS cannot infer a non-ND layout for
     // such an unused view (notably the MX scale tensors on the AIV cast side).
     if (body_vars.var_uses.count(param.get()) == 0) continue;
-    if (param->name_hint_ == "__gm_pipe_buffer") continue;         // GM slot buffer is a raw pointer
+    if (!fs_.buffer_ir && param->name_hint_ == "__gm_pipe_buffer") continue;  // Legacy GM slot buffer
     if (fs_.ffts_workspace_vars.count(param.get()) > 0) continue;  // FFTS workspace stays a raw pointer
 
     // ptoas rejects a malformed view (bad strides / layout) on this line, so
@@ -1489,8 +1482,9 @@ PTOCodegen::AllocTileFields PTOCodegen::ComputeAllocTileFields(
   // place a physically illegal box grid can be caught with the IR location and
   // an actionable remedy -- rather than by PTOAS, whose message names its own
   // internals and points at whichever line the location happened to carry.
-  CheckBoxedTileExtents(*tile_type, ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_)),
-                        current_span_);
+  const auto alloc_components = ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_));
+  CheckBoxedTileExtents(*tile_type, alloc_components, current_span_);
+  CheckFlatTileExtents(*tile_type, alloc_components, current_span_);
 
   // Cast a non-index integer SSA to `index` (PTOAS expects index typed
   // valid_row / valid_col operands). Floating-point operands are rejected.
@@ -1649,6 +1643,15 @@ void PTOCodegen::PlanMultiBufferRegions(const FunctionPtr& func) {
       candidate.count = memref->slot_count_;
     }
     if (candidate.reference_tile || !memref->slot_index_.has_value() || !*memref->slot_index_) continue;
+    // A multi-buffer region's slots never pass through ComputeAllocTileFields:
+    // the whole region is emitted as one `pto.alloc_multi_tile` by
+    // EmitMultiBufferRegionAllocs, which takes only the rendered strings. Run
+    // the flat-extent check on the reference tile, which describes every slot,
+    // so a slotted tile gets the same PyPTO diagnostic as a plain one instead
+    // of reaching PTOAS. (The boxed-extent rule has the same gap here, but it
+    // predates this check and widening it is not this change's business.)
+    CheckFlatTileExtents(*tile_type, ExtractTileTypeInfo(*tile_type, GetTypeString(tile_type->dtype_)),
+                         &tile_var->span_);
     candidate.slot_type_str = GetTileBufTypeStringFromTileType(tile_type);
     const auto reference_extents = StaticValidExtents(tile_type);
     candidate.has_extents = reference_extents.has_value();
@@ -2101,12 +2104,12 @@ void PTOCodegen::EmitExtraAllocTiles() {
 
 void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
   // Defensive: the first-class SplitAivScopeStmt region is consumed and erased
-  // by LowerAutoVectorSplit (pass 20), well before codegen. There is no
+  // by LowerAutoVectorSplit (pass 23), well before codegen. There is no
   // ScopeStmt handler here, so a survivor would be silently unwrapped by the
   // base visitor — losing the region semantics. Fail loudly instead.
   INTERNAL_CHECK_SPAN(!ir::As<ir::SplitAivScopeStmt>(stmt), stmt->span_)
       << "Internal error: SplitAivScopeStmt reached PTO codegen; it must be lowered and erased by "
-         "LowerAutoVectorSplit (pass 20).";
+         "LowerAutoVectorSplit (pass 23).";
   // Primary location source: every op lowered under this statement is attributed
   // to the statement's source line unless a nested Call refines it (see
   // VisitExpr_(CallPtr)). The statement span is what passes reliably preserve —
@@ -2117,6 +2120,7 @@ void PTOCodegen::VisitStmt(const ir::StmtPtr& stmt) {
 
 void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
   auto call = As<ir::Call>(op->value_);
+  if (fs_.buffer_ir && TryEmitBufferCall(call, op->var_)) return;
   const bool is_set_validshape = ir::IsOp(call, "tile.set_validshape");
   const bool alias_result_to_in_place_input = ShouldAliasResultToInPlaceInput(op);
   const bool alias_array_update_to_input = ShouldAliasArrayUpdateResultToInput(op);
@@ -2274,6 +2278,7 @@ void PTOCodegen::VisitStmt_(const AssignStmtPtr& op) {
 // ========================================================================
 
 void PTOCodegen::VisitExpr_(const CallPtr& op) {
+  if (fs_.buffer_ir && TryEmitBufferCall(op)) return;
   const std::string& op_name = op->op_->name_;
 
   CHECK(backend_ != nullptr) << "Backend must not be null; use PTOCodegen(backend) or default backend";
@@ -2556,11 +2561,6 @@ std::string PTOCodegen::TryGetTensorView(const VarPtr& tensor_var) const {
     if (auto init_iter = As<ir::IterArg>(iter_arg->initValue_)) return TryGetTensorView(init_iter);
   }
   return "";
-}
-
-bool PTOCodegen::NoteCacheBypassWarned(const ir::Var* tensor) {
-  INTERNAL_CHECK(tensor != nullptr) << "Internal error: null tensor passed to NoteCacheBypassWarned";
-  return fs_.cache_bypass_warned.insert(tensor).second;
 }
 
 std::string PTOCodegen::GetOrCreateTensorView(const VarPtr& tensor_var) {

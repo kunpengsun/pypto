@@ -295,6 +295,16 @@ class UnknownType(Type):
             The singleton UnknownType instance
         """
 
+class VoidType(Type):
+    """Known absence of an SSA result, distinct from UnknownType."""
+
+    def __init__(self) -> None:
+        """Create a void type."""
+
+    @staticmethod
+    def get() -> VoidType:
+        """Get the singleton VoidType instance."""
+
 class ScalarType(Type):
     """Scalar type representation."""
 
@@ -813,6 +823,47 @@ class ArrayType(ShapedType):
     @property
     def extent(self) -> Expr:
         """Number of elements (always a ConstInt)."""
+
+class BufferType(Type):
+    """Physical descriptor for a final device buffer, without a MemRef or address.
+
+    Physical extents are static positive integers. ``valid_shape`` entries are
+    static nonnegative extents or -1 for a runtime valid extent carried by an op
+    operand. An empty valid shape is normalized to the physical shape.
+    """
+
+    shape: Final[Sequence[int]]
+    dtype: Final[DataType]
+    memory_space: Final[MemorySpace]
+    valid_shape: Final[Sequence[int]]
+    blayout: Final[TileLayout]
+    slayout: Final[TileLayout]
+    fractal: Final[int]
+    pad: Final[PadValue]
+    compact: Final[CompactMode]
+
+    def __init__(
+        self,
+        shape: Sequence[int],
+        dtype: DataType,
+        memory_space: MemorySpace,
+        valid_shape: Sequence[int] = (),
+        blayout: TileLayout = TileLayout.row_major,
+        slayout: TileLayout = TileLayout.none_box,
+        fractal: int = 512,
+        pad: PadValue = PadValue.null,
+        compact: CompactMode = CompactMode.null,
+    ) -> None:
+        """Create a static physical buffer descriptor with explicit memory space."""
+
+class MultiBufferType(Type):
+    """Descriptor for an explicit multi-slot allocation of identical buffers."""
+
+    element_type: Final[BufferType]
+    slot_count: Final[int]
+
+    def __init__(self, element_type: BufferType, slot_count: int) -> None:
+        """Create a multi-buffer descriptor with a positive slot count."""
 
 class TupleType(Type):
     """Tuple type representation (contains multiple types)."""
@@ -1385,7 +1436,7 @@ class ConstBool(Expr):
         """Data type of the expression (always DataType.BOOL)."""
 
 class Call(Expr):
-    """Function call expression."""
+    """Function call expression. Expressions in args, attrs, and kwargs must produce a value."""
 
     op: Final[Op]
     """Operation/function."""
@@ -1413,7 +1464,7 @@ class Call(Expr):
           :attr:`arg_directions` shortcut for typed access).
         """
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, Any]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1451,7 +1502,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         span: Span,
     ) -> None:
         """Create a function call expression with kwargs.
@@ -1469,7 +1520,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         type: Type,
         span: Span,
     ) -> None:
@@ -1489,7 +1540,7 @@ class Call(Expr):
         self,
         op: Op,
         args: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
@@ -1522,6 +1573,8 @@ class Submit(Expr):
     ``Tuple[<callee return>..., Scalar[TASK_ID]]`` (or just
     ``Scalar[TASK_ID]`` when the callee has no value return); callers unpack
     as ``out, tid = pl.submit(...)``.
+
+    Expressions in attrs and kwargs must produce a value.
 
     ``deps`` is a first-class field carrying the explicit cross-task
     dependencies passed as ``deps=[tid1, tid2, ...]``.
@@ -1571,7 +1624,7 @@ class Submit(Expr):
     def attrs(self) -> Mapping[str, Any]:
         """Compiler-internal node metadata (see :attr:`Call.attrs`)."""
 
-    kwargs: Final[Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue]]
+    kwargs: Final[Mapping[str, Any]]
     """Keyword arguments (metadata)."""
 
     @overload
@@ -1600,7 +1653,7 @@ class Submit(Expr):
         op: Op,
         args: Sequence[Expr],
         deps: Sequence[Expr],
-        kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+        kwargs: Mapping[str, object],
         attrs: Mapping[str, object] | Sequence[tuple[str, object]] | None,
         type: Type,
         span: Span,
@@ -2304,6 +2357,9 @@ class ScopeKind(enum.Enum):
     SplitAiv = 7
     """Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)."""
 
+    Graph = 8
+    """Recordable orchestration region (pl.graph, outlined into a Graph function)."""
+
 class SplitMode(enum.Enum):
     """Split mode for cross-core data transfer."""
 
@@ -2431,7 +2487,8 @@ class ScopeStmt(Stmt):
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         """ScopeStmt is abstract — construct an InCoreScopeStmt, ClusterScopeStmt,
-        HierarchyScopeStmt, SplitAivScopeStmt, or SpmdScopeStmt instead."""
+        HierarchyScopeStmt, SplitAivScopeStmt, GraphScopeStmt, or SpmdScopeStmt
+        instead."""
 
 class InCoreScopeStmt(ScopeStmt):
     """InCore scope: AICore sub-graph region."""
@@ -2454,6 +2511,12 @@ class ClusterScopeStmt(ScopeStmt):
 
     def __init__(self, name_hint: str = "", *, body: Stmt, span: Span) -> None:
         """Create a Cluster scope statement."""
+
+class GraphScopeStmt(ScopeStmt):
+    """Graph scope: a recordable orchestration region."""
+
+    def __init__(self, name_hint: str, *, body: Stmt, span: Span) -> None:
+        """Create a Graph scope statement (``name_hint`` is the region name)."""
 
 class HierarchyScopeStmt(ScopeStmt):
     """Hierarchy scope: distributed-hierarchy region."""
@@ -2505,7 +2568,7 @@ class SplitAivScopeStmt(ScopeStmt):
     Dispatches a region across the 2 AIV subblocks. ``mode=SplitMode.NONE`` is
     task-parallel (no halving; both lanes run the full body, dispatched via
     ``aiv_id``); ``UP_DOWN`` / ``LEFT_RIGHT`` are data-parallel (vector compute
-    halved on the split axis). Erased by LowerAutoVectorSplit (pass 20); never
+    halved on the split axis). Erased by LowerAutoVectorSplit (pass 23); never
     reaches codegen.
     """
 
@@ -3116,6 +3179,7 @@ def create_op_call(
         Exception: If operator is not registered, is internal-only, or type deduction fails
     """
 
+@overload
 def _create_internal_op_call(
     op_name: str,
     args: Sequence[Expr],
@@ -3145,6 +3209,20 @@ def _create_internal_op_call(
 
     Raises:
         Exception: If operator is not registered or type deduction fails
+    """
+
+@overload
+def _create_internal_op_call(
+    op_name: str,
+    args: Sequence[Expr],
+    kwargs: Mapping[str, int | bool | str | float | DataType | MemorySpace | PadValue],
+    type: Type,
+    span: Span,
+) -> Call:
+    """Create an internal Buffer call with a validated explicit result descriptor.
+
+    Only operators registered with explicit type validation accept this form.
+    The descriptor is stored in the result type; runtime values stay in args.
     """
 
 def set_call_attrs(call: Call, attrs: Mapping[str, object]) -> Call:
@@ -3245,6 +3323,61 @@ def get_op_memory_spec(op_name: str) -> dict[str, Any] | None:
         * ``None`` — no resolver registered for this op.
     """
 
+class OpIRStage(enum.Enum):
+    """Representation consumed and produced by an operator."""
+
+    Functional = ...
+    Buffer = ...
+
+class BufferAccess(enum.Enum):
+    """Access to buffer data or descriptor metadata; absence is explicit."""
+
+    None_ = ...
+    Read = ...
+    Write = ...
+    ReadWrite = ...
+
+class BufferResultBehavior(enum.Enum):
+    """Storage ownership of each actual SSA result."""
+
+    None_ = ...
+    Allocate = ...
+    Alias = ...
+    Borrow = ...
+    Value = ...
+
+class BufferArgEffect:
+    """Explicit data and metadata effects of one buffer-stage operand."""
+
+    @property
+    def data(self) -> BufferAccess:
+        """Access to lane data; Write does not imply full coverage."""
+    @property
+    def metadata(self) -> BufferAccess:
+        """Access to descriptor state, including dynamic valid extents."""
+    @property
+    def non_memory(self) -> bool:
+        """Whether the operand contains only non-memory scalar values."""
+
+class BufferResultSpec:
+    """Storage ownership and alias source of one actual SSA result."""
+
+    @property
+    def behavior(self) -> BufferResultBehavior:
+        """The declared ownership behavior."""
+    @property
+    def alias_arg(self) -> int | None:
+        """Source operand for Alias/Borrow, absent for other behaviors."""
+
+def get_op_ir_stage(op_name: str) -> OpIRStage:
+    """Get the operator's typed representation stage."""
+
+def get_op_buffer_arg_effect(op_name: str, arg_index: int) -> BufferArgEffect:
+    """Get declared buffer data/metadata effects; fail on missing classification."""
+
+def get_op_buffer_result_spec(op_name: str, result_index: int = 0) -> BufferResultSpec:
+    """Get one buffer result's ownership; zero-result ops declare None_ at index 0."""
+
 class ArgEffect(enum.Enum):
     """What executing an operator does to the buffer one argument names."""
 
@@ -3335,7 +3468,7 @@ class LaneInvariantArg(enum.Enum):
 
     Declared only for the arguments an operator's own ``f_deduce_type`` cannot
     speak about; ``LowerAutoVectorSplit`` decides every other operand by
-    re-deducing the halved call. See ``docs/en/dev/passes/21-lower_auto_vector_split.md``.
+    re-deducing the halved call. See ``docs/en/dev/passes/22-lower_auto_vector_split.md``.
     """
 
     Scratch = ...
@@ -3366,7 +3499,8 @@ def get_op_lane_invariant_arg(op_name: str, arg_index: int) -> LaneInvariantArg 
 def get_op_output_arity(op_name: str) -> int:
     """Number of values an operator produces.
 
-    1 for an ordinary operator; N > 1 for a multi-output operator, whose deduced
+    0 for a buffer operator returning ``VoidType``; 1 for an ordinary operator;
+    N > 1 for a multi-output operator, whose deduced
     result is a ``TupleType`` of exactly N elements. Codegen reads the arity from
     here rather than restating it per emitter.
 
@@ -3383,7 +3517,7 @@ def get_op_output_arity(op_name: str) -> int:
 def op_arg_is_workspace(op_name: str, arg_index: int) -> bool:
     """Whether an argument is compiler-supplied scratch rather than a result.
 
-    A multi-output operator may write through an argument only when that
+    A Functional-stage multi-output operator may write through an argument only when that
     argument is declared a workspace; an undeclared written argument is a
     destination tile leaked into the argument list.
 
@@ -4229,6 +4363,7 @@ class IRVisitor:
     def visit_while_stmt(self, op: WhileStmt) -> None: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> None: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> None: ...
+    def visit_graph_scope_stmt(self, op: GraphScopeStmt) -> None: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> None: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> None: ...
     def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> None: ...
@@ -4311,6 +4446,7 @@ class IRMutator:
     def visit_while_stmt(self, op: WhileStmt) -> Stmt: ...
     def visit_in_core_scope_stmt(self, op: InCoreScopeStmt) -> Stmt: ...
     def visit_cluster_scope_stmt(self, op: ClusterScopeStmt) -> Stmt: ...
+    def visit_graph_scope_stmt(self, op: GraphScopeStmt) -> Stmt: ...
     def visit_hierarchy_scope_stmt(self, op: HierarchyScopeStmt) -> Stmt: ...
     def visit_spmd_scope_stmt(self, op: SpmdScopeStmt) -> Stmt: ...
     def visit_split_aiv_scope_stmt(self, op: SplitAivScopeStmt) -> Stmt: ...

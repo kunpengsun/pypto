@@ -14,7 +14,7 @@ Codegen must be a **strict 1-to-1 translation** from IR to generated code. Each 
 
 **Why:** Codegen that embeds analysis becomes fragile — it duplicates logic that passes already handle, and it's harder to test in isolation. Keeping codegen a straightforward translation ensures it stays predictable and maintainable.
 
-**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/26-normalize_return_order.md) pass.
+**When analysis is found in codegen:** File a tracking issue and refactor it into a dedicated pass when bandwidth allows. [#814](https://github.com/hw-native-sys/pypto/issues/814) was an example: return-to-parameter tracing in orchestration codegen has been refactored into the [`NormalizeReturnOrder`](../passes/28-normalize_return_order.md) pass.
 
 ## Overview
 
@@ -42,6 +42,28 @@ stride expression — e.g. the `2` in a composite parameter dim `M * 2` — is s
 declared in the constants block before its use.
 
 ## Architecture
+
+### Explicit Buffer input
+
+`GenerateBufferFunction` validates explicitly constructed Buffer IR before
+emission. Its GM path supports static, packed ND rank-2 FP32 Tensor parameters
+and normalized Tensor parameter returns. It shares the existing GM tensor-view
+prologue and native tensors-first/scalars-last ABI. Tensor returns remain in IR
+for orchestration aliasing; they do not create native return values.
+
+`buffer.load` and `buffer.store` each render an explicit window as
+`pto.partition_view` followed by `pto.tload` or `pto.tstore`. Their destination,
+offsets, and valid extents come from ordinary operands. `buffer.add`, `mul`, and
+`copy` render their explicit buffer destinations. Each `pto.alloc_tile` comes
+from a `buffer.alloc` in the same scope; an address is emitted exactly when its
+operand is present, independently of the legacy emission flag. GM transfers
+never create a buffer, infer valid-state updates, or reconstruct a logical Tile.
+
+This direct path does not enable automatic Tile-to-Buffer conversion or change
+the default pipeline. See [Buffer contracts](../ir/02-types.md#buffer-operator-contracts)
+for descriptor, direction, dynamic-window, and ABI limits. Native compilation
+tests establish syntax and operand dataflow; numerical execution is a separate
+integration requirement.
 
 ### Class Structure
 
@@ -146,6 +168,9 @@ print(pto_code)
 | `tile.addsc(src0, scalar, carry)` | `pto.taddsc` (`src0 + scalar + carry`) |
 | `tile.subsc(src0, scalar, carry)` | `pto.tsubsc` (`src0 - scalar + carry`) |
 | `tile.adds(tile, scalar)` | `pto.tadds` (tile + scalar) |
+| `tile.and_(lhs, rhs)` / `tile.ands(lhs, scalar)` | `pto.tand` / `pto.tands`; scalar is same-width signless `iN` |
+| `tile.or_(lhs, rhs)` / `tile.ors(lhs, scalar)` | `pto.tor` / `pto.tors`; scalar is same-width signless `iN` |
+| `tile.xor(lhs, rhs, tmp)` / `tile.xors(lhs, scalar, tmp)` | `pto.txor` / `pto.txors`; scalar is same-width signless `iN` |
 | `tile.fillpad_expand(src, shape)` | `pto.tfillpad_expand ins(%src) outs(%dst)` (the `shape` tuple is type-deduction only; the larger `dst` and its pad come from the result type) |
 
 **`tile.slice` / `tile.assemble` lowering details.**  Both ops are lowered
@@ -217,8 +242,8 @@ or call `set_validshape` on the source tile before taking the view.
 
   `eL` is lane `L`'s **runtime** valid extent on the split axis — the ISA reads it off the popped
   tile (`popVecTileFromGMFiFo`), so the even codes require `e0 == e1` and the odd ones
-  `e0 == e1 + 1`. [LowerAutoVectorSplit](../passes/21-lower_auto_vector_split.md) materializes those
-  extents and [ExpandMixedKernel](../passes/22-expand_mixed_kernel.md) picks the matching code.
+  `e0 == e1 + 1`. [LowerAutoVectorSplit](../passes/23-lower_auto_vector_split.md) materializes those
+  extents and [ExpandMixedKernel](../passes/24-expand_mixed_kernel.md) picks the matching code.
 - The Cube-to-Vector FIFO carries a compacted rectangle: the producer stores its `valid_row` x
   `valid_col` block at a `valid_col` row pitch, and each consumer lane reads its band back with the
   same pitch (`gmStrideR = valid_col`, doubled for the left-right codes). A partial valid shape on
@@ -578,7 +603,7 @@ through — the per-variable declaration, the hoisted `extra_alloc_tiles`, and t
 control-flow paths alike — so the check sees exactly what is emitted and cannot
 drift from it. A tensor-level `pl.matmul` / `pl.matmul_acc` never trips it *on
 its M axis*, which is boxed for the user in
-[`ConvertTensorToTileOps`](../passes/10-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing).
+[`ConvertTensorToTileOps`](../passes/11-convert_tensor_to_tile_ops.md#cube-operand-m-axis-boxing).
 The axes that remain the user's responsibility are `K` and `N`.
 
 ## Complete Example

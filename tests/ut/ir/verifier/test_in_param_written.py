@@ -30,7 +30,7 @@ consistent proves nothing. Calling it on unlowered IR is what exercises the
 
 **Best-effort, not a property.** This is a warning and nothing more. It runs
 `PostPipeline`, which is the earliest point after ``DeriveCallDirections``
-(pass 37) — and ``InitMemRef`` (pass 31) invalidates ``SSAForm`` with nothing
+(pass 41) — and ``InitMemRef`` (pass 34) invalidates ``SSAForm`` with nothing
 re-establishing it, so the IR it sees is not in SSA form and no pipeline
 position satisfies both. The buffer lineage has no merging at a join, which is
 exact only when each name has one definition, so it can both miss a write and
@@ -110,6 +110,25 @@ class TestWrittenInParamIsRejected:
         assert len(messages) == 1
         assert "'out'" in messages[0]
         assert "tile.mscatter" in messages[0]
+
+    def test_gather_writes_scratch_through_validshape_view(self):
+        @pl.program
+        class Prog:
+            @pl.function(type=pl.FunctionType.InCore)
+            def kernel(
+                self,
+                src: pl.Tile[[1, 128], pl.FP16, pl.Mem.Vec],
+                idx: pl.Tile[[1, 16], pl.INT32, pl.Mem.Vec],
+                scratch: pl.Tile[[1, 16], pl.INT32, pl.Mem.Vec],
+            ) -> pl.Tile[[1, 16], pl.FP16, pl.Mem.Vec]:
+                tmp = pl.tile.set_validshape(scratch, 1, 16)
+                result = pl.tile.gather(src, idx, tmp)
+                return result
+
+        messages = _messages(Prog)
+        assert len(messages) == 1
+        assert "'scratch'" in messages[0]
+        assert "tile.gather" in messages[0]
 
     def test_notify_into_in_signal(self):
         """``pld.system.notify`` deposits into the peer's slot of its signal.

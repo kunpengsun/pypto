@@ -28,7 +28,7 @@ print(compiled.output_dir)
 然后把工具指向那个目录：
 
 ```bash
-OUT=build_output/<program>_<timestamp>          # 上一行打印出来的路径
+OUT=build_output/<program>_<unique>             # 上一行打印出来的路径
 python -m pypto.tools.memory_map "$OUT/passes_dump/NN_after_SomePass.py" -o map.html
 ```
 
@@ -72,4 +72,4 @@ python -m pypto.tools.memory_map "$OUT/passes_dump/NN_after_SomePass.py" -o map.
 - [内存](../performance/05-memory.md) —— 运行时那四个环，以及本工具所画的片上预算。
 - [InCore 函数调优](../performance/04-incore.md) —— 消耗这份预算的一侧。
 - [调试](00-debugging.md) —— pass dump 的另一个读者。
-- [AllocateMemoryAddr](../../dev/passes/35-allocate_memory_addr.md) —— 这张图所呈现的那个 pass 的输出。
+- [AllocateMemoryAddr](../../dev/passes/37-allocate_memory_addr.md) —— 这张图所呈现的那个 pass 的输出。

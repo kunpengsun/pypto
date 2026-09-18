@@ -46,6 +46,7 @@ enum class IRProperty : uint64_t {
   BreakContinueValid,       ///< Break/continue only in sequential/while loops
   UseAfterDef,              ///< All variable uses are dominated by a definition
   HierarchyOutlined,        ///< Hierarchy scopes outlined into level/role functions
+  GraphOutlined,            ///< Graph scopes outlined into FunctionType::Graph functions
   StructuredCtrlFlow,       ///< No BreakStmt/ContinueStmt — only structured control flow
   VectorKernelSplit,        ///< AIV functions with split mode have tpop shapes and store offsets adjusted
   OutParamNotShadowed,      ///< Out/InOut params are not reassigned with tensor-creating ops
@@ -124,7 +125,21 @@ enum class IRProperty : uint64_t {
                        ///< helper can be paired with its caller's store; a mismatch can leave the A2/A3
                        ///< accumulator unit flag set or wait forever on an unset flag, stalling device
                        ///< execution
-  kCount               ///< Sentinel (must be last)
+  NoScalarKernelReturn,  ///< No device function (InCore / AIC / AIV / Group / Spmd) has a ScalarType
+                         ///< anywhere in return_types_ -- including one nested in a pl.Tuple return,
+                         ///< which is a single TupleType entry. Those types mean "a dispatchable task",
+                         ///< and the runtime has no scalar output channel -- Arg::add_scalar passes a
+                         ///< scalar in by value and TaskOutputTensors returns only tensors -- so
+                         ///< orchestration codegen has no carrier to bind it to (#631). Scalar[TASK_ID]
+                         ///< is exempt: a scheduler handle, not data. A device-side scalar helper is
+                         ///< written FunctionType::Inline and spliced away by InlineFunctions. Decidable
+                         ///< on the user's own IR, so it is a structural property verified at every pass
+                         ///< boundary
+  AivSplitLoweredValid,  ///< Lowered split regions or flat split bodies have valid cross-core boundaries
+  BufferIR,              ///< InCore/AIC/AIV use explicit buffer handles and valid registered buffer calls;
+             ///< composes SSA, lexical use-after-definition, and assignment symmetry, not lifetime or
+             ///< initialization checks
+  kCount  ///< Sentinel (must be last)
 };
 
 static_assert(
@@ -256,7 +271,7 @@ enum class VerificationLevel {
  * Returns {SSAForm, TypeChecked, MixedKernelExpanded, AllocatedMemoryAddr,
  * BreakContinueValid, NoRedundantBlocks, InOutUseValid,
  * CallDirectionsResolved, ManualDepsOnSubmitOnly, ReturnParamsExplicit,
- * AivSplitValid, TileMemoryInferred, HardSyncallOccupancyValid,
+ * AivSplitValid, AivSplitLoweredValid, TileMemoryInferred, TileOps2D, HardSyncallOccupancyValid,
  * IterArgCarryClassified, RuntimeScopesMaterialized,
  * DistTensorCtxMaterialized, GraphBoundaryLegalized, AccToGmStoreValid,
  * AccCompactValid, AtomicAddDtypeValid, AccStorePhaseValid} —
@@ -271,7 +286,7 @@ const IRPropertySet& GetVerifiedProperties();
  * in per-pass PassProperties. Returns {TypeChecked, BreakContinueValid,
  * NoRedundantBlocks, UseAfterDef, OutParamNotShadowed, NoNestedInCore,
  * InOutUseValid, PipelineLoopValid, ArrayNotEscaped, ManualDepsOnSubmitOnly,
- * AtomicAddDtypeValid}.
+ * AtomicAddDtypeValid, NoScalarKernelReturn}.
  */
 const IRPropertySet& GetStructuralProperties();
 

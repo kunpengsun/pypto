@@ -29,6 +29,7 @@
 #include "pypto/core/dtype.h"
 #include "pypto/core/error.h"
 #include "pypto/core/logging.h"
+#include "pypto/ir/cast_saturation.h"
 #include "pypto/ir/core.h"
 #include "pypto/ir/expr.h"
 #include "pypto/ir/function.h"
@@ -63,23 +64,6 @@ namespace ir {
 
 namespace {
 
-// Check if operation is a view operation (zero-copy metadata transform).
-// A view op is one registered with set_output_memory_inherit_input() — its
-// output reuses the input's MemRef view. Delegates to the shared registry
-// predicate so InferTileMemorySpace and InitMemRef agree on the set.
-bool IsViewOperation(const std::string& op_name) {
-  auto& registry = OpRegistry::GetInstance();
-  if (!registry.IsRegistered(op_name)) return false;
-  return registry.GetEntry(op_name).OutputMemoryInheritsInput();
-}
-
-// Whether an inherit-input op *permutes* data rather than just reinterpreting
-// it (tile.transpose).  A pure metadata view (slice/reshape/extract/...) aliases
-// its input's buffer, but a permuting op's output must never alias the input:
-// pto.ttrans is not in-place safe (the unaligned scalar path writes dst directly
-// from src), so InitMemRef gives the transpose output a fresh buffer.
-bool IsDataPermutingInheritOp(const OpPtr& op) { return IsOp(op, "tile.transpose"); }
-
 // A tile owns no general-pool buffer ("buffer-less by design") when its defining
 // value is a cross-core tpop result, or a non-permuting zero-copy view / plain
 // alias chained off a buffer-less source. `source_buffer_less` reports whether a
@@ -101,14 +85,6 @@ bool ProducesBufferLessTile(const ExprPtr& value, const SourceBufferLess& source
   }
   auto v = AsVarLike(value);
   return v && source_buffer_less(v.get());
-}
-
-// Check if an operation's output should reuse the MemRef of a specific input argument.
-// Returns the input arg index whose MemRef to share, or nullopt.
-std::optional<size_t> GetOutputReusesInputArg(const std::string& op_name) {
-  auto& registry = OpRegistry::GetInstance();
-  if (!registry.IsRegistered(op_name)) return std::nullopt;
-  return registry.GetEntry(op_name).GetOutputReusesInputArg();
 }
 
 /// Byte envelope of a static slice of an NZ-boxed accumulator (L0C) parent.
@@ -345,6 +321,17 @@ class MaterializePtoLevel3ScratchMutator : public IRMutator {
       INTERNAL_CHECK_SPAN(src_type, span) << "tile.cast source must be TileType before InitMemRef";
       const DataType dst = call->GetKwarg<DataType>("target_type");
       if (!TcvtNeedsLevel3Scratch(src_type->dtype_, dst)) return std::nullopt;
+      // The scratch exists only for PTOAS's *non-saturating* narrowing helper,
+      // which emulates the target's overflow behavior with a chunked vector
+      // sequence. A saturating cast is a native conversion that takes no tmp, so
+      // synthesizing one would allocate Vec memory the emitted `pto.tcvt` never
+      // reads. Every pair reaching here narrows to an integer, whose default is
+      // saturating, so only a cast that explicitly opted out needs the buffer. A
+      // caller-supplied tmp is untouched either way: this arm only runs for the
+      // 1-argument form.
+      if (GetSaturationMode(call) != static_cast<int>(SaturationMode::kOff)) {
+        return std::nullopt;
+      }
       const int64_t bytes = TcvtScratchCapacityBytes(src_type, dst, span);
       return PtoScratchSpec{MakeStaticShape({1, bytes}, span), DataType::INT8, "tcvt"};
     }
@@ -646,7 +633,7 @@ class InitMemRefMutator : public IRMutator {
       // default, which is their correct home.
       if (auto tile_type = std::dynamic_pointer_cast<const TileType>(var_expr->GetType())) {
         if (IsInCoreType(func_type_)) {
-          // A device tile with no space after pass 17 is a compiler bug:
+          // A device tile with no space after pass 20 is a compiler bug:
           // InferTileMemorySpace covers every IsInCoreType function and is
           // declared to produce TileMemoryInferred.
           INTERNAL_CHECK_SPAN(tile_type->memory_space_.has_value(), var->span_)
@@ -835,26 +822,39 @@ class InitMemRefMutator : public IRMutator {
       // A pure metadata view (slice/reshape/...) inherits its input's buffer.  A
       // permuting inherit-input op — tile.transpose — must NOT: pto.ttrans is
       // not in-place safe (the unaligned scalar path writes dst directly from
-      // src), so the transpose output always gets a fresh buffer.
-      if (IsViewOperation(call->op_->name_) && call->args_.size() > 0) {
+      // src), so the transpose output always gets a fresh buffer.  Both halves
+      // of that statement are `IsBufferAliasingViewOp`, which is
+      // `OutputMemoryInheritsInput() && IsInplaceSafe()` — it excludes transpose
+      // without naming it, and will exclude any future inherit-input op
+      // registered `not_inplace_safe()`.
+      if (op_predicates::IsBufferAliasingViewOp(call->op_->name_) && !call->args_.empty()) {
         LOG_DEBUG << "Detected view operation: " << call->op_->name_;
         // Get the input tile (first argument) after mutation
         auto new_call = std::dynamic_pointer_cast<const Call>(new_value);
         if (new_call && !new_call->args_.empty()) {
-          const bool may_inherit = !IsDataPermutingInheritOp(call->op_);
-          if (may_inherit) {
-            auto result = ShareMemRefFrom(new_call->args_[0], op, new_value);
-            if (result) {
-              LOG_DEBUG << "Sharing MemRef from input tile to " << op->var_->name_hint_;
-              return result;
-            }
-            LOG_DEBUG << "Input tile has no MemRef yet";
+          auto result = ShareMemRefFrom(new_call->args_[0], op, new_value);
+          if (result) {
+            LOG_DEBUG << "Sharing MemRef from input tile to " << op->var_->name_hint_;
+            return result;
           }
+          LOG_DEBUG << "Input tile has no MemRef yet";
         }
       }
 
-      // Handle ops whose output reuses a specific input arg's MemRef (registry-based)
-      auto reuse_arg_idx = GetOutputReusesInputArg(call->op_->name_);
+      // Handle ops whose output lands in a specific input arg's MemRef.
+      //
+      // The registry's `set_output_reuses_input` slot, NOT the broader
+      // `ResultAliasedArgIndex`. The two answer different questions.  This pass
+      // asks a *physical* one — which argument's buffer does this result
+      // occupy, so the LHS can be bound to it — and only the registry
+      // declaration states that.  `ResultAliasedArgIndex` additionally covers
+      // host-level ops whose result names an argument for *lineage* purposes
+      // (`tensor.write`, and the `pld.tensor.*` collectives, whose result is
+      // the window they reduced or gathered into).  A window's storage belongs
+      // to the distributed runtime and is materialized later by
+      // LowerHostTensorCollectives, so binding the SSA result to it here
+      // rewrites a buffer this pass does not own.
+      auto reuse_arg_idx = op_predicates::BuiltinWritebackArgIndex(call->op_, call->args_.size());
       if (reuse_arg_idx.has_value()) {
         auto new_call = std::dynamic_pointer_cast<const Call>(new_value);
         if (new_call && *reuse_arg_idx < new_call->args_.size()) {
@@ -1051,15 +1051,9 @@ FunctionPtr TransformInitMemRef(const FunctionPtr& func) {
   // PTOAS level2 owns implicit-tmp materialization as part of PlanMemory. PyPTO
   // and DSA-RP instead emit fixed addresses and invoke level3. CI/TCVT scratch
   // remains restricted to A2/A3, while TSORT32 scratch is level-driven.
-  //
-  // Temporarily disabled: #2523 compiler-owned level3 scratch (tile.ci / narrowing
-  // cast / sort32) + ptoas v0.60 caused packed-prefill NaN (pypto#2558 /
-  // pypto-lib#1072). PTOAS is pinned to v0.57; do not synthesize those tmps until
-  // the 3-arg tile.ci / PIPE_S vs PIPE_V mismatch is fixed upstream.
   const MemoryPlanner planner = ctx ? ctx->GetMemoryPlanner() : MemoryPlanner::PyPTO;
-  if (handler != nullptr && handler->RequiresLevel3TmpScratch() &&
-      (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
-    MaterializePtoLevel3ScratchMutator materializer(/*materialize_a2a3_scratch=*/true);
+  if (handler != nullptr && (planner == MemoryPlanner::PyPTO || planner == MemoryPlanner::DsaRP)) {
+    MaterializePtoLevel3ScratchMutator materializer(handler->RequiresLevel3TmpScratch());
     normalized_func = materializer.VisitFunction(normalized_func);
   }
 

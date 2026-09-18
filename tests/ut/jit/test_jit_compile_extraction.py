@@ -16,10 +16,12 @@ Closes hw-native-sys/pypto#1455.
 
 import ctypes
 import importlib
+import warnings
 
 import pypto.language as pl
 import pytest
-from pypto.ir import OptimizationStrategy
+from pypto.compile_profiling import CompileProfiler
+from pypto.ir import OptimizationStrategy, PassDumpLevel
 from pypto.ir.compiled_program import CompiledProgram
 from pypto.jit.decorator import jit
 from pypto.language.parser.diagnostics.exceptions import ParserTypeError
@@ -104,7 +106,10 @@ class TestCompileReturnsCompiledProgram:
 
     def test_compile_keeps_outer_report_instrument(self, tmp_path):
         torch = pytest.importorskip("torch")
-        x = torch.zeros(19, 19)
+        # 32 columns, not 19: an unboxed FP32 tile is addressed in whole
+        # 32-byte units, and this test is about the report instrument, not
+        # the shape.
+        x = torch.zeros(19, 32)
 
         with passes.PassContext([passes.ReportInstrument(str(tmp_path))]):
             compiled = add_kernel.compile(x, x, torch.empty_like(x))
@@ -363,9 +368,9 @@ class TestCompileFromSignature:
         any concrete extent (dynamic dim marked, static dim/dtype identical)."""
         torch = pytest.importorskip("torch")
 
-        _, _, meta_sig, _, _, _ = sig_kernel._bind_args_from_signature({})
+        _, _, meta_sig, _, _ = sig_kernel._bind_args_from_signature({})
         t = torch.zeros(512, 128, dtype=torch.float32)
-        _, _, meta_tensor, _, _, _ = sig_kernel._bind_args((t, t), {})
+        _, _, meta_tensor, _, _ = sig_kernel._bind_args((t, t), {})
         for name in ("a", "c"):
             assert meta_sig[name].dynamic_dim_indices() == meta_tensor[name].dynamic_dim_indices() == {0}
             assert meta_sig[name].static_shape()[1] == meta_tensor[name].static_shape()[1] == 128
@@ -375,12 +380,12 @@ class TestCompileFromSignature:
         """Specializing from the signature yields the same IR as from tensors."""
         torch = pytest.importorskip("torch")
 
-        _, _, tm_s, sv_s, sd_s, dyn_s = sig_kernel._bind_args_from_signature({})
-        prog_sig = sig_kernel._compile_to_program(tm_s, sv_s, sd_s, dyn_s, pl)
+        _, _, tm_s, sd_s, dyn_s = sig_kernel._bind_args_from_signature({})
+        prog_sig = sig_kernel._compile_to_program(tm_s, sd_s, dyn_s, pl)
 
         t = torch.zeros(64, 128, dtype=torch.float32)
-        _, _, tm_t, sv_t, sd_t, dyn_t = sig_kernel._bind_args((t, t), {})
-        prog_tensor = sig_kernel._compile_to_program(tm_t, sv_t, sd_t, dyn_t, pl)
+        _, _, tm_t, sd_t, dyn_t = sig_kernel._bind_args((t, t), {})
+        prog_tensor = sig_kernel._compile_to_program(tm_t, sd_t, dyn_t, pl)
 
         ir.assert_structural_equal(prog_sig, prog_tensor)
 
@@ -390,8 +395,13 @@ class TestCompileFromSignature:
         with pytest.raises(TypeError, match="bare 'pl.Tensor'"):
             add_kernel.compile()
 
-    def test_scalar_param_needs_value(self):
-        """Scalar params carry no value in the signature; must be supplied."""
+    def test_scalar_param_needs_no_value(self):
+        """A scalar parameter is a runtime value, so the signature needs none.
+
+        Its value arrives at dispatch (issue #2751), so only the declared dtype
+        is read here. A keyword is still accepted — it used to mean "specialize
+        this value", so it warns rather than changing meaning silently.
+        """
 
         s_m = pl.dynamic("SM")
 
@@ -404,61 +414,62 @@ class TestCompileFromSignature:
             c = a
             return c
 
-        with pytest.raises(TypeError, match="scalar parameter 'n'"):
-            scalar_sig_kernel._bind_args_from_signature({})
+        _, _, _, scalar_dtypes, _ = scalar_sig_kernel._bind_args_from_signature({})
+        assert scalar_dtypes == {"n": pl.INT32}
 
-        # Supplied via keyword: value flows into scalar_values.
-        _, _, _, scalar_values, _, _ = scalar_sig_kernel._bind_args_from_signature({"n": 7})
-        assert scalar_values == {"n": 7}
+        with pytest.warns(DeprecationWarning, match="no longer folds that value"):
+            _, _, _, kw_dtypes, _ = scalar_sig_kernel._bind_args_from_signature({"n": 7})
+        assert kw_dtypes == {"n": pl.INT32}
 
-    def test_runtime_scalar_left_unspecialized(self):
-        """``pl.RUNTIME`` keeps a scalar out of ``scalar_values`` (issue #2283):
-        the value is supplied at dispatch, not baked into the artifact. The
-        dtype is still recorded — only the value is withheld."""
-        _, _, _, scalar_values, scalar_dtypes, _ = rt_scalar_kernel._bind_args_from_signature(
-            {"n": pl.RUNTIME}
-        )
-        assert scalar_values == {}
-        assert scalar_dtypes == {"n": pl.FP32}
+    def test_runtime_marker_still_accepted(self):
+        """``pl.RUNTIME`` (issue #2283) is now what every scalar does by default.
 
-    def test_runtime_scalar_keeps_symbolic_param_in_program(self):
-        """A ``pl.RUNTIME`` scalar survives specialization as a real parameter
-        reference — in the entry *and* in the incore dep it is forwarded to.
-        A literal is folded into a constant in both instead."""
-        _, _, tm_r, sv_r, sd_r, dyn_r = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
-        prog_runtime = str(rt_scalar_kernel._compile_to_program(tm_r, sv_r, sd_r, dyn_r, pl))
+        It stays accepted so existing signatures keep working; the resulting
+        metadata is the dtype alone, exactly as when nothing is passed.
+        """
+        _, _, _, marked, _ = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
+        _, _, _, unmarked, _ = rt_scalar_kernel._bind_args_from_signature({})
+        assert marked == unmarked == {"n": pl.FP32}
 
-        _, _, tm_s, sv_s, sd_s, dyn_s = rt_scalar_kernel._bind_args_from_signature({"n": 7.0})
-        prog_specialized = str(rt_scalar_kernel._compile_to_program(tm_s, sv_s, sd_s, dyn_s, pl))
+    def test_scalar_stays_symbolic_in_program_whatever_was_passed(self):
+        """A scalar is symbolic end to end — in the entry *and* in the incore dep
+        it is forwarded to — whether the caller marked it ``pl.RUNTIME``, passed
+        a literal, or passed nothing (issue #2751).
 
-        # Both keep 'n' in the entry *and* dep signatures — the parameter list
-        # comes from the annotations either way. What differs is every *use*:
-        # runtime forwards and consumes the symbol, specialized folds a constant.
-        assert prog_runtime.count("n: pl.Scalar[pl.FP32]") == 2
-        assert prog_specialized.count("n: pl.Scalar[pl.FP32]") == 2
-        assert "self._rt_add_scalar_incore(a, n, c)" in prog_runtime
-        assert "self._rt_add_scalar_incore(a, 7.0, c)" in prog_specialized
-        assert "pl.tile.adds(tile, n)" in prog_runtime
-        assert "pl.tile.adds(tile, 7.0)" in prog_specialized
+        A literal used to be folded here, which is what made one artifact per
+        value and left the declared parameter unused.
+        """
+        programs = []
+        for kwargs in ({"n": pl.RUNTIME}, {"n": 7.0}, {}):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                _, _, tm, sd, dyn = rt_scalar_kernel._bind_args_from_signature(kwargs)
+            programs.append(str(rt_scalar_kernel._compile_to_program(tm, sd, dyn, pl)))
+
+        for prog in programs:
+            # 'n' is a parameter of both the entry and the dep, and every use
+            # forwards or consumes the symbol rather than a constant.
+            assert prog.count("n: pl.Scalar[pl.FP32]") == 2
+            assert "self._rt_add_scalar_incore(a, n, c)" in prog
+            assert "pl.tile.adds(tile, n)" in prog
+        assert programs[0] == programs[1] == programs[2]
 
     def test_runtime_scalar_forwards_dtype_to_dep(self):
         """A runtime scalar carries no value, but its dtype still reaches the dep
         it is forwarded to."""
-        _, _, tm, sv, sd, dyn = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
-        contexts = rt_scalar_kernel._build_contexts(tm, sv, sd, dyn)
+        _, _, tm, sd, dyn = rt_scalar_kernel._bind_args_from_signature({"n": pl.RUNTIME})
+        contexts = rt_scalar_kernel._build_contexts(tm, sd, dyn)
         dep_ctx = next(c for c in contexts if c.func_name == "_rt_add_scalar_incore")
-        assert dep_ctx.scalar_values == {}
         assert dep_ctx.scalar_dtypes == {"n": pl.FP32}
 
     def test_runtime_scalar_default_needs_no_keyword(self):
         """``pl.RUNTIME`` as the signature default makes the parameter runtime
         without the caller passing anything — through to the generated program
         (the specializer drops Python defaults, so the marker never leaks)."""
-        _, _, tm, sv, sd, dyn = rt_scalar_default_kernel._bind_args_from_signature({})
-        assert sv == {}
+        _, _, tm, sd, dyn = rt_scalar_default_kernel._bind_args_from_signature({})
         assert sd == {"n": pl.FP32}
 
-        prog = str(rt_scalar_default_kernel._compile_to_program(tm, sv, sd, dyn, pl))
+        prog = str(rt_scalar_default_kernel._compile_to_program(tm, sd, dyn, pl))
         assert "n: pl.Scalar[pl.FP32]" in prog
         assert "pl.RUNTIME" not in prog
         assert "pl.tile.adds(tile, n)" in prog
@@ -476,14 +487,19 @@ class TestCompileFromSignature:
         with pytest.raises(TypeError, match=r"'n' received pl\.RUNTIME"):
             rt_scalar_kernel._bind_args((t, pl.RUNTIME, t), {})
 
-    def test_runtime_scalar_and_literal_do_not_share_cache(self):
-        """Specializing the value and leaving it runtime are different artifacts."""
+    def test_scalar_value_never_splits_the_cache(self):
+        """One artifact serves every scalar value (issue #2751).
+
+        A literal used to compile its own artifact, so a caller that varied a
+        token count or an offset paid a compilation per value.
+        """
         from_runtime = rt_scalar_kernel.compile(n=pl.RUNTIME)
-        from_literal = rt_scalar_kernel.compile(n=7.0)
         assert isinstance(from_runtime, CompiledProgram)
-        assert from_runtime is not from_literal
-        # Re-requesting the runtime specialization hits the same cache entry.
-        assert rt_scalar_kernel.compile(n=pl.RUNTIME) is from_runtime
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            assert rt_scalar_kernel.compile(n=7.0) is from_runtime
+            assert rt_scalar_kernel.compile(n=9.0) is from_runtime
+        assert rt_scalar_kernel.compile() is from_runtime
 
     def test_unsupported_scalar_value_points_at_runtime_marker(self):
         """A value that is neither a literal nor ``pl.RUNTIME`` names both paths."""
@@ -517,7 +533,7 @@ class TestCompileFromSignature:
         spec.loader.exec_module(module)
 
         kernel = module.make_closure_kernel()
-        _, _, tensor_meta, _, _, _ = kernel._bind_args_from_signature({})
+        _, _, tensor_meta, _, _ = kernel._bind_args_from_signature({})
         assert tensor_meta["a"].dynamic_dim_indices() == {0}
         assert tensor_meta["a"].static_shape()[1] == 64
         assert tensor_meta["a"].dtype == pl.FP32
@@ -554,8 +570,8 @@ class TestAnnotationLayoutReachesTheProgram:
     """
 
     def _entry_param_type(self, kernel):
-        _, _, tm, sv, sd, dyn = kernel._bind_args_from_signature({})
-        program = kernel._compile_to_program(tm, sv, sd, dyn, pl)
+        _, _, tm, sd, dyn = kernel._bind_args_from_signature({})
+        program = kernel._compile_to_program(tm, sd, dyn, pl)
         return list(program.functions.values())[0].params[0].type
 
     def test_layout_reaches_the_param_type(self):
@@ -566,8 +582,8 @@ class TestAnnotationLayoutReachesTheProgram:
 
     def test_unannotated_layout_stays_absent(self):
         """The plain two-slot form must not gain a view."""
-        _, _, tm, sv, sd, dyn = _mx_kernel._bind_args_from_signature({})
-        program = _mx_kernel._compile_to_program(tm, sv, sd, dyn, pl)
+        _, _, tm, sd, dyn = _mx_kernel._bind_args_from_signature({})
+        program = _mx_kernel._compile_to_program(tm, sd, dyn, pl)
         out_param = list(program.functions.values())[0].params[1]
         assert out_param.type.tensor_view is None
 
@@ -609,8 +625,8 @@ class TestDepDeclaredLayout:
     """
 
     def test_dep_layout_survives_when_caller_declares_none(self):
-        _, _, tm, sv, sd, dyn = _calls_mx_dep._bind_args_from_signature({})
-        program = _calls_mx_dep._compile_to_program(tm, sv, sd, dyn, pl)
+        _, _, tm, sd, dyn = _calls_mx_dep._bind_args_from_signature({})
+        program = _calls_mx_dep._compile_to_program(tm, sd, dyn, pl)
         views = [
             p.type.tensor_view
             for f in program.functions.values()
@@ -647,7 +663,7 @@ class TestNzOnTensorIsNotJitSpecific:
 
     NZ on a TensorType asserts that the GM bytes are already in PTO-native NZ
     fractal order; ``BlockNzTensorViews`` later rewrites the shape into the
-    blocked rank-(r+2) form pto-isa needs. What matters here is only that the
+    blocked rank-5 form pto-isa needs. What matters here is only that the
     annotation *survives specialization* — dropping it is what silently produced
     an ND buffer from an NZ annotation.
 
@@ -667,9 +683,9 @@ class TestNzOnTensorIsNotJitSpecific:
             pl.store(t, [0, 0], c)
             return c
 
-        _, _, tm, sv, sd, dyn = kernel._bind_args_from_signature({})
+        _, _, tm, sd, dyn = kernel._bind_args_from_signature({})
         assert tm["a"].layout == ir.TensorLayout.NZ
-        program = kernel._compile_to_program(tm, sv, sd, dyn, pl)
+        program = kernel._compile_to_program(tm, sd, dyn, pl)
         view = list(program.functions.values())[0].params[0].type.tensor_view
         assert view is not None and view.layout == ir.TensorLayout.NZ
 
@@ -693,6 +709,230 @@ class TestNzOnTensorIsNotJitSpecific:
         assert isinstance(param_type, ir.TensorType)
         assert param_type.tensor_view is not None
         assert param_type.tensor_view.layout == ir.TensorLayout.NZ
+
+
+def _request_kernel(x: pl.Tensor[[32, 32], pl.FP32]) -> pl.Tensor[[32, 32], pl.FP32]:
+    with pl.at(level=pl.Level.CORE_GROUP):
+        result = pl.add(x, x)
+    return result
+
+
+@pytest.fixture
+def kernel(monkeypatch):
+    monkeypatch.delenv("PYPTO_COMPILE_PROFILING", raising=False)
+    monkeypatch.setattr(CompileProfiler._local, "current", None, raising=False)
+    return pl.jit(_request_kernel)
+
+
+@pytest.fixture
+def compile_calls(kernel, monkeypatch):
+    calls = []
+
+    def record_compile(*_args, **kwargs):
+        artifact = object()
+        calls.append((kwargs, artifact))
+        return artifact
+
+    monkeypatch.setattr(kernel, "_compile", record_compile)
+    return calls
+
+
+def test_default_and_runtime_only_requests_share_cache(kernel, compile_calls):
+    cached = kernel.compile()
+    for config in (
+        RunConfig(),
+        RunConfig(dump_passes=PassDumpLevel.NONE),
+        RunConfig(device_id=3, codegen_only=True, save_kernels=True),
+    ):
+        assert kernel.compile(config=config) is cached
+    with passes.PassContext([]):
+        assert kernel.compile() is cached
+    assert len(compile_calls) == 1
+    kwargs = compile_calls[0][0]
+    assert kwargs["platform"] == "a2a3sim"
+    assert kwargs["dump_passes"] is PassDumpLevel.NONE
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"dump_passes": True},
+        {"dump_passes": PassDumpLevel.EXPLICIT},
+        {"dump_ptoas_passes": True},
+        {"compile_profiling": True},
+        {"save_kernels_dir": "requested-output"},
+        {"diagnostic_phase": passes.DiagnosticPhase.PRE_PIPELINE},
+        {"disabled_diagnostics": passes.DiagnosticCheckSet()},
+    ],
+)
+@pytest.mark.parametrize("warm", [False, True])
+def test_diagnostic_requests_neither_lookup_nor_insert(kernel, compile_calls, monkeypatch, options, warm):
+    cached = kernel.compile() if warm else None
+    before = dict(kernel._cache)
+
+    def fail_key():
+        pytest.fail("diagnostic request constructed a cache key")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kernel, "_get_source_hash", fail_key)
+        first = kernel.compile(config=RunConfig(**options))
+        second = kernel.compile(config=RunConfig(**options))
+    assert first is not second
+    assert kernel._cache == before
+    assert len(compile_calls) == (3 if warm else 2)
+    if warm:
+        assert kernel.compile() is cached
+
+
+@pytest.mark.parametrize("env_name", ["PYPTO_PROG_BUILD_DIR", "PYPTO_COMPILE_PROFILING"])
+def test_environment_request_bypasses_warm_cache(kernel, compile_calls, monkeypatch, tmp_path, env_name):
+    kernel.compile()
+    before = dict(kernel._cache)
+    monkeypatch.setenv(env_name, "1" if env_name == "PYPTO_COMPILE_PROFILING" else str(tmp_path))
+    first = kernel.compile()
+    assert kernel.compile() is not first
+    assert len(compile_calls) == 3
+    assert kernel._cache == before
+
+
+def test_active_profiler_bypasses_warm_cache(kernel, compile_calls):
+    cached = kernel.compile()
+    with CompileProfiler():
+        assert kernel.compile() is not cached
+        assert kernel.compile() is not cached
+    assert kernel.compile() is cached
+    assert len(compile_calls) == 3
+
+
+@pytest.mark.parametrize(
+    "context_options",
+    [
+        {"verification_level": passes.VerificationLevel.ROUNDTRIP},
+        {"diagnostic_phase": passes.DiagnosticPhase.POST_PASS},
+        {"disabled_diagnostics": passes.DiagnosticCheckSet()},
+    ],
+)
+def test_custom_pass_checks_bypass_warm_cache(kernel, compile_calls, context_options):
+    cached = kernel.compile()
+    with passes.PassContext([], **context_options):
+        assert kernel.compile() is not cached
+        assert kernel.compile() is not cached
+    assert kernel.compile() is cached
+    assert len(compile_calls) == 3
+
+
+def test_pass_context_conflict_is_rejected_before_cache_lookup(kernel, compile_calls):
+    config = RunConfig(memory_planner=passes.MemoryPlanner.PYPTO)
+    kernel.compile(config=config)
+    with passes.PassContext([]), pytest.raises(RuntimeError, match="memory_planner.*PassContext"):
+        kernel.compile(config=config)
+    assert len(compile_calls) == 1
+
+
+def test_failed_diagnostic_compile_preserves_ordinary_entry(kernel, compile_calls, monkeypatch):
+    cached = kernel.compile()
+
+    def fail_compile(*_args, **_kwargs):
+        raise ValueError("diagnostic compilation failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kernel, "_compile", fail_compile)
+        with pytest.raises(ValueError, match="diagnostic compilation failed"):
+            kernel.compile(config=RunConfig(dump_passes=True))
+    assert kernel.compile() is cached
+    assert len(compile_calls) == 1
+
+
+def test_source_locations_use_captured_effective_option(kernel, compile_calls, monkeypatch):
+    monkeypatch.setenv("PYPTO_EMIT_PTO_LOC", "0")
+    without_locations = kernel.compile()
+    monkeypatch.setenv("PYPTO_EMIT_PTO_LOC", "1")
+    original_hash = kernel._get_source_hash
+
+    def change_environment_after_resolution():
+        monkeypatch.setenv("PYPTO_EMIT_PTO_LOC", "0")
+        return original_hash()
+
+    monkeypatch.setattr(kernel, "_get_source_hash", change_environment_after_resolution)
+    assert kernel.compile() is not without_locations
+    assert [kwargs["emit_source_loc"] for kwargs, _ in compile_calls] == [False, True]
+    assert kernel.compile() is without_locations
+
+
+def test_real_dumps_are_regenerated_after_ordinary_cache_hit(kernel, tmp_path):
+    cached = kernel.compile()
+    assert not (cached.output_dir / "passes_dump").exists()
+    for name in ("first", "second"):
+        output = tmp_path / name
+        config = RunConfig(save_kernels_dir=str(output), dump_passes=True)
+        compiled = kernel.compile(config=config)
+        assert compiled.output_dir == output
+        dumps = list((output / "passes_dump").glob("*.py"))
+        assert dumps
+        dump = dumps[0]
+        expected = dump.read_bytes()
+        dump.unlink()
+        assert kernel.compile(config=config) is not compiled
+        assert dump.read_bytes() == expected
+    assert kernel.compile() is cached
+
+
+def test_real_outer_instrument_runs_after_ordinary_cache_hit(kernel, tmp_path):
+    cached = kernel.compile()
+    calls = []
+    callback = passes.CallbackInstrument(
+        before_pass=lambda pass_obj, _program: calls.append(pass_obj.get_name()), name="observer"
+    )
+    with passes.PassContext([callback, passes.ReportInstrument(str(tmp_path))]):
+        first = kernel.compile()
+        assert first.output_dir != cached.output_dir
+        assert calls
+        calls.clear()
+        second = kernel.compile()
+        assert second.output_dir not in (cached.output_dir, first.output_dir)
+        assert calls
+    assert (tmp_path / "perf_hints.log").is_file()
+    assert kernel.compile() is cached
+
+
+def test_real_profile_contains_compile_stages_after_cache_hit(kernel):
+    cached = kernel.compile()
+    with CompileProfiler() as profiler:
+        compiled = kernel.compile()
+        assert compiled.output_dir != cached.output_dir
+    assert profiler.to_dict()["stages"]
+    assert kernel.compile() is cached
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_disabling_environment_profiling_restores_warm_cache(kernel, monkeypatch, fail):
+    """Real successful and failed compiles must not make profiling sticky."""
+    cached = kernel.compile()
+    monkeypatch.setenv("PYPTO_COMPILE_PROFILING", "1")
+    if fail:
+
+        def fail_parse(*_args, **_kwargs):
+            raise ValueError("profiling compilation failed")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(pl, "parse", fail_parse)
+            with pytest.raises(ValueError, match="profiling compilation failed"):
+                kernel.compile()
+    else:
+        assert kernel.compile() is not cached
+    monkeypatch.delenv("PYPTO_COMPILE_PROFILING")
+    assert kernel.compile() is cached
+    assert CompileProfiler.current() is None
+
+
+def test_warm_cache_hit_does_not_probe_toolchain(kernel, monkeypatch):
+    cached = kernel.compile()
+
+    def fail_discovery():
+        pytest.fail("warm cache hit probed the toolchain")
+
+    monkeypatch.setattr(importlib.import_module("pypto.jit.decorator"), "find_ptoas_binary", fail_discovery)
+    assert kernel.compile() is cached
 
 
 if __name__ == "__main__":

@@ -112,6 +112,13 @@ class Backend:
     """Abstract backend base class."""
 
     def get_type_name(self) -> str: ...
+    def get_registered_op_names(self) -> list[str]:
+        """Return registered operator names in sorted order, including target exclusions.
+
+        Registration does not imply support for every operand type or layout.
+        Mutating the returned snapshot does not change the backend registry.
+        """
+
     def get_handler(self) -> BackendHandler: ...
     def export_to_file(self, path: str) -> None: ...
     @staticmethod
@@ -180,6 +187,27 @@ def get_backend_instance(backend_type: BackendType) -> Backend:
 def get_handler() -> BackendHandler:
     """
     Get the :class:`BackendHandler` for the currently configured backend.
+
+    Raises:
+        ValueError: If backend type has not been configured
+    """
+    ...
+
+def get_input_tile_layout(op_name: str, input_index: int) -> ir.TileLayout | None:
+    """
+    Tile layout the configured backend requires for one input of an operator.
+
+    ``ResolveBackendOpLayouts`` repairs an operand whose layout disagrees, so an
+    operator whose PTOAS lowering addresses its operands linearly must constrain
+    every tile input; one that reads the layout itself must constrain none.
+
+    Args:
+        op_name: Operator name, e.g. ``"tile.minimums"``
+        input_index: Positional index of the input to query
+
+    Returns:
+        The required :class:`ir.TileLayout`, or None when that input is
+        unconstrained (including when the operator declares no layout spec)
 
     Raises:
         ValueError: If backend type has not been configured

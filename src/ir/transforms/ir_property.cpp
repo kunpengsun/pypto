@@ -55,6 +55,8 @@ std::string IRPropertyToString(IRProperty prop) {
       return "UseAfterDef";
     case IRProperty::HierarchyOutlined:
       return "HierarchyOutlined";
+    case IRProperty::GraphOutlined:
+      return "GraphOutlined";
     case IRProperty::StructuredCtrlFlow:
       return "StructuredCtrlFlow";
     case IRProperty::VectorKernelSplit:
@@ -111,6 +113,12 @@ std::string IRPropertyToString(IRProperty prop) {
       return "GraphBoundaryLegalized";
     case IRProperty::AccStorePhaseValid:
       return "AccStorePhaseValid";
+    case IRProperty::NoScalarKernelReturn:
+      return "NoScalarKernelReturn";
+    case IRProperty::AivSplitLoweredValid:
+      return "AivSplitLoweredValid";
+    case IRProperty::BufferIR:
+      return "BufferIR";
     default:
       return "Unknown";
   }
@@ -157,7 +165,9 @@ const IRPropertySet& GetVerifiedProperties() {
                                    IRProperty::ManualDepsOnSubmitOnly,
                                    IRProperty::ReturnParamsExplicit,
                                    IRProperty::AivSplitValid,
+                                   IRProperty::AivSplitLoweredValid,
                                    IRProperty::TileMemoryInferred,
+                                   IRProperty::TileOps2D,
                                    IRProperty::HardSyncallOccupancyValid,
                                    IRProperty::IterArgCarryClassified,
                                    IRProperty::RuntimeScopesMaterialized,
@@ -195,7 +205,7 @@ const IRPropertySet& GetStructuralProperties() {
                                    IRProperty::OutParamNotShadowed, IRProperty::NoNestedInCore,
                                    IRProperty::InOutUseValid,       IRProperty::PipelineLoopValid,
                                    IRProperty::ArrayNotEscaped,     IRProperty::ManualDepsOnSubmitOnly,
-                                   IRProperty::AtomicAddDtypeValid};
+                                   IRProperty::AtomicAddDtypeValid, IRProperty::NoScalarKernelReturn};
   return props;
 }
 

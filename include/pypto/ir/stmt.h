@@ -69,7 +69,8 @@ enum class ScopeKind : uint8_t {
   Spmd = 4,        ///< SPMD dispatch scope (core_num/sync_start on ScopeStmt)
   Runtime = 5,     ///< Runtime orchestration scope (SIMPLER_SCOPE wrapper, manual on/off)
   CommDomain = 6,  ///< CommDomain scope (with orch.allocate_domain(...) wrapper)
-  SplitAiv = 7     ///< Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)
+  SplitAiv = 7,    ///< Explicit AIV-split region (pl.split_aiv, nestable in loops/conditionals)
+  Graph = 8        ///< Recordable orchestration region (pl.graph, outlined into a Graph function)
 };
 
 /**
@@ -244,7 +245,7 @@ inline ForKind StringToForKind(const std::string& str) {
  * @brief Convert ScopeKind to string
  * @param kind The scope kind
  * @return String representation ("InCore", "Cluster", "Hierarchy", "Spmd", "Runtime",
- *         or "CommDomain")
+ *         "CommDomain", "SplitAiv", or "Graph")
  */
 inline std::string ScopeKindToString(ScopeKind kind) {
   switch (kind) {
@@ -262,6 +263,8 @@ inline std::string ScopeKindToString(ScopeKind kind) {
       return "CommDomain";
     case ScopeKind::SplitAiv:
       return "SplitAiv";
+    case ScopeKind::Graph:
+      return "Graph";
   }
   throw pypto::TypeError("Unknown ScopeKind");
 }
@@ -328,7 +331,9 @@ class AssignStmt : public Stmt {
    * @param span Source location
    */
   AssignStmt(VarPtr var, ExprPtr value, Span span, std::vector<std::string> leading_comments = {})
-      : Stmt(std::move(span), std::move(leading_comments)), var_(std::move(var)), value_(std::move(value)) {}
+      : Stmt(std::move(span), std::move(leading_comments)), var_(std::move(var)), value_(std::move(value)) {
+    detail::CheckValueOperand(value_, span_, "AssignStmt value");
+  }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::AssignStmt; }
   [[nodiscard]] std::string TypeName() const override { return "AssignStmt"; }
@@ -370,7 +375,9 @@ class IfStmt : public Stmt {
         condition_(std::move(condition)),
         then_body_(std::move(then_body)),
         else_body_(std::move(else_body)),
-        return_vars_(std::move(return_vars)) {}
+        return_vars_(std::move(return_vars)) {
+    detail::CheckValueOperand(condition_, span_, "IfStmt condition");
+  }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::IfStmt; }
   [[nodiscard]] std::string TypeName() const override { return "IfStmt"; }
@@ -412,7 +419,9 @@ class YieldStmt : public Stmt {
    * @param span Source location
    */
   YieldStmt(std::vector<ExprPtr> value, Span span, std::vector<std::string> leading_comments = {})
-      : Stmt(std::move(span), std::move(leading_comments)), value_(std::move(value)) {}
+      : Stmt(std::move(span), std::move(leading_comments)), value_(std::move(value)) {
+    detail::CheckValueOperands(value_, span_, "YieldStmt value");
+  }
 
   /**
    * @brief Create a yield statement without values
@@ -456,7 +465,9 @@ class ReturnStmt : public Stmt {
    * @param span Source location
    */
   ReturnStmt(std::vector<ExprPtr> value, Span span, std::vector<std::string> leading_comments = {})
-      : Stmt(std::move(span), std::move(leading_comments)), value_(std::move(value)) {}
+      : Stmt(std::move(span), std::move(leading_comments)), value_(std::move(value)) {
+    detail::CheckValueOperands(value_, span_, "ReturnStmt value");
+  }
 
   /**
    * @brief Create a return statement without values
@@ -534,7 +545,11 @@ class ForStmt : public Stmt {
         body_(std::move(body)),
         return_vars_(std::move(return_vars)),
         kind_(kind),
-        attrs_(std::move(attrs)) {}
+        attrs_(std::move(attrs)) {
+    detail::CheckValueOperand(start_, span_, "ForStmt start");
+    detail::CheckValueOperand(stop_, span_, "ForStmt stop");
+    detail::CheckValueOperand(step_, span_, "ForStmt step");
+  }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::ForStmt; }
   [[nodiscard]] std::string TypeName() const override { return "ForStmt"; }
@@ -639,7 +654,9 @@ class WhileStmt : public Stmt {
         condition_(std::move(condition)),
         iter_args_(std::move(iter_args)),
         body_(std::move(body)),
-        return_vars_(std::move(return_vars)) {}
+        return_vars_(std::move(return_vars)) {
+    detail::CheckValueOperand(condition_, span_, "WhileStmt condition");
+  }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::WhileStmt; }
   [[nodiscard]] std::string TypeName() const override { return "WhileStmt"; }
@@ -679,11 +696,14 @@ using WhileStmtPtr = std::shared_ptr<const WhileStmt>;
  *   - `ClusterScopeStmt`: no extra fields
  *   - `HierarchyScopeStmt`: required `level_`, optional `role_`
  *   - `SpmdScopeStmt`: required `core_num_`, `sync_start_` (default false)
+ *   - `GraphScopeStmt`: no extra fields; `name_hint_` is the region name
  *
  * **Syntax:**
  * with pl.at(level=pl.Level.CORE_GROUP):    # InCore scope -> InCoreScopeStmt
  *     body
  * with pl.cluster():   # Cluster scope -> ClusterScopeStmt
+ *     body
+ * with pl.graph("layer"):  # Graph scope -> GraphScopeStmt
  *     body
  * with pl.at(level=pl.Level.HOST, role=pl.Role.SubWorker):  # -> HierarchyScopeStmt
  *     body
@@ -708,6 +728,7 @@ using WhileStmtPtr = std::shared_ptr<const WhileStmt>;
  * - OutlineIncoreScopes extracts InCore scopes into InCore functions
  * - OutlineClusterScopes extracts Cluster scopes into Group functions
  * - Hierarchy scopes are outlined into level-/role-annotated functions
+ * - OutlineGraphScopes extracts Graph scopes into Graph functions
  */
 class ScopeStmt : public Stmt {
  public:
@@ -817,6 +838,40 @@ class ClusterScopeStmt : public ScopeStmt {
 using ClusterScopeStmtPtr = std::shared_ptr<const ClusterScopeStmt>;
 
 /**
+ * @brief Graph scope: a recordable orchestration region.
+ *
+ * Marks a region whose task topology the `host_build_graph` runtime records on
+ * its first execution and replays afterwards. `OutlineGraphScopes` extracts the
+ * region into a `FunctionType::Graph` function and leaves a `Call` behind, so
+ * the scope form is pure sugar over the function form: after that pass every
+ * downstream consumer — `LegalizeGraphBoundary`, the Graph verifier, codegen —
+ * sees exactly what `@pl.jit.graph` produces.
+ *
+ * `name_hint_` is the user-supplied region name and becomes the outlined
+ * function's name, which codegen turns into the emitted symbol and hence the
+ * runtime's graph key. It is therefore not optional the way it is on the other
+ * scope kinds: the parser requires it.
+ *
+ * No kind-specific fields; only inherits `name_hint_` and `body_` from base.
+ */
+class GraphScopeStmt : public ScopeStmt {
+ public:
+  GraphScopeStmt(std::string name_hint, StmtPtr body, Span span,
+                 std::vector<std::string> leading_comments = {},
+                 std::vector<std::pair<std::string, std::any>> attrs = {})
+      : ScopeStmt(std::move(name_hint), std::move(body), std::move(span), std::move(leading_comments),
+                  std::move(attrs)) {}
+
+  [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::GraphScopeStmt; }
+  [[nodiscard]] ScopeKind GetScopeKind() const override { return ScopeKind::Graph; }
+  [[nodiscard]] std::string TypeName() const override { return "GraphScopeStmt"; }
+
+  static constexpr auto GetFieldDescriptors() { return ScopeStmt::GetFieldDescriptors(); }
+};
+
+using GraphScopeStmtPtr = std::shared_ptr<const GraphScopeStmt>;
+
+/**
  * @brief Hierarchy scope: distributed-hierarchy region.
  *
  * Required `level`, optional `role`. Outlined into level-/role-annotated functions.
@@ -870,6 +925,7 @@ class SpmdScopeStmt : public ScopeStmt {
         core_num_(std::move(core_num)),
         sync_start_(sync_start) {
     INTERNAL_CHECK(core_num_ != nullptr) << "SpmdScopeStmt core_num must not be null";
+    detail::CheckValueOperand(core_num_, span_, "SpmdScopeStmt core_num");
   }
 
   [[nodiscard]] ObjectKind GetKind() const override { return ObjectKind::SpmdScopeStmt; }
@@ -903,7 +959,7 @@ using SpmdScopeStmtPtr = std::shared_ptr<const SpmdScopeStmt>;
  * Unlike the legacy whole-InCore-scope split, this is a structural region that
  * may appear anywhere in an InCore body — inside a pl.range/pl.pipeline loop or
  * an if. The region body begins with `aiv_id = tile.get_subblock_idx()`. The
- * node is consumed and erased by LowerAutoVectorSplit (pass 20); never reaches
+ * node is lowered by LowerAutoVectorSplit and erased by ExpandMixedKernel; never reaches
  * codegen.
  *
  * A function holding at least one region is in MANUAL MODE: the regions are

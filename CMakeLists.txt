@@ -120,6 +120,8 @@ set(PYPTO_SOURCES
     src/ir/type.cpp
 
     # IR - Operators
+    src/ir/op/buffer_ops/elementwise.cpp
+    src/ir/op/buffer_ops/memory.cpp
     src/ir/op/tile_ops/batch_matmul.cpp
     src/ir/op/tile_ops/broadcast.cpp
     src/ir/op/tile_ops/elementwise.cpp
@@ -183,6 +185,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/dsa/memref_dsa_adapter.cpp
     src/ir/transforms/dsa/reuse_penalty_recognizer.cpp
     src/ir/transforms/allocate_memory_addr_pass.cpp
+    src/ir/transforms/block_mx_scale_tensor_views_pass.cpp
     src/ir/transforms/block_nz_tensor_views_pass.cpp
     src/ir/transforms/canonicalize_tile_slice_pass.cpp
     src/ir/transforms/fold_no_op_reshape_pass.cpp
@@ -197,6 +200,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/synthesize_allreduce_signals_pass.cpp
     src/ir/transforms/materialize_comm_domain_scopes_pass.cpp
     src/ir/transforms/lower_host_tensor_collectives_pass.cpp
+    src/ir/transforms/lower_l2_tensor_collectives_pass.cpp
     src/ir/transforms/materialize_dist_tensor_ctx_pass.cpp
     src/ir/transforms/legalize_graph_boundary_pass.cpp
     src/ir/transforms/materialize_valid_shape_symbols_pass.cpp
@@ -221,6 +225,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/outline_incore_scopes_pass.cpp
     src/ir/transforms/outline_cluster_scopes_pass.cpp
     src/ir/transforms/outline_hierarchy_scopes_pass.cpp
+    src/ir/transforms/outline_graph_scopes_pass.cpp
     src/ir/transforms/expand_mixed_kernel_pass.cpp
     src/ir/transforms/lower_auto_vector_split_pass.cpp
     src/ir/transforms/split_vector_kernel_pass.cpp
@@ -271,6 +276,7 @@ set(PYPTO_SOURCES
     src/ir/transforms/utils/pipeline_loop_utils.cpp
     src/ir/transforms/utils/return_lineage_utils.cpp
     src/ir/transforms/utils/result_alias_utils.cpp
+    src/ir/transforms/utils/scalar_output_hoist.cpp
     src/ir/transforms/utils/scope_outline_utils.cpp
     src/ir/transforms/utils/split_axis_utils.cpp
     src/ir/transforms/utils/stmt_dependency_analysis.cpp
@@ -289,6 +295,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_acc_to_gm_store.cpp
     src/ir/verifier/verify_atomic_add_dtype.cpp
     src/ir/verifier/verify_acc_store_phase.cpp
+    src/ir/verifier/verify_no_scalar_kernel_return.cpp
     src/ir/verifier/warning_in_param_written.cpp
     src/ir/verifier/verify_ssa_pass.cpp
     src/ir/verifier/verify_no_nested_call_pass.cpp
@@ -310,6 +317,7 @@ set(PYPTO_SOURCES
     src/ir/verifier/verify_runtime_scopes_materialized.cpp
     src/ir/verifier/verify_call_directions.cpp
     src/ir/verifier/verify_tile_type_coherence.cpp
+    src/ir/verifier/verify_buffer_ir.cpp
     src/ir/verifier/verify_assign_type_symmetry.cpp
     src/ir/verifier/verify_graph_functions.cpp
     src/ir/verifier/verify_orchestration_references.cpp
@@ -334,6 +342,7 @@ set(PYPTO_SOURCES
     src/codegen/orchestration/orchestration_codegen.cpp
     src/codegen/orchestration_op_registry.cpp
     src/codegen/pto/pto_codegen.cpp
+    src/codegen/pto/pto_buffer_codegen.cpp
     src/codegen/pto/pto_control_flow_codegen.cpp
     src/codegen/pto/pto_scalar_expr_codegen.cpp
     src/codegen/pto/pto_type_utils.cpp

@@ -123,6 +123,26 @@ PropertyVerifierPtr CreateAccCompactValidPropertyVerifier();
 PropertyVerifierPtr CreateAtomicAddDtypeValidPropertyVerifier();
 
 /**
+ * @brief Factory for the device-kernel scalar-return property verifier
+ *
+ * Rejects a ``ScalarType`` anywhere in the ``return_types_`` of any device
+ * function (``InCore`` / ``AIC`` / ``AIV`` / ``Group`` / ``Spmd``) -- those
+ * types mean "a dispatchable task". The search descends into ``TupleType``,
+ * since a ``-> pl.Tuple[...]`` annotation is one ``return_types_`` entry and a
+ * tuple element has no more of a carrier than a bare return does. The runtime
+ * has no scalar output channel:
+ * ``Arg::add_scalar`` passes a scalar *in* by value and ``TaskOutputTensors``
+ * returns only tensors, so orchestration codegen has no carrier to bind such a
+ * return to (#631). ``Scalar[TASK_ID]`` is exempt (a scheduler handle, not
+ * data), and a device-side scalar helper belongs in a ``FunctionType::Inline``
+ * function, which ``InlineFunctions`` splices away. Listed in
+ * ``GetStructuralProperties()``, so it is verified at every pass boundary --
+ * catching both user-written signatures and any pass that synthesises one.
+ * @return Shared pointer to NoScalarKernelReturn PropertyVerifier
+ */
+PropertyVerifierPtr CreateNoScalarKernelReturnPropertyVerifier();
+
+/**
  * @brief Factory for the InParamWritten warning verifier.
  *
  * Reports a parameter declared `In` that its own function body writes, where
@@ -191,6 +211,12 @@ PropertyVerifierPtr CreateClusterOutlinedPropertyVerifier();
 PropertyVerifierPtr CreateHierarchyOutlinedPropertyVerifier();
 
 /**
+ * @brief Factory function for creating GraphOutlined property verifier
+ * @return Shared pointer to GraphOutlined PropertyVerifier
+ */
+PropertyVerifierPtr CreateGraphOutlinedPropertyVerifier();
+
+/**
  * @brief Factory function for creating HasMemRefs property verifier
  * @return Shared pointer to HasMemRefs PropertyVerifier
  */
@@ -248,6 +274,9 @@ PropertyVerifierPtr CreateMixedKernelExpandedPropertyVerifier();
  */
 PropertyVerifierPtr CreateAivSplitValidPropertyVerifier();
 
+/// Verify the post-LowerAutoVectorSplit region/flat compatibility contract.
+PropertyVerifierPtr CreateAivSplitLoweredValidPropertyVerifier();
+
 /**
  * @brief Factory function for creating AllocatedMemoryAddr property verifier
  *
@@ -304,6 +333,17 @@ PropertyVerifierPtr CreateTileMemoryInferredPropertyVerifier();
  * @return Shared pointer to UseAfterDef PropertyVerifier
  */
 PropertyVerifierPtr CreateUseAfterDefPropertyVerifier();
+
+/**
+ * @brief Create the UseAfterDef check with strict lexical scopes for final SSA IR.
+ *
+ * Branch- and loop-local definitions never leak into their enclosing scope;
+ * only explicit return_vars become visible there. Uses indexed membership and
+ * scope undo records instead of copying the whole visible-definition set.
+ * Type-metadata uses are checked identically to the legacy UseAfterDef property.
+ * This is an internal composition helper, not a separate IR property or pass option.
+ */
+PropertyVerifierPtr CreateLexicalUseAfterDefPropertyVerifier();
 
 /**
  * @brief Factory function for creating StructuredCtrlFlow property verifier
@@ -493,6 +533,14 @@ PropertyVerifierPtr CreateCallDirectionsResolvedPropertyVerifier();
  * @return Shared pointer to TileTypeCoherence PropertyVerifier
  */
 PropertyVerifierPtr CreateTileTypeCoherencePropertyVerifier();
+
+/**
+ * @brief Verify explicit buffer representation in InCore/AIC/AIV functions.
+ *
+ * Validates registered buffer calls and composes SSA, use-after-definition, and
+ * assignment-type checks. Does not prove storage lifetimes or initialized data.
+ */
+PropertyVerifierPtr CreateBufferIRPropertyVerifier();
 
 /**
  * @brief Factory function for creating OrchestrationReferencesResolved property verifier
