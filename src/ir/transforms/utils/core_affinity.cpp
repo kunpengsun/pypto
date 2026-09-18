@@ -27,7 +27,10 @@ namespace pypto {
 namespace ir {
 namespace core_affinity {
 
-bool IsCubeMemorySpace(MemorySpace ms) { return ms != MemorySpace::DDR && ms != MemorySpace::Vec; }
+bool IsCubeMemorySpace(MemorySpace ms) {
+  // External memory is not owned by either compute core.
+  return ms != MemorySpace::DDR && ms != MemorySpace::SRAM && ms != MemorySpace::Vec;
+}
 
 // The memory space of the first tile-typed argument, whatever expression carries it.
 //

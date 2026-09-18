@@ -189,6 +189,29 @@ TypePtr DeduceTileLoadType(const std::vector<ExprPtr>& args,
       break;
     }
   }
+
+  CHECK_SPAN(!target_memory_opt.has_value() || *target_memory_opt == MemorySpace::Vec ||
+                 *target_memory_opt == MemorySpace::Mat,
+             args[0]->span_)
+      << "tile.load target_memory must be Vec or Mat; external memory is the tensor source";
+
+  // The tensor pointer selects external DDR or SRAM in the same global address
+  // space. This declaration does not relocate the tensor or change tile placement.
+  std::optional<MemorySpace> source_memory_opt;
+  for (const auto& [k, v] : kwargs) {
+    if (k == "source_memory") {
+      source_memory_opt = AnyCast<MemorySpace>(v, "source_memory");
+      break;
+    }
+  }
+  CHECK_SPAN(!source_memory_opt.has_value() || *source_memory_opt == MemorySpace::DDR ||
+                 *source_memory_opt == MemorySpace::SRAM,
+             args[0]->span_)
+      << "The operator " << op_name
+      << " reads from external memory {DDR, SRAM}: source_memory must be "
+         "one of those, but got "
+      << (source_memory_opt.has_value() ? MemorySpaceToString(*source_memory_opt) : std::string("none"));
+
   const bool is_mx_load =
       tensor_type->tensor_view_.has_value() && IsMxTensorLayout(tensor_type->tensor_view_->layout);
   if (is_mx_load) {
@@ -489,6 +512,40 @@ TypePtr DeduceTileStoreType(const std::vector<ExprPtr>& args,
   CHECK(IsValidSTPhase(st_phase))
       << "The operator " << op_name
       << " requires st_phase to be STPhase.Unspecified or STPhase.Final, but got int " << st_phase;
+
+  // source_memory asserts the resolved on-chip tile location. target_memory
+  // declares the external medium selected by the output tensor pointer; DDR
+  // and SRAM share the same global address space.
+  std::optional<MemorySpace> source_memory_opt;
+  std::optional<MemorySpace> target_memory_opt;
+  for (const auto& [k, v] : kwargs) {
+    if (k == "source_memory") {
+      source_memory_opt = AnyCast<MemorySpace>(v, "source_memory");
+    } else if (k == "target_memory") {
+      target_memory_opt = AnyCast<MemorySpace>(v, "target_memory");
+    }
+  }
+  if (source_memory_opt.has_value()) {
+    CHECK_SPAN(*source_memory_opt == MemorySpace::Vec || *source_memory_opt == MemorySpace::Acc,
+               args[0]->span_)
+        << "The operator " << op_name
+        << " stores from the vector or accumulator buffers: source_memory must be "
+           "MemorySpace.Vec or MemorySpace.Acc, but got "
+        << MemorySpaceToString(*source_memory_opt);
+    CHECK_SPAN(!tile_type->memory_space_.has_value() || *source_memory_opt == *tile_type->memory_space_,
+               args[0]->span_)
+        << "The operator " << op_name << " source_memory ("
+        << MemorySpaceToString(*source_memory_opt)
+        << ") disagrees with the tile's resolved memory space ("
+        << MemorySpaceToString(*tile_type->memory_space_) << ")";
+  }
+  CHECK_SPAN(!target_memory_opt.has_value() || *target_memory_opt == MemorySpace::DDR ||
+                 *target_memory_opt == MemorySpace::SRAM,
+             args[2]->span_)
+      << "The operator " << op_name
+      << " writes to external memory {DDR, SRAM}: target_memory must be "
+         "one of those, but got "
+      << (target_memory_opt.has_value() ? MemorySpaceToString(*target_memory_opt) : std::string("none"));
 
   // ---- Valid-region union -------------------------------------------------
   // A store writes into the destination tensor, so the tensor it returns holds
@@ -1290,6 +1347,8 @@ REGISTER_OP("tile.load")
         "valid_shape",
         "Valid shape of tile in each dimension, in source tensor coordinates (TupleType of ScalarType). ")
     .set_attr<MemorySpace>("target_memory")
+    // External source medium (DDR or SRAM); the tensor retains global addressing.
+    .set_attr<MemorySpace>("source_memory")
     .set_attr<bool>("clamp")
     // Declared GM cache-access policy, carried as an int (``ir::CachePolicy``)
     // so serialization / structural comparison need no new enum arm.
@@ -1313,6 +1372,9 @@ REGISTER_OP("tile.store")
                   "Injected by FlattenTileNdTo2D for ND tensors.")
     .set_attr<int>("atomic")
     .set_attr<int>("st_phase")
+    // Tile source location and external tensor destination medium.
+    .set_attr<MemorySpace>("source_memory")
+    .set_attr<MemorySpace>("target_memory")
     .set_input_memory(0, {MemorySpace::Vec, MemorySpace::Acc})
     .set_output_reuses_input(2)
     // A plain store overwrites the region it lands on: the untouched remainder

@@ -186,6 +186,7 @@ def load(
     clamp: bool = False,
     span: Span | None = None,
     cache: int | None = None,
+    source_memory: MemorySpace | None = None,
 ) -> Call:
     """Copy data from tensor to specified memory level.
 
@@ -209,11 +210,10 @@ def load(
             narrows the tile, but cannot widen it past what the source has. Every
             element must be an integer scalar — one extent per dimension, never a
             nested tuple.
-        target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
-            ``None`` (the default) leaves an ordinary load unset so
-            InferTileMemorySpace places the tile from consumer demand. An
-            MX-layout load instead defaults to MemorySpace.Mat, the only memory
-            that the raw MX load instruction can target.
+        target_memory: On-chip target memory space (MemorySpace.Vec or .Mat). ``None`` (the
+            default) leaves the space unset so InferTileMemorySpace places the
+            tile from consumer demand; the kwarg is then omitted from the op
+            entirely. MX-layout tensors require an explicit MemorySpace.Mat.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts that ``offsets + valid_shape`` stays inside the source
             and is rejected when that provably fails; with ``clamp=True`` the
@@ -226,6 +226,12 @@ def load(
             stamp one later. An explicit 0 is NOT the same as ``None``: it is
             recorded, and it is what makes ``cache=CachePolicy.DEFAULT`` opt a
             single read back into the cache inside a bypassing scope.
+        source_memory: External source medium, ``MemorySpace.DDR`` or
+            ``MemorySpace.SRAM``. Both share the global address space; the
+            tensor pointer must already address the intended memory. This
+            declaration emits ``source_memory = "sram"`` (or ``"gm"`` for DDR)
+            on ``pto.tload`` without changing pointer addressing or placement.
+            ``None`` omits the marker and uses ordinary global addressing.
 
     Returns:
         Call expression that returns a TileType with the copied data
@@ -246,11 +252,14 @@ def load(
             f"(omitting target_memory selects Mat automatically); got {target_memory}"
         )
 
-    # Validate target_memory: only Vec and Mat are allowed for load. ``None``
-    # leaves the space unset so InferTileMemorySpace places the tile.
+    # Tile placement and external medium are separate: SRAM is only a tensor endpoint.
     if target_memory is not None and target_memory not in (MemorySpace.Vec, MemorySpace.Mat):
         raise ValueError(
             f"target_memory for tile.load must be MemorySpace.Vec or MemorySpace.Mat, got {target_memory}"
+        )
+    if source_memory is not None and source_memory not in (MemorySpace.DDR, MemorySpace.SRAM):
+        raise ValueError(
+            f"source_memory for tile.load must be MemorySpace.DDR or MemorySpace.SRAM, got {source_memory}"
         )
 
     actual_span = _get_span_or_capture(span)
@@ -269,6 +278,8 @@ def load(
     # survive into the IR. Only an unstated policy omits the kwarg.
     if cache is not None:
         kwargs["cache"] = cache
+    if source_memory is not None:
+        kwargs["source_memory"] = source_memory
 
     valid_shape_tuple = shapes_tuple
     if valid_shape is not None:
@@ -296,6 +307,8 @@ def store(
     *,
     atomic: int = 0,
     st_phase: STPhase = STPhase.Unspecified,
+    source_memory: MemorySpace | None = None,
+    target_memory: MemorySpace | None = None,
 ) -> Call:
     """Copy data from unified buffer (tile) to tensor.
 
@@ -314,6 +327,14 @@ def store(
             preserves ordinary stores; ``STPhase.Final`` checks and clears the
             flag published by a final phased accumulator producer. The kwarg is
             omitted entirely for the default so existing stores remain unchanged.
+        source_memory: On-chip source location, ``MemorySpace.Vec`` or
+            ``MemorySpace.Acc``. Must agree with the tile's resolved location.
+            ``None`` leaves the source unstated.
+        target_memory: External destination medium, ``MemorySpace.DDR`` or
+            ``MemorySpace.SRAM``. Both share the global address space; the
+            output tensor pointer must already address the intended memory.
+            This declaration emits ``target_memory = "sram"`` (or ``"gm"`` for
+            DDR) on ``pto.tstore`` without relocating data. ``None`` omits the marker.
 
     Returns:
         Call expression that returns the output tensor
@@ -328,6 +349,20 @@ def store(
     kwargs: dict[str, Any] = {"atomic": atomic} if atomic else {}
     if st_phase != STPhase.Unspecified:
         kwargs["st_phase"] = int(st_phase)
+    if source_memory is not None:
+        if source_memory not in (MemorySpace.Vec, MemorySpace.Acc):
+            raise ValueError(
+                "source_memory for tile.store must be MemorySpace.Vec or MemorySpace.Acc, "
+                f"got {source_memory}"
+            )
+        kwargs["source_memory"] = source_memory
+    if target_memory is not None:
+        if target_memory not in (MemorySpace.DDR, MemorySpace.SRAM):
+            raise ValueError(
+                "target_memory for tile.store must be MemorySpace.DDR or MemorySpace.SRAM, "
+                f"got {target_memory}"
+            )
+        kwargs["target_memory"] = target_memory
     return _ir_core.create_op_call("tile.store", args, kwargs, actual_span)
 
 

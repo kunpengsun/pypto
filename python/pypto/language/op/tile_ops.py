@@ -401,6 +401,7 @@ def load(
     target_memory: MemorySpace | None = None,
     clamp: bool = False,
     cache: CachePolicy | None = None,
+    source_memory: MemorySpace | None = None,
 ) -> Tile:
     """Copy data from tensor to unified buffer (tile).
 
@@ -423,10 +424,9 @@ def load(
             the tile; cannot widen it past what the source has. Each element must
             be an integer scalar — one extent per dimension, not a nested
             ``[start, extent]`` pair.
-        target_memory: Target memory space (MemorySpace.Vec or MemorySpace.Mat).
-            ``None`` (the default) leaves an ordinary load unset for the compiler
-            to place. MX-layout tensors default to MemorySpace.Mat so they can be
-            passed directly to ``matmul_mx`` and placed from its operand position.
+        target_memory: On-chip target memory space (MemorySpace.Vec or .Mat). ``None`` (the
+            default) leaves the space unset for the compiler to place.
+            MX-layout tensors require an explicit MemorySpace.Mat.
         clamp: Sanction a read that runs off the end of the source. By default a
             load asserts ``offsets + valid_shape`` stays inside the source and is
             rejected when that provably fails; ``clamp=True`` cuts the request back
@@ -440,9 +440,15 @@ def load(
             the full contract). An explicit value here always wins over a
             scope-level ``pl.set_cache_policy`` declaration for the same tensor,
             in both directions: ``cache=CachePolicy.DEFAULT`` opts this one read
-            back into the cache inside a bypassing scope. Requires PTOAS >= v0.61,
-            where a BYPASS read compiles to an L2 hint on the emitted load;
-            DEFAULT emits nothing.
+            back into the cache inside a bypassing scope. PTOAS has no L2-bypass
+            path yet (https://github.com/hw-native-sys/PTOAS/issues/1356), so a
+            BYPASS request warns and compiles as an ordinary cached access today.
+        source_memory: External source medium, ``MemorySpace.DDR`` or
+            ``MemorySpace.SRAM``. Both share the global address space; the
+            tensor pointer must already address the intended memory. This
+            declaration emits ``source_memory = "sram"`` (or ``"gm"`` for DDR)
+            on ``pto.tload`` without changing pointer addressing or placement.
+            ``None`` omits the marker and uses ordinary global addressing.
 
     Returns:
         Tile wrapping the load operation
@@ -452,6 +458,9 @@ def load(
         >>> tile = load(tensor, offsets=[0, 0], shapes=[32, 32])
         >>> # streaming read, no cache reuse expected
         >>> tile = load(tensor, [0, 0], [32, 32], cache=pl.CachePolicy.BYPASS)
+        >>> # both ends of the move stated explicitly (GM -> unified buffer)
+        >>> tile = load(tensor, [0, 0], [32, 32],
+        ...             source_memory=pl.Mem.DDR, target_memory=pl.Mem.Vec)
     """
     if valid_shape is None:
         valid_shape = shapes
@@ -463,6 +472,7 @@ def load(
         target_memory,
         clamp=clamp,
         cache=None if cache is None else int(cache),
+        source_memory=source_memory,
     )
     return Tile(expr=call_expr)
 
@@ -475,6 +485,8 @@ def store(
     *,
     atomic: AtomicType = AtomicType.None_,
     st_phase: STPhase = STPhase.Unspecified,
+    source_memory: MemorySpace | None = None,
+    target_memory: MemorySpace | None = None,
 ) -> _TensorT:
     """Copy data from tile back to tensor.
 
@@ -499,6 +511,14 @@ def store(
         st_phase: Consumer-side unit-flag phase. A producer that finishes with
             ``acc_phase=pl.AccPhase.Final`` must be consumed by a store with
             ``st_phase=pl.STPhase.Final`` so the unit flag is cleared.
+        source_memory: On-chip source location, ``MemorySpace.Vec`` or
+            ``MemorySpace.Acc``. Must agree with the tile's resolved location.
+            ``None`` leaves the source unstated.
+        target_memory: External destination medium, ``MemorySpace.DDR`` or
+            ``MemorySpace.SRAM``. Both share the global address space; the
+            output tensor pointer must already address the intended memory.
+            This declaration emits ``target_memory = "sram"`` (or ``"gm"`` for
+            DDR) on ``pto.tstore`` without relocating data. ``None`` omits the marker.
 
     Returns:
         Tensor wrapping the store operation
@@ -512,6 +532,9 @@ def store(
         >>> result = store(partial, [0, 0], out, atomic=pl.AtomicType.Add)
         >>> # clear the unit flag after a final phased accumulation
         >>> result = store(acc, [0, 0], out, st_phase=pl.STPhase.Final)
+        >>> # both ends of the move stated explicitly (unified buffer -> GM)
+        >>> result = store(tile, [0, 0], out,
+        ...                source_memory=pl.Mem.Vec, target_memory=pl.Mem.DDR)
     """
     normalized_offsets = _normalize_intlike(offsets)
     normalized_shapes = _normalize_intlike(shapes) if shapes is not None else None
@@ -522,6 +545,8 @@ def store(
         normalized_shapes,
         atomic=int(atomic),
         st_phase=st_phase,
+        source_memory=source_memory,
+        target_memory=target_memory,
     )
     return output_tensor.__class__(expr=call_expr)
 

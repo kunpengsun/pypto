@@ -101,6 +101,9 @@ std::string FormatLocalArrayTypeString(const ir::ArrayType& array_type) {
 std::string MemorySpaceToMLIR(ir::MemorySpace space) {
   if (space == ir::MemorySpace::DDR) {
     return "gm";
+  } else if (space == ir::MemorySpace::SRAM) {
+    // External endpoint identity; SRAM pointers still use global addressing.
+    return "sram";
   } else if (space == ir::MemorySpace::Vec) {
     return "vec";
   } else if (space == ir::MemorySpace::Mat) {

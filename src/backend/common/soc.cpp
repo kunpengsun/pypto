@@ -91,11 +91,13 @@ bool Die::operator==(const Die& other) const { return cluster_counts_ == other.c
 
 // ========== SoC Implementation ==========
 
-SoC::SoC(std::map<Die, int> die_counts, std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> mem_graph)
-    : die_counts_(std::move(die_counts)), mem_graph_(std::move(mem_graph)) {}
+SoC::SoC(std::map<Die, int> die_counts, std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> mem_graph,
+         std::vector<Mem> mems)
+    : die_counts_(std::move(die_counts)), mems_(std::move(mems)), mem_graph_(std::move(mem_graph)) {}
 
-SoC::SoC(const Die& die, int count, std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> mem_graph)
-    : die_counts_({{die, count}}), mem_graph_(std::move(mem_graph)) {}
+SoC::SoC(const Die& die, int count, std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> mem_graph,
+         std::vector<Mem> mems)
+    : die_counts_({{die, count}}), mems_(std::move(mems)), mem_graph_(std::move(mem_graph)) {}
 
 int SoC::TotalDieCount() const {
   return std::accumulate(die_counts_.begin(), die_counts_.end(), 0,
@@ -144,14 +146,17 @@ const SoC& Create910BSoC() {
 
     Die die({{aic_cluster, 24}, {aiv_cluster, 48}});  // 24 AIC cores and 48 AIV cores per die
 
-    // Memory hierarchy graph for path finding
+    // External SRAM is a distinct topology endpoint in the simulation model,
+    // even though its pointers share DDR addressing. DDR <-> SRAM is direct;
+    // SRAM's Vec/Mat connections mirror DDR's directions. It is not a per-core pool.
     std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> mem_graph;
-    mem_graph[ir::MemorySpace::DDR] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat};
-    mem_graph[ir::MemorySpace::Vec] = {ir::MemorySpace::DDR};
+    mem_graph[ir::MemorySpace::DDR] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat, ir::MemorySpace::SRAM};
+    mem_graph[ir::MemorySpace::SRAM] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat, ir::MemorySpace::DDR};
+    mem_graph[ir::MemorySpace::Vec] = {ir::MemorySpace::DDR, ir::MemorySpace::SRAM};
     mem_graph[ir::MemorySpace::Mat] = {ir::MemorySpace::Left, ir::MemorySpace::Right, ir::MemorySpace::Bias};
-    mem_graph[ir::MemorySpace::Acc] = {ir::MemorySpace::Mat, ir::MemorySpace::DDR};
+    mem_graph[ir::MemorySpace::Acc] = {ir::MemorySpace::Mat, ir::MemorySpace::DDR, ir::MemorySpace::SRAM};
 
-    return SoC(die, 1, std::move(mem_graph));
+    return SoC(die, 1, std::move(mem_graph), {Mem(ir::MemorySpace::SRAM, 256ULL * 1024 * 1024, 32)});
   }();
   return soc;
 }
@@ -187,15 +192,19 @@ const SoC& Create950SoC() {
 
     Die die({{mix_cluster, 18}});  // 18 mix clusters per die
 
-    // Memory hierarchy graph for path finding
+    // Keep DDR and external SRAM distinct in route queries and pipe inference.
+    // SRAM is an external endpoint, not a tile buffer or a per-core pool.
+    // DDR <-> SRAM is direct; SRAM's Vec/Mat connections mirror DDR's directions.
     std::map<ir::MemorySpace, std::vector<ir::MemorySpace>> mem_graph;
-    mem_graph[ir::MemorySpace::DDR] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat};
-    mem_graph[ir::MemorySpace::Vec] = {ir::MemorySpace::Mat, ir::MemorySpace::DDR};
+    mem_graph[ir::MemorySpace::DDR] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat, ir::MemorySpace::SRAM};
+    mem_graph[ir::MemorySpace::SRAM] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat, ir::MemorySpace::DDR};
+    mem_graph[ir::MemorySpace::Vec] = {ir::MemorySpace::Mat, ir::MemorySpace::DDR, ir::MemorySpace::SRAM};
     mem_graph[ir::MemorySpace::Mat] = {ir::MemorySpace::Left, ir::MemorySpace::Right, ir::MemorySpace::Bias,
                                        ir::MemorySpace::LeftScale, ir::MemorySpace::RightScale};
-    mem_graph[ir::MemorySpace::Acc] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat, ir::MemorySpace::DDR};
+    mem_graph[ir::MemorySpace::Acc] = {ir::MemorySpace::Vec, ir::MemorySpace::Mat, ir::MemorySpace::DDR,
+                                    ir::MemorySpace::SRAM};
 
-    return SoC(die, 2, std::move(mem_graph));
+    return SoC(die, 2, std::move(mem_graph), {Mem(ir::MemorySpace::SRAM, 256ULL * 1024 * 1024, 32)});
   }();
   return soc;
 }

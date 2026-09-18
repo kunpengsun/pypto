@@ -26,8 +26,9 @@ miscompile.
 """
 
 import pytest
-from pypto import backend
-from pypto.pypto_core import ir
+from pypto import DataType, backend
+from pypto.ir.op import tile
+from pypto.pypto_core import ir, testing
 
 MS = ir.MemorySpace
 
@@ -41,6 +42,7 @@ _SPACES = [
     MS.Bias,
     MS.LeftScale,
     MS.RightScale,
+    MS.SRAM,
 ]
 
 _TARGETS = [backend.BackendType.Ascend910B, backend.BackendType.Ascend950]
@@ -57,7 +59,7 @@ def _direct_edges(backend_type) -> set[str]:
     """Direct edges of one target's memory graph.
 
     ``find_mem_path`` BFSs the same adjacency the graph stores, so a path of
-    exactly two nodes is a single edge -- i.e. one ``pto.tmov``.
+    exactly two nodes is a single topology edge, not necessarily a ``pto.tmov``.
     """
     backend.set_backend_type(backend_type)
     be = backend.get_backend_instance(backend_type)
@@ -103,6 +105,57 @@ def test_targets_disagree_on_some_edges():
     assert "Vec->Mat" not in a2a3
     assert "Acc->Vec" in a5
     assert "Acc->Vec" not in a2a3
+
+
+@pytest.mark.parametrize("backend_type", _TARGETS)
+def test_sram_has_independent_external_routes(backend_type):
+    """Shared pointer addressing does not collapse the two physical endpoints."""
+    edges = _direct_edges(backend_type)
+    assert {"SRAM->Vec", "SRAM->Mat", "Vec->SRAM", "Acc->SRAM"} <= edges
+    assert {"DDR->Vec", "DDR->Mat", "Vec->DDR", "Acc->DDR"} <= edges
+    assert {"DDR->SRAM", "SRAM->DDR"} <= edges
+    be = backend.get_backend_instance(backend_type)
+    assert be.find_mem_path(MS.DDR, MS.SRAM) == [MS.DDR, MS.SRAM]
+    assert be.find_mem_path(MS.SRAM, MS.DDR) == [MS.SRAM, MS.DDR]
+    assert be.find_mem_path(MS.SRAM, MS.Mat) == [MS.SRAM, MS.Mat]
+    assert be.find_mem_path(MS.DDR, MS.Mat) == [MS.DDR, MS.Mat]
+    assert be.find_mem_path(MS.SRAM, MS.Left) == [MS.SRAM, MS.Mat, MS.Left]
+    assert be.find_mem_path(MS.Vec, MS.SRAM) == [MS.Vec, MS.SRAM]
+    # Capacity belongs to the chip, not to a per-core allocation pool.
+    assert be.get_mem_size(MS.SRAM) == 256 * 1024 * 1024
+
+
+@pytest.mark.parametrize("backend_type", _TARGETS)
+def test_sram_vec_mat_connections_match_ddr(backend_type):
+    """Match both directions, including unsupported Mat-to-external writeback."""
+    edges = _direct_edges(backend_type)
+    for buffer in ("Vec", "Mat"):
+        assert (f"SRAM->{buffer}" in edges) == (f"DDR->{buffer}" in edges)
+        assert (f"{buffer}->SRAM" in edges) == (f"{buffer}->DDR" in edges)
+
+
+@pytest.mark.parametrize("backend_type", _TARGETS)
+@pytest.mark.parametrize("medium", [None, MS.DDR, MS.SRAM])
+@pytest.mark.parametrize("destination", [MS.Vec, MS.Mat])
+def test_external_load_pipe(backend_type, medium, destination):
+    backend.set_backend_type(backend_type)
+    tensor = ir.Var("input", ir.TensorType([16, 128], DataType.FP32), ir.Span.unknown())
+    call = tile.load(tensor, [0, 0], [16, 128], source_memory=medium, target_memory=destination)
+    assert testing.try_infer_pipe(call) == int(ir.PipeType.MTE2)
+    assert testing.classify_call_affinity(call) == ("vector" if destination == MS.Vec else "cube")
+
+
+@pytest.mark.parametrize("backend_type", _TARGETS)
+@pytest.mark.parametrize("medium", [None, MS.DDR, MS.SRAM])
+@pytest.mark.parametrize("source,pipe", [(MS.Vec, ir.PipeType.MTE3), (MS.Acc, ir.PipeType.FIX)])
+def test_external_store_pipe(backend_type, medium, source, pipe):
+    backend.set_backend_type(backend_type)
+    span = ir.Span.unknown()
+    tensor = ir.Var("output", ir.TensorType([16, 128], DataType.FP32), span)
+    value = ir.Var("value", ir.TileType([16, 128], DataType.FP32, memory_space=source), span)
+    call = tile.store(value, [0, 0], tensor, target_memory=medium)
+    assert testing.try_infer_pipe(call) == int(pipe)
+    assert testing.classify_call_affinity(call) == ("vector" if source == MS.Vec else "cube")
 
 
 if __name__ == "__main__":

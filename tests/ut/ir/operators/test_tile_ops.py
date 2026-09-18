@@ -5815,6 +5815,276 @@ class TestTileLoadOp:
         assert Prog is not None
 
 
+class TestTileLoadStoreMemoryDecls:
+    """External endpoints declare DDR/SRAM; tile endpoints retain on-chip placement."""
+
+    def test_load_source_memory_ddr_is_carried_in_kwargs(self):
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+
+        call = tile.load(tensor, [0, 0], [64, 128], source_memory=ir.MemorySpace.DDR)
+
+        assert call.kwargs["source_memory"] == ir.MemorySpace.DDR
+
+    def test_load_default_omits_source_memory_kwarg(self):
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+
+        call = tile.load(tensor, [0, 0], [64, 128])
+
+        assert "source_memory" not in call.kwargs
+
+    def test_load_accepts_sram_source_memory(self):
+        """The declared source spaces are legal on the GM end of a load."""
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+
+        call = tile.load(tensor, [0, 0], [64, 128], source_memory=ir.MemorySpace.SRAM)
+
+        assert call.kwargs["source_memory"] == ir.MemorySpace.SRAM
+
+    def test_load_rejects_nonexternal_source_memory(self):
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+
+        with pytest.raises(
+            ValueError,
+            match=r"source_memory for tile\.load must be MemorySpace\.DDR or MemorySpace\.SRAM",
+        ):
+            tile.load(tensor, [0, 0], [64, 128], source_memory=ir.MemorySpace.Acc)
+
+    def test_load_rejects_unsupported_tile_target(self):
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+
+        with pytest.raises(
+            ValueError,
+            match=r"target_memory for tile\.load must be MemorySpace\.Vec or MemorySpace\.Mat",
+        ):
+            tile.load(tensor, [0, 0], [64, 128], target_memory=ir.MemorySpace.Acc)
+
+    def test_load_both_ends_declared(self):
+        """source_memory + target_memory together present the whole move."""
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+
+        call = tile.load(
+            tensor, [0, 0], [64, 128], source_memory=ir.MemorySpace.DDR, target_memory=ir.MemorySpace.Vec
+        )
+
+        assert call.kwargs["source_memory"] == ir.MemorySpace.DDR
+        assert call.kwargs["target_memory"] == ir.MemorySpace.Vec
+        assert call.type.memory_space == ir.MemorySpace.Vec
+
+    def test_store_source_and_target_memory_are_carried_in_kwargs(self):
+        span = ir.Span.unknown()
+        out = ir.Var("out", ir.TensorType([64, 128], DataType.FP32), span)
+        src = _partial_tile([16, 128], [12, 128], name="src")
+
+        call = tile.store(
+            src, [0, 0], out, source_memory=ir.MemorySpace.Vec, target_memory=ir.MemorySpace.DDR
+        )
+
+        assert call.kwargs["source_memory"] == ir.MemorySpace.Vec
+        assert call.kwargs["target_memory"] == ir.MemorySpace.DDR
+
+    def test_store_default_omits_memory_kwargs(self):
+        span = ir.Span.unknown()
+        out = ir.Var("out", ir.TensorType([64, 128], DataType.FP32), span)
+        src = _partial_tile([16, 128], [12, 128], name="src")
+
+        call = tile.store(src, [0, 0], out)
+
+        assert "source_memory" not in call.kwargs
+        assert "target_memory" not in call.kwargs
+
+    def test_store_rejects_mat_source_memory(self):
+        """Mat stays outside the store's input set (no direct Mat->GM path)."""
+        span = ir.Span.unknown()
+        out = ir.Var("out", ir.TensorType([64, 128], DataType.FP32), span)
+        src = _partial_tile([16, 128], [12, 128], name="src")
+
+        with pytest.raises(
+            ValueError,
+            match=r"source_memory for tile\.store must be MemorySpace\.Vec or MemorySpace\.Acc",
+        ):
+            tile.store(src, [0, 0], out, source_memory=ir.MemorySpace.Mat)
+
+    def test_store_rejects_left_source_memory(self):
+        """Left stays outside the store's input set."""
+        span = ir.Span.unknown()
+        out = ir.Var("out", ir.TensorType([64, 128], DataType.FP32), span)
+        src = _partial_tile([16, 128], [12, 128], name="src")
+
+        with pytest.raises(
+            ValueError,
+            match=r"source_memory for tile\.store must be MemorySpace\.Vec or MemorySpace\.Acc",
+        ):
+            tile.store(src, [0, 0], out, source_memory=ir.MemorySpace.Left)
+
+    def test_store_accepts_sram_target_memory(self):
+        """The declared destination spaces are legal on the GM end of a store."""
+        span = ir.Span.unknown()
+        out = ir.Var("out", ir.TensorType([64, 128], DataType.FP32), span)
+        src = _partial_tile([16, 128], [12, 128], name="src")
+
+        call = tile.store(src, [0, 0], out, target_memory=ir.MemorySpace.SRAM)
+
+        assert call.kwargs["target_memory"] == ir.MemorySpace.SRAM
+
+    def test_store_rejects_nonexternal_target_memory(self):
+        span = ir.Span.unknown()
+        out = ir.Var("out", ir.TensorType([64, 128], DataType.FP32), span)
+        src = _partial_tile([16, 128], [12, 128], name="src")
+
+        with pytest.raises(
+            ValueError,
+            match=r"target_memory for tile\.store must be MemorySpace\.DDR or MemorySpace\.SRAM",
+        ):
+            tile.store(src, [0, 0], out, target_memory=ir.MemorySpace.Acc)
+
+    def test_store_source_memory_must_agree_with_resolved_tile_space(self):
+        """A resolved tile space makes a contradicting declaration an error."""
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([64, 128], DataType.FP32), span)
+        vec_tile = ir.Var("v", tile.load(tensor, [0, 0], [16, 128], target_memory=ir.MemorySpace.Vec).type, span)
+        out = ir.Var("out", ir.TensorType([64, 128], DataType.FP32), span)
+
+        with pytest.raises(ValueError, match="disagrees with the tile's resolved memory space"):
+            tile.store(vec_tile, [0, 0], out, source_memory=ir.MemorySpace.Acc)
+
+    def test_load_store_memory_decls_print_parse_roundtrip(self):
+        """Both-end declarations survive python_print -> pl.parse round-trip."""
+        src = (
+            "import pypto.language as pl\n\n"
+            "@pl.program\n"
+            "class P:\n"
+            "    @pl.function\n"
+            "    def main(self, x: pl.Tensor[[64, 128], pl.FP32],"
+            " out: pl.Out[pl.Tensor[[64, 128], pl.FP32]]) -> pl.Tensor[[64, 128], pl.FP32]:\n"
+            "        t = pl.load(x, [0, 0], [64, 128], target_memory=pl.Mem.Vec,\n"
+            "                    source_memory=pl.Mem.DDR)\n"
+            "        return pl.store(t, [0, 0], out, source_memory=pl.Mem.Vec,\n"
+            "                        target_memory=pl.Mem.DDR)\n"
+        )
+        prog = pl.parse(src)
+        reparsed = pl.parse(ir.python_print(prog))
+        ir.assert_structural_equal(reparsed, prog)
+
+    def test_load_store_memory_decls_via_dsl(self):
+        """pl.load / pl.store accept the declarations at the DSL surface."""
+
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[64, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[64, 128], pl.FP32]],
+            ) -> pl.Tensor[[64, 128], pl.FP32]:
+                t = pl.load(
+                    x, [0, 0], [64, 128], source_memory=pl.Mem.DDR, target_memory=pl.Mem.Vec
+                )
+                return pl.store(t, [0, 0], out, source_memory=pl.Mem.Vec, target_memory=pl.Mem.DDR)
+
+        assert Prog is not None
+
+
+class TestTileSramSpace:
+    """External SRAM is a global tensor endpoint, never an on-chip tile pool."""
+
+    @pytest.mark.parametrize("target", [ir.MemorySpace.Vec, ir.MemorySpace.Mat])
+    def test_load_from_sram_keeps_onchip_target(self, target):
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([16, 128], DataType.FP32), span)
+        call = tile.load(
+            tensor, [0, 0], [16, 128], source_memory=ir.MemorySpace.SRAM, target_memory=target
+        )
+        assert call.type.memory_space == target
+        assert call.kwargs["source_memory"] == ir.MemorySpace.SRAM
+        assert tensor.type.memory_space == ir.MemorySpace.DDR
+
+    @pytest.mark.parametrize("source", [ir.MemorySpace.Vec, ir.MemorySpace.Acc])
+    def test_store_to_sram_keeps_global_tensor(self, source):
+        span = ir.Span.unknown()
+        tensor = ir.Var("out", ir.TensorType([16, 128], DataType.FP32), span)
+        src = ir.Var("src", ir.TileType([16, 128], DataType.FP32, memory_space=source), span)
+        call = tile.store(src, [0, 0], tensor, source_memory=source, target_memory=ir.MemorySpace.SRAM)
+        assert call.type.memory_space == ir.MemorySpace.DDR
+        assert call.kwargs["target_memory"] == ir.MemorySpace.SRAM
+
+    @pytest.mark.parametrize("space", [ir.MemorySpace.DDR, ir.MemorySpace.SRAM])
+    def test_load_rejects_external_tile_target(self, space):
+        tensor = ir.Var("a", ir.TensorType([16, 128], DataType.FP32), ir.Span.unknown())
+        with pytest.raises(ValueError, match="target_memory for tile.load"):
+            tile.load(tensor, [0, 0], [16, 128], target_memory=space)
+
+    def test_sram_cannot_be_a_tile_type(self):
+        with pytest.raises(ValueError, match="SRAM is external memory"):
+            ir.TileType([16, 128], DataType.FP32, memory_space=ir.MemorySpace.SRAM)
+
+    def test_move_cannot_target_sram(self):
+        src = _partial_tile([16, 128], [16, 128], name="src")
+        with pytest.raises(ValueError, match="SRAM"):
+            tile.move(src, target_memory=ir.MemorySpace.SRAM)
+
+    @pytest.mark.parametrize("space", [ir.MemorySpace.Vec, ir.MemorySpace.Mat])
+    def test_external_declarations_reject_onchip_spaces(self, space):
+        tensor = ir.Var("a", ir.TensorType([16, 128], DataType.FP32), ir.Span.unknown())
+        src = _partial_tile([16, 128], [16, 128], name="src")
+        with pytest.raises(ValueError, match="source_memory for tile.load"):
+            tile.load(tensor, [0, 0], [16, 128], source_memory=space)
+        with pytest.raises(ValueError, match="target_memory for tile.store"):
+            tile.store(src, [0, 0], tensor, target_memory=space)
+
+    def test_store_rejects_sram_tile_source(self):
+        tensor = ir.Var("out", ir.TensorType([16, 128], DataType.FP32), ir.Span.unknown())
+        src = _partial_tile([16, 128], [16, 128], name="src")
+        with pytest.raises(ValueError, match="source_memory for tile.store"):
+            tile.store(src, [0, 0], tensor, source_memory=ir.MemorySpace.SRAM)
+
+    @pytest.mark.parametrize("space", [ir.MemorySpace.Vec, ir.MemorySpace.Mat])
+    def test_cpp_boundary_rejects_onchip_external_declarations(self, space):
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([16, 128], DataType.FP32), span)
+        loaded = tile.load(tensor, [0, 0], [16, 128])
+        with pytest.raises(ValueError, match="source_memory must be"):
+            ir.create_op_call("tile.load", list(loaded.args), {"source_memory": space}, span)
+        src = _partial_tile([16, 128], [16, 128], name="src")
+        stored = tile.store(src, [0, 0], tensor)
+        with pytest.raises(ValueError, match="target_memory must be"):
+            ir.create_op_call("tile.store", list(stored.args), {"target_memory": space}, span)
+
+    def test_cpp_boundary_rejects_sram_tile_endpoints(self):
+        span = ir.Span.unknown()
+        tensor = ir.Var("a", ir.TensorType([16, 128], DataType.FP32), span)
+        loaded = tile.load(tensor, [0, 0], [16, 128])
+        with pytest.raises(ValueError, match="target_memory must be"):
+            ir.create_op_call("tile.load", list(loaded.args), {"target_memory": ir.MemorySpace.SRAM}, span)
+        src = _partial_tile([16, 128], [16, 128], name="src")
+        stored = tile.store(src, [0, 0], tensor)
+        with pytest.raises(ValueError, match="source_memory must be"):
+            ir.create_op_call("tile.store", list(stored.args), {"source_memory": ir.MemorySpace.SRAM}, span)
+
+    def test_sram_roundtrip_through_print(self):
+        @pl.program
+        class Prog:
+            @pl.function
+            def main(
+                self,
+                x: pl.Tensor[[16, 128], pl.FP32],
+                out: pl.Out[pl.Tensor[[16, 128], pl.FP32]],
+            ) -> pl.Tensor[[16, 128], pl.FP32]:
+                t = pl.load(
+                    x, [0, 0], [16, 128], source_memory=pl.Mem.SRAM, target_memory=pl.Mem.Vec
+                )
+                return pl.store(t, [0, 0], out, target_memory=pl.Mem.SRAM)
+
+        printed = ir.python_print(Prog)
+        assert "SRAM" in printed
+        ir.assert_structural_equal(pl.parse(printed), Prog)
+
+
 class TestTileLoadStoreOffsetElements:
     """tile.load / tile.store offsets must be integer scalars, as tensor.slice's are.
 
