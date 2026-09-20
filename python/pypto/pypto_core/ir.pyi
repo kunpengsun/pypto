@@ -1114,6 +1114,9 @@ class MemorySpace(enum.Enum):
     ScalarLocal = ...
     """On-core scalar register file / C stack (ArrayType)."""
 
+    SRAM = ...
+    """External SRAM medium sharing DDR addressing; not a tile storage location."""
+
 Mem = MemorySpace
 """Short alias for MemorySpace (e.g., Mem.Vec instead of MemorySpace.Vec)."""
 

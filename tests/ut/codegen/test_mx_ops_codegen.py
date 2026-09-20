@@ -89,8 +89,9 @@ class TestMxMatmulCodegen:
         with pytest.raises(ValueError, match=r"matmul_mx.*only supported.*Ascend950.*a5.*a2a3"):
             _run_default_pipeline(Program, BackendType.Ascend910B)
 
-    def test_mx_scale_load_accepts_provable_dynamic_offset(self):
-        """Provable MX offsets become FloorDiv in IR; codegen sees divsi + maxsi."""
+    @pytest.mark.parametrize("source_memory", [None, pl.Mem.SRAM])
+    def test_mx_scale_load_accepts_narrowed_valid_shape(self, source_memory):
+        """Physical shapes stay fractal-aligned; valid_shape may narrow M."""
 
         @pl.program
         class Program:
@@ -99,17 +100,25 @@ class TestMxMatmulCodegen:
                 self,
                 a_s: pl.Tensor[[128, 8], pl.FP8E8M0, pl.MX_A_ZZ],
             ):
-                for mt in pl.parallel(128 // 16):
-                    row_off = mt * 16
-                    for kg in pl.pipeline(2, 8, 2, stage=1):
-                        _ = pl.load(a_s, [row_off, kg], [16, 2], target_memory=pl.Mem.Mat)
+                _ = pl.load(
+                    a_s,
+                    [0, 0],
+                    [16, 2],
+                    valid_shape=[8, 2],
+                    target_memory=pl.Mem.Mat,
+                    source_memory=source_memory,
+                )
 
         mlir = _emit_incore_mlir(Program)
         assert "cf.assert" not in mlir
         assert "arith.remui" not in mlir
         assert "arith.divsi" in mlir or "arith.divui" in mlir
         assert "pto.tload" in mlir
-        assert "{layout = #pto.layout<mx_a_zz>}" in mlir
+        load = next(line for line in mlir.splitlines() if "pto.tload " in line)
+        if source_memory == pl.Mem.SRAM:
+            assert '{source_memory = "sram", layout = #pto.layout<mx_a_zz>}' in load
+        else:
+            assert "source_memory" not in load
         partitions = [line for line in mlir.splitlines() if "partition_view" in line]
         assert any(
             "sizes = [%c1_index, %c1_index, %c1_index, %c16_index, %c2_index]" in line for line in partitions

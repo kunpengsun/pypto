@@ -113,6 +113,8 @@ std::string MemorySpaceToString(MemorySpace space) {
       return "RightScale";
     case MemorySpace::ScalarLocal:
       return "ScalarLocal";
+    case MemorySpace::SRAM:
+      return "SRAM";
     default:
       return "Unknown";
   }
@@ -129,6 +131,7 @@ MemorySpace StringToMemorySpace(const std::string& str) {
   if (str == "LeftScale") return MemorySpace::LeftScale;
   if (str == "RightScale") return MemorySpace::RightScale;
   if (str == "ScalarLocal") return MemorySpace::ScalarLocal;
+  if (str == "SRAM") return MemorySpace::SRAM;
   throw pypto::ValueError("Unknown MemorySpace: " + str);
 }
 

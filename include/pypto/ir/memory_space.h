@@ -22,7 +22,9 @@ namespace ir {
  * @brief Memory space enumeration
  *
  * Defines the available memory spaces in the hardware hierarchy:
- * - DDR: Double Data Rate memory (off-chip)
+ * - DDR: External DDR memory; also the canonical global tensor address space
+ * - SRAM: External SRAM medium declaration for load/store tensor endpoints;
+ *   has its own topology node, shares DDR addressing, and is not a tile storage location
  * - Vec: Vector/unified buffer (on-chip shared memory)
  * - Mat: Matrix/L1 buffer
  * - Left: Left matrix operand buffer
@@ -44,6 +46,7 @@ enum class MemorySpace {
   ScalarLocal = 7,  ///< On-core scalar register file / C stack (for ArrayType)
   LeftScale = 8,    ///< L0A-side MX block-scale buffer (A5)
   RightScale = 9,   ///< L0B-side MX block-scale buffer (A5)
+  SRAM = 10,        ///< External SRAM medium, in the same address space as DDR
 };
 
 /**
