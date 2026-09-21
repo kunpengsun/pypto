@@ -1,5 +1,30 @@
 # 算子系统
 
+## copy 作为 L2 预取封装
+
+`pl.copy(dst, src)` 现在是前端语句展开：先执行 `dst = src`，再依次生成
+`prefetch.make_context`、`async_prefetch`、`session`、`wait`。它不搬运张量值，
+也不写入 dst 原来的分配；后续 load(dst) 使用源地址，保留原张量形状。
+只接受两个位置参数，dst 必须是类型兼容的张量变量。区域参数和内存端点参数
+属于下方保留的旧 `pl.tensor.copy` 搬运接口，不用于新的 pl.copy。
+
+```python
+with pl.at(level=pl.Level.CORE_GROUP):
+    pl.copy(a1, a)
+    # 等价展开：
+    # a1 = a
+    # ctx = pl.prefetch.make_context()
+    # evt = pl.prefetch.async_prefetch(a1, ctx)
+    # session = pl.prefetch.session(ctx)
+    # pl.prefetch.wait(evt, session)
+```
+
+prefetch 接受连续、静态形状的 ND 张量。代码生成仅把预取视图展平为逻辑一维，
+不改变后续 load 的张量形状；自定义 stride、部分 valid_shape 和非 ND 布局被拒绝。
+仍依赖原有 SDMA/runtime 支持。本次按 IR 与代码生成验证，旧 DDR copy 数值测试结果
+不能当作新接口验证结果。混合 kernel 中 AIV 的 wait 本身不会添加 AIC 跨核屏障。
+
+
 ## DDR/SRAM 张量创建与拷贝
 
 `pl.create_tensor(shape, dtype=..., memory_type=pl.Mem.DDR)` 新增仅限关键字的
@@ -14,15 +39,18 @@ SRAM 声明保存在 `tensor.create` 属性中，TensorType 仍使用 DDR 全局
 ```python
 dst = pl.create_tensor(src.shape, dtype=src.dtype, memory_type=pl.Mem.DDR)
 with pl.at(level=pl.Level.CORE_GROUP):
-    dst = pl.copy(dst, src, source_memory=pl.Mem.DDR, target_memory=pl.Mem.DDR)
+    pl.tensor.copy(dst, src, source_memory=pl.Mem.DDR, target_memory=pl.Mem.DDR)
 ```
 
 省略全部区域参数时复制整个同形状张量；指定区域时，`dst_offsets`、`src_offsets`
-和 `shape` 必须同时提供。参数顺序始终为目的在前、源在后。完整验证示例见
-`examples/beginner/05_matmul.py`：先复制 A/B，再在另一 InCore scope 中执行矩阵乘法。
+和 `shape` 必须同时提供。参数顺序始终为目的在前、源在后。
+当前 `examples/beginner/05_matmul.py` 已改用上方的新 L2 预取封装。
 
-`pl.copy(dst, src, dst_offsets, src_offsets, shape, *, source_memory=pl.Mem.DDR,
-target_memory=pl.Mem.SRAM)` 在张量区域之间搬运数据，返回 `dst` 的别名。
+`pl.tensor.copy(dst, src, dst_offsets, src_offsets, shape, *, source_memory=pl.Mem.DDR,
+target_memory=pl.Mem.SRAM)` 原地写入 `dst`，无张量返回值。作为独立语句调用后，
+直接使用 `dst`；原来的 `dst = pl.tensor.copy(...)` 改为 `pl.tensor.copy(...)`，
+`return pl.tensor.copy(...)` 改为先调用 copy 再 `return dst`。
+Python 构建函数返回供解析器使用的 UnknownType IR Call，不返回 Tensor。
 支持 DDR → DDR、DDR → SRAM 和 SRAM → DDR；默认端点仍为 DDR → SRAM。
 两端 dtype、rank 必须一致；静态越界在编译时
 报错，动态区域由调用者保证运行时不越界。源和目的区域不得重叠。
@@ -40,7 +68,8 @@ target_memory=pl.Mem.SRAM)` 在张量区域之间搬运数据，返回 `dst` 的
 @pl.jit.incore
 def stage(src: pl.Tensor[[4, 600], pl.FP32],
           dst: pl.Out[pl.Tensor[[4, 600], pl.FP32]]) -> pl.Tensor[[4, 600], pl.FP32]:
-    return pl.copy(dst, src, [0, 0], [0, 0], [4, 600])
+    pl.tensor.copy(dst, src, [0, 0], [0, 0], [4, 600])
+    return dst
 ```
 
 类型 (Type) 安全的算子定义，支持自动类型推导，按模块化分类组织（TensorOp、TileOp、SyncOp、CrossCoreOp）。
@@ -791,10 +820,9 @@ codegen 会向 prefetch kernel 注入隐藏指针。
 
 ### 约束
 
-- `src` 必须是**扁平连续的逻辑一维 GM** 区域：shape 必须完全静态，且除最后一维外
-  所有维度都为 `1`（`[N]`、`[1, N]`、`[1, 1, N]`）。该检查与 PTOAS 的
-  `TPrefetchAsyncOp::verify()` 保持一致，因此 shape 写错会在 PyPTO IR 构造阶段就报错，
-  而不是拖到 PTOAS 校验阶段。
+- `src` 必须是连续、完全静态、各维为正数的 ND GM 张量。
+  自定义 stride、部分 valid_shape 和非 ND 布局被拒绝。
+  代码生成将预取视图展平为逻辑一维以满足 PTOAS，不改变源指针或后续 load 的形状。
 
 ### 使用示例
 

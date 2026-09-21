@@ -39,6 +39,7 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -82,13 +83,11 @@ void CheckHandle(const std::string& op_name, const std::string& arg_role, const 
 /**
  * @brief Enforce the PTOAS ``tprefetch_async`` source constraint.
  *
- * Mirrors ``verifyAsyncFlatContiguous1DGMViewLike`` in PTOAS: ``src`` must be a
- * GM tensor with a fully static shape that is *logically* 1D — every dimension
- * except the last must be 1, so the region is one flat contiguous run. Rejecting
- * this here means a shape mistake fails at PyPTO IR construction with a DSL-level
- * message instead of surfacing much later as a PTOAS verification error.
+ * Dense static ND tensors are flattened to a logical-1D view in codegen.
+ * Reject custom layouts, strides and partial valid regions rather than prefetch
+ * bytes that are not part of the requested contiguous tensor.
  */
-void CheckFlatContiguous1DSource(const std::string& op_name, const ExprPtr& src) {
+void CheckPackedStaticSource(const std::string& op_name, const ExprPtr& src) {
   CHECK(AsVarLike(src)) << op_name << " expects src to be a Var or IterArg";
 
   auto tensor_type = AsTensorTypeLike(src->GetType());
@@ -100,21 +99,20 @@ void CheckFlatContiguous1DSource(const std::string& op_name, const ExprPtr& src)
   const auto& shape = tensor_type->shape_;
   CHECK(!shape.empty()) << op_name << " expects src to have rank >= 1, got a rank-0 tensor";
 
-  std::vector<int64_t> dims;
-  dims.reserve(shape.size());
+  int64_t elements = 1;
   for (size_t i = 0; i < shape.size(); ++i) {
     auto dim = As<ConstInt>(shape[i]);
     CHECK(dim) << op_name << " expects src to have a fully static shape, but dimension " << i
                << " is dynamic; async prefetch needs a compile-time byte extent";
-    dims.push_back(dim->value_);
+    CHECK_SPAN(dim->value_ > 0 && elements <= std::numeric_limits<int64_t>::max() / dim->value_, src->span_)
+        << op_name << " requires positive dimensions and an element count fitting int64";
+    elements *= dim->value_;
   }
 
-  for (size_t i = 0; i + 1 < dims.size(); ++i) {
-    CHECK(dims[i] == 1) << op_name
-                        << " expects src to be a flat contiguous logical 1D GM region (all "
-                           "dimensions except the last must be 1), but dimension "
-                        << i << " is " << dims[i]
-                        << "; reshape the tensor to [N] or [1, ..., N] before prefetching";
+  if (tensor_type->tensor_view_) {
+    const auto& view = *tensor_type->tensor_view_;
+    CHECK_SPAN(view.layout == TensorLayout::ND && view.stride.empty() && view.valid_shape.empty(), src->span_)
+        << op_name << " requires a packed ND tensor without explicit strides or partial valid_shape";
   }
 }
 
@@ -152,7 +150,7 @@ REGISTER_OP("prefetch.make_context")
 
 REGISTER_OP("prefetch.async_prefetch")
     .set_description(
-        "Start one asynchronous prefetch of a flat contiguous 1D GM region into L2 cache "
+        "Start one asynchronous prefetch of a packed static ND GM tensor into L2 cache "
         "via SDMA CMO and return the completion event (AsyncEventType). Does not block and "
         "does not modify any tensor value — it only warms the cache. Pair the returned "
         "event with prefetch.session(ctx) in prefetch.wait to observe completion.")
@@ -163,13 +161,13 @@ REGISTER_OP("prefetch.async_prefetch")
     // Without this, these ops carry no tile operand, fall through to SHARED,
     // and ExpandMixedKernel duplicates them onto the cube lane too.
     .set_core_affinity(core_affinity::CoreAffinity::VECTOR)
-    .add_argument("src", "A flat contiguous logical-1D GM Tensor to pull into L2")
+    .add_argument("src", "A packed static ND GM Tensor to pull into L2")
     .add_argument("ctx", "An async-prefetch context (PrefetchAsyncContextType)")
     .no_memory_spec()
     .f_deduce_type([](const std::vector<ExprPtr>& args,
                       const std::vector<std::pair<std::string, std::any>>& kwargs) -> TypePtr {
       CheckArity("prefetch.async_prefetch", "src, ctx", 2, args, kwargs);
-      CheckFlatContiguous1DSource("prefetch.async_prefetch", args[0]);
+      CheckPackedStaticSource("prefetch.async_prefetch", args[0]);
       CheckHandle<PrefetchAsyncContextType>("prefetch.async_prefetch",
                                             "ctx to be a "
                                             "PrefetchAsyncContext",

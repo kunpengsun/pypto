@@ -137,20 +137,11 @@ class TestPrefetchOpTypes:
 class TestPrefetchOpVerification:
     """The IR-level verifier mirrors the PTOAS ``verify()`` input checks."""
 
-    def test_non_1d_source_rejected(self):
-        """A ``[4, 32]`` source is not a flat contiguous logical-1D region."""
-        with pytest.raises(InvalidOperationError, match="flat contiguous logical 1D"):
-
-            @pl.program
-            class Program:
-                @pl.function(type=pl.FunctionType.InCore)
-                def main(
-                    self,
-                    x: pl.Tensor[[4, 32], pl.FP32],
-                ) -> pl.Tensor[[4, 32], pl.FP32]:
-                    ctx = pl.prefetch.make_context()
-                    pl.prefetch.async_prefetch(x, ctx)
-                    return x
+    def test_packed_nd_source_accepted(self):
+        span = ir.Span.unknown()
+        src = ir.Var("src", ir.TensorType([4, 32], DataType.FP32), span)
+        ctx = ir_prefetch.make_context(span)
+        assert isinstance(ir_prefetch.async_prefetch(src, ctx, span).type, ir.AsyncEventType)
 
     def test_non_var_tensor_expression_rejected_before_codegen(self):
         """A Tensor-typed Call is not a legal PTOAS partition-view source."""

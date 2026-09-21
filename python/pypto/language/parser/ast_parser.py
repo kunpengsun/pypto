@@ -6217,6 +6217,31 @@ class ASTParser:
             return_expr = self.parse_expression(stmt.value)
             self.builder.return_stmt([return_expr], span)
 
+    def _parse_copy_prefetch(self, call: ast.Call) -> None:
+        """Expand pl.copy(dst, src) to a name rebind and the prefetch sequence."""
+        span = self.span_tracker.get_span(call)
+        if len(call.args) != 2 or call.keywords or not isinstance(call.args[0], ast.Name):
+            raise ParserSyntaxError(
+                "pl.copy expects exactly two positional arguments: pl.copy(dst, src)",
+                span=span,
+                hint="dst must be a variable name; region and memory endpoint arguments are not supported",
+            )
+        dst = self.parse_expression(call.args[0])
+        src = self.parse_expression(call.args[1])
+        if not isinstance(dst.type, ir.TensorType) or not isinstance(src.type, ir.TensorType):
+            raise ParserTypeError("pl.copy expects tensor arguments", span=span)
+        # Use the normal assignment path, so SSA conversion and scope outlining
+        # see the same rebind as an explicit `dst = src` in the user's program.
+        name = call.args[0].id
+        alias = self._assign_or_let(name, src, span)
+        self.scope_manager.define_var(name, alias, span=span)
+        ctx = self.builder.let("copy_prefetch_ctx", ir_op.prefetch.make_context(span), span=span)
+        evt = self.builder.let(
+            "copy_prefetch_evt", ir_op.prefetch.async_prefetch(alias, ctx, span), span=span
+        )
+        session = self.builder.let("copy_prefetch_session", ir_op.prefetch.session(ctx, span), span=span)
+        self.builder.eval_stmt(ir_op.prefetch.wait(evt, session, span), span)
+
     def parse_evaluation_statement(self, stmt: ast.Expr) -> None:
         """Parse evaluation statement (EvalStmt).
 
@@ -6227,6 +6252,9 @@ class ASTParser:
             stmt: Expr AST node
         """
         # Intercept compile-time-only constructs (produce no IR)
+        if _is_pl_call(stmt.value, "copy"):
+            self._parse_copy_prefetch(stmt.value)
+            return
         if self._is_dsl_call(stmt, "static_print"):
             self._handle_static_print(stmt)
             return

@@ -1,6 +1,15 @@
 # PyPTO DDR↔SRAM copy 接口实现说明
 
+> 后续接口更新：`pl.copy(dst, src)` 已改为 `dst = src` 加 L2 prefetch/wait 的前端封装。
+> 本文下面的分块 load/store 方案保留为历史实现，对应 `pl.tensor.copy` 底层搬运接口。
+> 新接口详情见 [算子文档](../zh/dev/ir/05-operators.md)，不再具有目的缓冲区写入语义。
+
 日期：2026-09-17
+
+> 2026-09-20 接口更新：copy 已改为无张量返回值的原地写入算子。当前用法是
+> `pl.copy(dst, src, ...)`，调用后直接使用 dst；不再写 `dst = pl.copy(...)`。
+> 下文保留此前实现记录，其中输出别名描述和返回 copy 的示例属于旧接口。
+> 当前接口以 [算子文档](../zh/dev/ir/05-operators.md) 为准。
 
 ## 后续更新：create_tensor 与 DDR → DDR 验证
 

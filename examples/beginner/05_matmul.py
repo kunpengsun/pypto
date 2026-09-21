@@ -14,7 +14,7 @@ Kernel:
   matmul_64 -- full 64x64 matmul in one shot
 
 Concepts introduced:
-  - DDR tensor allocation and DDR -> DDR copy through load/store
+  - L2 prefetch through pl.copy, with source aliasing
   - Memory hierarchy: GM -> Mat (L1) -> Left/Right (L0A/L0B) -> matmul -> Acc (L0C)
   - pl.matmul for cube unit multiplication
 
@@ -34,11 +34,11 @@ def matmul_64(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
     a1 = pl.create_tensor(a.shape, dtype=a.dtype, memory_type=pl.Mem.DDR)
     b1 = pl.create_tensor(b.shape, dtype=b.dtype, memory_type=pl.Mem.DDR)
 
-    # copy is destination-first. Run its load/store instructions in an InCore
-    # scope before the matmul scope consumes the separately allocated buffers.
+    # copy rebinds a1/b1 to a/b and prefetches their data into L2.
+    # Keep the wait in a separate task before the matmul consumes the aliases.
     with pl.at(level=pl.Level.CORE_GROUP):
-        a1 = pl.copy(a1, a, source_memory=pl.Mem.DDR, target_memory=pl.Mem.DDR)
-        b1 = pl.copy(b1, b, source_memory=pl.Mem.DDR, target_memory=pl.Mem.DDR)
+        pl.copy(a1, a)
+        pl.copy(b1, b)
 
     with pl.at(level=pl.Level.CORE_GROUP):
         tile_a_l1 = pl.load(a1, [0, 0], [64, 64], target_memory=pl.MemorySpace.Mat)
@@ -51,10 +51,7 @@ def matmul_64(a: pl.Tensor, b: pl.Tensor, c: pl.Out[pl.Tensor]):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Validate DDR copy followed by 64x64 matmul")
-    parser.add_argument("--platform", default="a2a3sim", choices=["a2a3sim", "a5sim", "a2a3", "a5"])
-    args = parser.parse_args()
-    cfg = RunConfig(platform=args.platform)
+    cfg = RunConfig()
     torch.manual_seed(0)
 
     a = torch.randn(64, 64, dtype=torch.float32)

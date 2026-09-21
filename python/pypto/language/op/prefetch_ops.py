@@ -69,9 +69,9 @@ def async_prefetch(src: Tensor, ctx: PrefetchAsyncContext) -> AsyncEvent:
     Does not block and does not modify ``src``.
 
     Args:
-        src: A flat contiguous logical-1D GM [`pl.Tensor`][pypto.language.Tensor] to pull into L2.
-            The op verifier (C++) requires a fully static shape whose dimensions
-            are all 1 except the last — e.g. ``[N]`` or ``[1, N]``.
+        src: A packed static ND GM [`pl.Tensor`][pypto.language.Tensor] to pull into L2.
+            Codegen flattens the prefetch view while preserving the tensor shape.
+            Explicit strides, partial valid shapes and non-ND layouts are rejected.
         ctx: A [`PrefetchAsyncContext`][pypto.language.PrefetchAsyncContext] from
             [`make_context`][pypto.language.prefetch.make_context].
 

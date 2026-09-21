@@ -52,7 +52,7 @@ def async_prefetch(src: Expr, ctx: Expr, span: Span | None = None) -> Call:
     Does not block and does not modify ``src``.
 
     Args:
-        src: A flat contiguous logical-1D GM Tensor to pull into L2
+        src: A packed static ND GM Tensor to pull into L2
         ctx: An async-prefetch context from :func:`make_context`
         span: Optional source span for debugging (auto-captured if not provided)
 
