@@ -112,7 +112,7 @@ def test_dynamic_extent_and_discarded_result():
             rows: pl.Scalar[pl.INDEX],
             cols: pl.Scalar[pl.INDEX],
         ) -> pl.Tensor[[4, 600], pl.FP32]:
-            pl.copy(dst, src, [0, 0], [0, 0], [rows, cols])
+            pl.tensor.copy(dst, src, [0, 0], [0, 0], [rows, cols])
             return dst
 
     lowered = PassManager.get_strategy(OptimizationStrategy.Default).run_passes(Copy)
@@ -131,7 +131,7 @@ def test_full_pipeline(target, endpoints, shape, repeat):
     source, destination = endpoints
     offsets = [0] * len(shape)
     first_copy = (
-        f"pl.copy(dst, src, {offsets}, {offsets}, {shape}, "
+        f"pl.tensor.copy(dst, src, {offsets}, {offsets}, {shape}, "
         f"source_memory=pl.Mem.{source}, target_memory=pl.Mem.{destination})"
         if repeat
         else ""
@@ -144,7 +144,7 @@ class Copy:
     def main(self, src: pl.Tensor[{shape}, pl.FP32],
              dst: pl.Out[pl.Tensor[{shape}, pl.FP32]]) -> pl.Tensor[{shape}, pl.FP32]:
         {first_copy}
-        pl.copy(dst, src, {offsets}, {offsets}, {shape},
+        pl.tensor.copy(dst, src, {offsets}, {offsets}, {shape},
                        source_memory=pl.Mem.{source}, target_memory=pl.Mem.{destination})
         return dst
 """)

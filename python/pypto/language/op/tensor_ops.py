@@ -230,6 +230,16 @@ def create(
 create_tensor = create
 
 
+def copy_prefetch(dst: Tensor, src: Tensor) -> None:
+    """Bind ``dst`` to ``src`` and prefetch the source into L2, then wait.
+
+    This is a parser statement: ``pl.copy(dst, src)`` expands to assignment
+    plus the four ``pl.prefetch`` operations. It does not write dst's old
+    allocation. Both arguments must be tensors and dst must be a variable name.
+    """
+    raise RuntimeError("pl.copy(dst, src) must be a standalone statement inside a PyPTO DSL function")
+
+
 def copy(
     dst: Tensor,
     src: Tensor,

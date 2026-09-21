@@ -1,5 +1,9 @@
 # PyPTO copy 与 create_tensor：设计、源码导航和实现详解
 
+> 后续接口更新：`pl.copy(dst, src)` 已改为 `dst = src` 加 L2 prefetch/wait 的前端封装。
+> 本文下面的分块 load/store 方案保留为历史实现，对应 `pl.tensor.copy` 底层搬运接口。
+> 新接口详情见 [算子文档](../zh/dev/ir/05-operators.md)，不再具有目的缓冲区写入语义。
+
 基于提交：`07c9c0bf`（分支 `feat/sram-transfer-protocol`）。
 
 > 2026-09-20 接口更新：以下内容描述上述提交的旧返回值方案。当前 copy 已改为

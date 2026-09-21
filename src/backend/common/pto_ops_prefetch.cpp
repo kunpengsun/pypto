@@ -99,9 +99,9 @@ std::string GetHandleSSA(const ir::CallPtr& op, size_t index, codegen::PTOCodege
  * @brief Build a whole-tensor ``pto.partition_view`` for the prefetch source.
  *
  * PTOAS ``tprefetch_async`` accepts a memref / tensor_view / partition_view but
- * not a bare pointer, and the region is always the entire (logically 1D) tensor
- * — the IR verifier already rejected anything else. Mirrors the view/partition
- * pair that ``tile.load`` emits.
+ * not a bare pointer. The IR verifier accepts packed static ND tensors;
+ * flatten the prefetch view when
+ * needed, leaving the original load view intact.
  *
  * @return A pair of (partition-view SSA, partition-view type string).
  */
@@ -117,6 +117,30 @@ std::pair<std::string, std::string> EmitWholeTensorPartitionView(const ir::CallP
   const std::string tensor_view = codegen.GetOrCreateTensorView(src);
   const std::string tensor_view_type = codegen.GetTensorViewTypeString(tensor_type.get());
   const std::string dtype_str = codegen.GetTypeString(tensor_type->dtype_);
+
+  // PTOAS requires a logical-1D view. Flatten only the prefetch view; loads
+  // continue to use the original tensor shape and the same global pointer.
+  bool needs_flatten = false;
+  int64_t elements = 1;
+  for (size_t i = 0; i < tensor_type->shape_.size(); ++i) {
+    const auto dim = ir::As<ir::ConstInt>(tensor_type->shape_[i]);
+    INTERNAL_CHECK_SPAN(dim, op->span_) << "prefetch requires verified static dimensions";
+    elements *= dim->value_;
+    if (i + 1 < tensor_type->shape_.size() && dim->value_ != 1) needs_flatten = true;
+  }
+  if (needs_flatten) {
+    const auto extent = codegen.GetOrEmitConstant(elements, DataType::INDEX);
+    const auto one = codegen.GetOrEmitConstant(static_cast<int64_t>(1), DataType::INDEX);
+    const auto flat_view = codegen.NewTemp();
+    const std::string flat_type = "!pto.tensor_view<?x" + dtype_str + ">";
+    codegen.Emit(flat_view + " = pto.make_tensor_view " + codegen.GetTensorBasePtr(src) + ", shape = [" +
+                 extent + "], strides = [" + one + "] {layout = #pto.layout<nd>} : " + flat_type);
+    const auto zero = codegen.GetOrEmitConstant(static_cast<int64_t>(0), DataType::INDEX);
+    const auto partition_type = MakePartitionTensorViewType({std::to_string(elements)}, dtype_str);
+    const auto partition = EmitPartitionViewPTO(src->name_hint_, flat_view, flat_type, partition_type, {zero},
+                                                {extent}, codegen);
+    return {partition, partition_type};
+  }
 
   const std::vector<std::string> dims = GetDimStrings(tensor_type->shape_);
   const std::vector<std::string> size_codes = GetSizeCodes(tensor_type->shape_, codegen);

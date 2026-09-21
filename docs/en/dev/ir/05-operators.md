@@ -1,5 +1,34 @@
 # Operator System
 
+## copy as L2 prefetch
+
+`pl.copy(dst, src)` is now a parser statement that rebinds `dst` to `src`,
+then emits `prefetch.make_context`, `async_prefetch`, `session`, and `wait`.
+It does not copy tensor values or write the old destination allocation. Later
+loads from `dst` use the source address and retain its tensor shape.
+Only the two positional arguments are accepted; dst must be a tensor variable
+with a compatible type. Region and memory-endpoint keywords belong to the
+legacy `pl.tensor.copy` transfer API below, which remains available separately.
+
+```python
+with pl.at(level=pl.Level.CORE_GROUP):
+    pl.copy(a1, a)
+    # Equivalent DSL expansion:
+    # a1 = a
+    # ctx = pl.prefetch.make_context()
+    # evt = pl.prefetch.async_prefetch(a1, ctx)
+    # session = pl.prefetch.session(ctx)
+    # pl.prefetch.wait(evt, session)
+```
+
+Prefetch supports packed, fully static ND tensors. Codegen flattens only the
+prefetch view to a logical-1D region; custom strides, partial valid shapes and
+non-ND layouts are rejected. SDMA/runtime requirements of prefetch still apply.
+This implementation is validated at IR and code-generation level; prior DDR
+copy numerical results do not validate this new API. A wait on the AIV lane
+does not itself add a cross-core AIC barrier in a mixed kernel.
+
+
 Type-safe operator definitions with automatic type deduction, organized into modular categories (TensorOp, TileOp, SyncOp, CrossCoreOp).
 
 ## Operator Categories
@@ -31,18 +60,17 @@ endpoints; specify them explicitly:
 ```python
 dst = pl.create_tensor(src.shape, dtype=src.dtype, memory_type=pl.Mem.DDR)
 with pl.at(level=pl.Level.CORE_GROUP):
-    pl.copy(dst, src, source_memory=pl.Mem.DDR, target_memory=pl.Mem.DDR)
+    pl.tensor.copy(dst, src, source_memory=pl.Mem.DDR, target_memory=pl.Mem.DDR)
 ```
 
 Omit all region arguments to copy equal-shaped whole tensors, or supply all of
 `dst_offsets`, `src_offsets`, and `shape`. The destination always comes first.
-See `examples/beginner/05_matmul.py`: copy A/B, then consume the copies in a
-separate InCore scope for matrix multiplication.
+The current `examples/beginner/05_matmul.py` uses the new L2-prefetch wrapper instead.
 
-`pl.copy(dst, src, dst_offsets, src_offsets, shape, *, source_memory=pl.Mem.DDR,
+`pl.tensor.copy(dst, src, dst_offsets, src_offsets, shape, *, source_memory=pl.Mem.DDR,
 target_memory=pl.Mem.SRAM)` writes `dst` in place without a tensor result. Use it
-as a standalone statement, then use `dst` directly; migrate `dst = pl.copy(...)`
-to `pl.copy(...)` and `return pl.copy(...)` to `pl.copy(...); return dst`.
+as a standalone statement, then use `dst` directly; migrate `dst = pl.tensor.copy(...)`
+to `pl.tensor.copy(...)` and `return pl.tensor.copy(...)` to `pl.tensor.copy(...); return dst`.
 The Python builder returns an UnknownType IR Call for the parser, not a Tensor.
 Supported routes are DDR → DDR, DDR → SRAM, and SRAM → DDR; the default
 remains DDR → SRAM. Dtypes and ranks must match;
@@ -66,7 +94,7 @@ simulation-compatible transfer path, not a new hardware SRAM allocator.
 @pl.jit.incore
 def stage(src: pl.Tensor[[4, 600], pl.FP32],
           dst: pl.Out[pl.Tensor[[4, 600], pl.FP32]]) -> pl.Tensor[[4, 600], pl.FP32]:
-    pl.copy(dst, src, [0, 0], [0, 0], [4, 600])
+    pl.tensor.copy(dst, src, [0, 0], [0, 0], [4, 600])
     return dst
 ```
 
@@ -987,10 +1015,10 @@ the runtime owns it, and codegen injects a hidden pointer into prefetch kernels.
 
 ### Constraints
 
-- `src` must be a **flat contiguous logical-1D GM** region: a fully static shape
-  whose dimensions are all `1` except the last (`[N]`, `[1, N]`, `[1, 1, N]`).
-  This mirrors the PTOAS `TPrefetchAsyncOp::verify()` check, so a shape mistake
-  fails at PyPTO IR construction rather than at PTOAS verification.
+- `src` must be a packed, fully static ND GM tensor with positive dimensions.
+  Explicit strides, partial valid shapes and non-ND layouts are rejected.
+  Codegen flattens ND tensors into a logical-1D prefetch view to satisfy PTOAS,
+  without changing the source pointer or the shape used by later loads.
 
 ### Example Usage
 

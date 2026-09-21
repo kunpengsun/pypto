@@ -9,6 +9,7 @@
 
 """PTO codegen tests for the ``prefetch.*`` async GM->L2 prefetch op family."""
 
+import importlib
 import re
 
 import pypto.language as pl
@@ -308,6 +309,59 @@ class TestPrefetchBackendArtifact:
         assert "get_dma_workspace" not in wrapper
         assert '#include "intrinsic.h"' not in wrapper
         assert '"enable_sdma"' not in result["kernel_config.py"]
+
+
+@pytest.mark.parametrize("shape", [[256], [4, 64]])
+@pytest.mark.parametrize("repeat", [1, 2])
+def test_copy_expands_to_alias_and_prefetch(shape, repeat):
+    header = f"""
+import pypto.language as pl
+@pl.program
+class Copy:
+    @pl.function(type=pl.FunctionType.InCore)
+    def main(self, src: pl.Tensor[{shape}, pl.FP32],
+             dst: pl.Tensor[{shape}, pl.FP32]) -> pl.Tensor[{shape}, pl.FP32]:
+"""
+    actual = pl.parse(header + "        pl.copy(dst, src)\n" * repeat + "        return dst\n")
+    explicit = "".join(
+        f"""        dst = src
+        ctx_{i} = pl.prefetch.make_context()
+        evt_{i} = pl.prefetch.async_prefetch(dst, ctx_{i})
+        session_{i} = pl.prefetch.session(ctx_{i})
+        pl.prefetch.wait(evt_{i}, session_{i})
+"""
+        for i in range(repeat)
+    )
+    expected = pl.parse(header + explicit + "        return dst\n")
+    ir.assert_structural_equal(actual, expected)
+    ir.assert_structural_equal(actual, pl.parse(ir.python_print(actual)))
+    mlir = _generate_mlir(actual)
+    assert "pto.tprefetch_async" in mlir
+    assert "pto.comm.wait_async_event" in mlir
+    assert mlir.count("pto.tprefetch_async") == repeat
+    assert "pto.tstore " not in mlir
+    assert "pto.tload " not in mlir
+    assert "!pto.partition_tensor_view<256xf32>" in mlir
+
+
+def test_beginner_matmul_prefetch_semantics():
+    torch = pytest.importorskip("torch")
+    matmul = importlib.import_module("examples.beginner.05_matmul").matmul_64
+    a, b, c = [torch.empty(64, 64) for _ in range(3)]
+    optimized = matmul.lower(a, b, c)
+    text = ir.python_print(optimized)
+    assert "tensor.copy" not in text
+    assert text.count("prefetch.async_prefetch") == 2
+    kernels = []
+    for func in optimized.functions.values():
+        if ir.is_incore_type(func.func_type):
+            kernels.append(codegen.PTOCodegen().generate(ir.Program([func], func.name, optimized.span)))
+    prefetched = [text for text in kernels if "pto.tprefetch_async" in text]
+    assert prefetched
+    assert sum(text.count("pto.tprefetch_async") for text in prefetched) == 2
+    assert all("pto.tstore " not in text and "pto.tload " not in text for text in prefetched)
+    assert all("4096xf32" in text for text in prefetched)
+    assert any("pto.tload " in text for text in kernels)
 
 
 if __name__ == "__main__":
